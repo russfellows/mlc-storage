@@ -47,6 +47,7 @@ def parse_args():
     parser.add_argument("--search-list-size", type=int, default=200, help="DiskANN SearchListSize parameter")
     parser.add_argument("--M", type=int, default=16, help="HNSW M parameter")
     parser.add_argument("--ef-construction", type=int, default=200, help="HNSW efConstruction parameter")
+    parser.add_argument("--inline-pq", type=int, default=16, help="AISAQ inline_pq parameter, performance(max_degree) vs scale(0) mode")
     
     # Monitoring parameters
     parser.add_argument("--monitor-interval", type=int, default=5, help="Interval in seconds for monitoring index building")
@@ -78,6 +79,7 @@ def parse_args():
         'search_list_size': args.search_list_size == 200,
         'M': args.M == 16,
         'ef_construction': args.ef_construction == 200,
+        'inline_pq': args.inline_pq == 16,
         'monitor_interval': args.monitor_interval == 5,
         'compact': not args.compact,  # Default is False
         'force': not args.force,  # Default is False
@@ -300,6 +302,12 @@ def main():
         index_params["params"] = {
             "MaxDegree": args.max_degree,
             "SearchListSize": args.search_list_size
+        }
+    elif args.index_type == "AISAQ":
+        index_params["params"] = {
+            "inline_pq": args.inline_pq,
+            "max_degree": args.max_degree,
+            "search_list_size": args.search_list_size
         }
     else:
         raise ValueError(f"Unsupported index_type: {args.index_type}")
