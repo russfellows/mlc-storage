@@ -45,7 +45,7 @@ tests/
 1. Install test dependencies:
 
 ```bash
-pip install -r tests/requirements-test.txt
+pip install -r tests/requirements.txt
 ```
 
 2. Install vdb-bench in development mode:
