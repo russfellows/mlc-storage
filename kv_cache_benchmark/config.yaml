@@ -1,0 +1,177 @@
+# MLPerf v3.0 KV Cache Benchmark Configuration
+# =============================================
+# This file contains all configurable parameters for the benchmark.
+# Edit values here instead of modifying the Python source code.
+#
+# Usage: python kv-cache-01-26-2026.py --config config.yaml [other args]
+#
+# YAML values are overridden by CLI arguments when both are specified.
+# Unknown keys will raise an error to prevent silent misconfigurations.
+
+# =============================================================================
+# USER TEMPLATES
+# Defines behavior patterns for different user personas in the simulation.
+# context_range: [min, max] tokens in the input prompt
+# generation_range: [min, max] tokens to generate in the response
+# think_time_range: [min, max] seconds between requests (simulated user delay)
+# =============================================================================
+user_templates:
+  chatbot:
+    context_range: [256, 1024]
+    generation_range: [50, 150]
+    think_time_range: [0.1, 0.5]
+  coding:
+    context_range: [1024, 4096]
+    generation_range: [100, 500]
+    think_time_range: [0.2, 1.0]
+  document:
+    context_range: [2048, 8192]
+    generation_range: [200, 800]
+    think_time_range: [0.3, 1.5]
+
+# =============================================================================
+# TOKEN GENERATION TIMING
+# Simulates GPU processing time per token for different modes.
+# Values in seconds per token.
+# - none: Pure storage benchmark (0 delay, 100% I/O latency)
+# - fast: Fast GPU simulation (2ms/token)
+# - realistic: Realistic GPU simulation (30ms/token)
+# =============================================================================
+generation_timing:
+  none: 0.0
+  fast: 0.002
+  realistic: 0.030
+
+# =============================================================================
+# QOS PROFILES (Quality of Service)
+# Defines SLA targets for different priority levels.
+# All latency values in milliseconds.
+# priority: Higher number = higher priority (3 > 2 > 1)
+# =============================================================================
+qos_profiles:
+  interactive:
+    # Highest priority - real-time applications like chatbots
+    target_latency_p95_ms: 50
+    target_latency_p99_ms: 100
+    target_latency_p999_ms: 150   # 3 nines (99.9%)
+    target_latency_p9999_ms: 200  # 4 nines (99.99%)
+    priority: 3
+  responsive:
+    # Medium priority - near real-time tasks
+    target_latency_p95_ms: 100
+    target_latency_p99_ms: 200
+    target_latency_p999_ms: 350
+    target_latency_p9999_ms: 500
+    priority: 2
+  batch:
+    # Low priority - offline/background processing
+    target_latency_p95_ms: 1000
+    target_latency_p99_ms: 5000
+    target_latency_p999_ms: 7500
+    target_latency_p9999_ms: 10000
+    priority: 1
+
+# =============================================================================
+# QOS DISTRIBUTION
+# Controls how requests are distributed across QoS levels.
+# interactive_probability: Fraction of requests that are INTERACTIVE (default 15%)
+# responsive_threshold: Cumulative threshold - if rand < this and not INTERACTIVE, use RESPONSIVE
+# Example: 0.15 interactive, 0.50 threshold → 15% INTERACTIVE, 35% RESPONSIVE, 50% BATCH
+# =============================================================================
+qos_distribution:
+  interactive_probability: 0.15
+  responsive_threshold: 0.50
+
+# =============================================================================
+# EVICTION SETTINGS
+# Controls the multi-tier LRU eviction behavior.
+# =============================================================================
+eviction:
+  max_recursion_depth: 10
+  target_usage_ratio: 0.8         # Try to keep tier at 80% capacity (20% buffer)
+  large_entry_limit_ratio: 0.95   # Skip to next tier if entry > 95% of tier capacity
+  max_evictions_hard_cap: 5000    # Safety limit per eviction cycle
+  max_evictions_min: 1000         # Minimum evictions before giving up
+
+# =============================================================================
+# GPU BACKEND SETTINGS
+# Controls GPU memory allocation and OOM handling.
+# =============================================================================
+gpu_backend:
+  memory_fraction: 0.9            # Use 90% of GPU memory
+  max_eviction_attempts: 100      # Max evictions during OOM recovery
+  free_memory_threshold: 0.1      # Keep 10% GPU memory free
+
+# =============================================================================
+# PREFIX CACHE SETTINGS
+# Controls hierarchical prefix caching for system prompts.
+# =============================================================================
+prefix_cache:
+  min_prefix_length: 50           # Minimum tokens for prefix matching
+  max_prefix_entries: 1000        # Max cached prefix entries
+  system_prompt_hit_probability: 0.2  # 20% of requests have common system prompt
+
+# =============================================================================
+# RAG SETTINGS
+# Controls Retrieval-Augmented Generation workload simulation.
+# =============================================================================
+rag:
+  chunk_size_tokens: 512          # Tokens per document chunk
+  top_k_chunks: 5                 # Number of chunks retrieved per query
+  max_chunk_bytes: 268435456      # 256MB max per chunk (256 * 1024 * 1024)
+
+# =============================================================================
+# CONVERSATION SETTINGS
+# Controls multi-turn conversation behavior.
+# =============================================================================
+conversation:
+  max_conversations: 1000         # Max active conversations in memory
+  max_turns_per_conv: 50          # Max turns before conversation reset
+  end_conversation_probability: 0.2  # 20% chance to end conversation each turn
+
+# =============================================================================
+# AUTOSCALER SETTINGS
+# Controls workload autoscaling to find saturation point.
+# =============================================================================
+autoscaler:
+  min_users: 1
+  max_users: 10000
+  scale_up_factor: 1.2            # Increase users by 20% when scaling up
+  scale_down_factor: 0.8          # Decrease users by 20% when scaling down
+  consecutive_samples_required: 2  # Samples needed before scale action
+
+# =============================================================================
+# DECODE PHASE SETTINGS
+# Controls token generation batching.
+# =============================================================================
+decode:
+  batch_size: 32                  # Tokens per decode batch
+
+# =============================================================================
+# SHAREGPT DATASET SETTINGS
+# Controls ShareGPT dataset loading and processing.
+# =============================================================================
+sharegpt:
+  max_context_tokens: 8192        # Truncate context to this length
+  max_generation_tokens: 2048     # Truncate generation to this length
+  chars_per_token_estimate: 4     # For tokenization estimation
+
+# =============================================================================
+# SATURATION DETECTION THRESHOLDS
+# Used by StorageMonitor to detect when storage is saturated.
+# =============================================================================
+saturation_detection:
+  read_latency_p95_threshold_ms: 100
+  write_latency_p95_threshold_ms: 50
+  queue_depth_threshold: 100
+  history_window_size: 10         # Number of samples for trend analysis
+
+# =============================================================================
+# VALIDATION LIMITS
+# Safety limits for CLI argument validation.
+# =============================================================================
+validation_limits:
+  max_users: 100000               # Max simulated users
+  max_duration_seconds: 86400     # 24 hours max benchmark duration
+  max_gpu_memory_gb: 1024         # 1TB max GPU memory
+  max_cpu_memory_gb: 16384        # 16TB max CPU memory
