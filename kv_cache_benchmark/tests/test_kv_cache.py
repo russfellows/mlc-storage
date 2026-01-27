@@ -11,10 +11,17 @@ Requirements:
 
 These tests verify core functionality without running the full benchmark.
 Typical execution time: < 5 seconds
+
+This version tests kv-cache.py which includes:
+- ConfigLoader with YAML support and strict validation
+- Extended QoS SLA with p999 and p9999 percentiles
+- Config-driven parameters via cfg() helper
+- Renamed nvme_* to storage_* in stats
 """
 
 import os
 import sys
+import argparse
 import tempfile
 import pytest
 import numpy as np
@@ -22,8 +29,26 @@ from datetime import datetime
 from pathlib import Path
 
 # Import from kv-cache.py (handle the hyphen in filename)
+# Try multiple locations: same directory, parent directory
 import importlib.util
-spec = importlib.util.spec_from_file_location("kv_cache", os.path.join(os.path.dirname(__file__), "kv-cache.py"))
+
+_kv_cache_path = None
+_possible_paths = [
+    os.path.join(os.path.dirname(__file__), "kv-cache.py"),        # Same directory
+    os.path.join(os.path.dirname(__file__), "..", "kv-cache.py"),  # Parent directory
+]
+for _path in _possible_paths:
+    if os.path.exists(_path):
+        _kv_cache_path = _path
+        break
+
+if _kv_cache_path is None:
+    raise FileNotFoundError(
+        f"Could not find kv-cache.py. Searched in:\n"
+        + "\n".join(f"  - {os.path.abspath(p)}" for p in _possible_paths)
+    )
+
+spec = importlib.util.spec_from_file_location("kv_cache", _kv_cache_path)
 kv_cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kv_cache)
 
@@ -44,6 +69,24 @@ UserSimulator = kv_cache.UserSimulator
 MultiTierCache = kv_cache.MultiTierCache
 export_results_to_xlsx = kv_cache.export_results_to_xlsx
 PANDAS_AVAILABLE = kv_cache.PANDAS_AVAILABLE
+
+# New imports for 01-26-2026 version
+ConfigLoader = kv_cache.ConfigLoader
+cfg = kv_cache.cfg
+get_config = kv_cache.get_config
+set_config = kv_cache.set_config
+get_qos_profiles = kv_cache.get_qos_profiles
+QoSSLA = kv_cache.QoSSLA
+YAML_AVAILABLE = kv_cache.YAML_AVAILABLE
+
+# Input validation imports
+validate_args = kv_cache.validate_args
+MAX_USERS = kv_cache.MAX_USERS
+MAX_DURATION_SECONDS = kv_cache.MAX_DURATION_SECONDS
+MAX_GPU_MEMORY_GB = kv_cache.MAX_GPU_MEMORY_GB
+MAX_CPU_MEMORY_GB = kv_cache.MAX_CPU_MEMORY_GB
+FORBIDDEN_CACHE_PREFIXES = kv_cache.FORBIDDEN_CACHE_PREFIXES
+
 if PANDAS_AVAILABLE:
     import pandas as pd
 
@@ -190,6 +233,171 @@ def mock_args():
     return MockArgs()
 
 
+@pytest.fixture
+def sample_config_yaml(tmp_path):
+    """Create a sample config.yaml for testing."""
+    config_content = '''
+user_templates:
+  chatbot:
+    context_range: [256, 1024]
+    generation_range: [50, 150]
+    think_time_range: [0.1, 0.5]
+  coding:
+    context_range: [1024, 4096]
+    generation_range: [100, 500]
+    think_time_range: [0.2, 1.0]
+  document:
+    context_range: [2048, 8192]
+    generation_range: [200, 800]
+    think_time_range: [0.3, 1.5]
+
+qos_profiles:
+  interactive:
+    target_latency_p95_ms: 50
+    target_latency_p99_ms: 100
+    target_latency_p999_ms: 150
+    target_latency_p9999_ms: 200
+    priority: 3
+  responsive:
+    target_latency_p95_ms: 100
+    target_latency_p99_ms: 200
+    target_latency_p999_ms: 350
+    target_latency_p9999_ms: 500
+    priority: 2
+  batch:
+    target_latency_p95_ms: 1000
+    target_latency_p99_ms: 5000
+    target_latency_p999_ms: 7500
+    target_latency_p9999_ms: 10000
+    priority: 1
+
+qos_distribution:
+  interactive_probability: 0.15
+  responsive_threshold: 0.50
+
+eviction:
+  max_recursion_depth: 10
+  target_usage_ratio: 0.8
+  large_entry_limit_ratio: 0.95
+  max_evictions_hard_cap: 5000
+  max_evictions_min: 1000
+
+decode:
+  batch_size: 32
+
+conversation:
+  max_conversations: 1000
+  max_turns_per_conv: 50
+  end_conversation_probability: 0.2
+'''
+    config_file = tmp_path / "test_config.yaml"
+    config_file.write_text(config_content)
+    return str(config_file)
+
+
+# =============================================================================
+# Test 0: ConfigLoader (New in 01-26-2026)
+# =============================================================================
+
+@pytest.mark.skipif(not YAML_AVAILABLE, reason="PyYAML not installed")
+class TestConfigLoader:
+    """Tests for ConfigLoader and cfg() helper function."""
+    
+    def test_config_loader_without_file(self):
+        """ConfigLoader should work without a config file."""
+        loader = ConfigLoader(config_path=None)
+        assert loader is not None
+        assert loader.config == {}
+    
+    def test_config_loader_loads_yaml(self, sample_config_yaml):
+        """ConfigLoader should load and parse YAML file."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        assert loader.config is not None
+        assert 'qos_profiles' in loader.config
+    
+    def test_config_loader_get_nested_value(self, sample_config_yaml):
+        """ConfigLoader.get() should retrieve nested values."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        priority = loader.get('qos_profiles', 'interactive', 'priority')
+        assert priority == 3
+    
+    def test_config_loader_get_with_default(self, sample_config_yaml):
+        """ConfigLoader.get() should return default for missing keys."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        value = loader.get('nonexistent', 'key', default=42)
+        assert value == 42
+    
+    def test_cfg_without_global_config(self):
+        """cfg() should return default when no global config is set."""
+        # Ensure no global config
+        set_config(None)
+        value = cfg('qos_profiles', 'interactive', 'priority', default=99)
+        assert value == 99
+    
+    def test_cfg_with_global_config(self, sample_config_yaml):
+        """cfg() should retrieve values from global config."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            value = cfg('qos_profiles', 'interactive', 'priority', default=99)
+            assert value == 3
+        finally:
+            set_config(None)  # Clean up
+    
+    def test_config_loader_validates_schema(self, tmp_path):
+        """ConfigLoader should reject unknown keys."""
+        bad_config = tmp_path / "bad_config.yaml"
+        bad_config.write_text('''
+unknown_section:
+  bad_key: true
+''')
+        with pytest.raises(ValueError, match="Unknown configuration key"):
+            ConfigLoader(config_path=str(bad_config))
+    
+    def test_get_config_returns_none_initially(self):
+        """get_config() should return None before set_config() is called."""
+        set_config(None)
+        assert get_config() is None
+    
+    def test_set_config_stores_loader(self, sample_config_yaml):
+        """set_config() should store the ConfigLoader globally."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            assert get_config() is loader
+        finally:
+            set_config(None)
+
+
+class TestCfgHelper:
+    """Tests for cfg() helper function in various contexts."""
+    
+    def test_cfg_returns_default_for_none_config(self):
+        """cfg() returns default when config is None."""
+        set_config(None)
+        assert cfg('any', 'path', default='fallback') == 'fallback'
+    
+    def test_cfg_returns_default_for_missing_key(self, sample_config_yaml):
+        """cfg() returns default for missing nested keys."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            result = cfg('nonexistent', 'nested', 'key', default=123)
+            assert result == 123
+        finally:
+            set_config(None)
+    
+    def test_cfg_retrieves_list_values(self, sample_config_yaml):
+        """cfg() can retrieve list values from config."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            context_range = cfg('user_templates', 'chatbot', 'context_range')
+            assert context_range == [256, 1024]
+        finally:
+            set_config(None)
+
+
 # =============================================================================
 # Test 1: ModelConfig
 # =============================================================================
@@ -318,6 +526,39 @@ class TestQoSProfiles:
     def test_interactive_target_latency(self):
         sla = QOS_PROFILES[QoSLevel.INTERACTIVE]
         assert sla.target_latency_p95_ms == 50
+    
+    # New tests for extended QoS percentiles (01-26-2026 feature)
+    def test_interactive_has_p999_latency(self):
+        """Test that p999 percentile is defined for INTERACTIVE."""
+        sla = QOS_PROFILES[QoSLevel.INTERACTIVE]
+        assert hasattr(sla, 'target_latency_p999_ms')
+        assert sla.target_latency_p999_ms > sla.target_latency_p99_ms
+    
+    def test_interactive_has_p9999_latency(self):
+        """Test that p9999 percentile is defined for INTERACTIVE."""
+        sla = QOS_PROFILES[QoSLevel.INTERACTIVE]
+        assert hasattr(sla, 'target_latency_p9999_ms')
+        assert sla.target_latency_p9999_ms > sla.target_latency_p999_ms
+    
+    def test_all_qos_levels_have_extended_percentiles(self):
+        """Verify all QoS levels have p999 and p9999 defined."""
+        for level in QoSLevel:
+            sla = QOS_PROFILES[level]
+            assert hasattr(sla, 'target_latency_p999_ms')
+            assert hasattr(sla, 'target_latency_p9999_ms')
+    
+    def test_get_qos_profiles_returns_dict(self):
+        """Test that get_qos_profiles() returns profiles dict."""
+        profiles = get_qos_profiles()
+        assert isinstance(profiles, dict)
+        assert len(profiles) == 3
+    
+    def test_get_qos_profiles_levels(self):
+        """Test that get_qos_profiles() has all QoS levels."""
+        profiles = get_qos_profiles()
+        assert QoSLevel.INTERACTIVE in profiles
+        assert QoSLevel.RESPONSIVE in profiles
+        assert QoSLevel.BATCH in profiles
 
 
 # =============================================================================
@@ -878,6 +1119,515 @@ class TestTierLogic:
 
 
 # =============================================================================
+# Test 13: Config-Driven Parameters (New in 01-26-2026)
+# =============================================================================
+
+class TestConfigDrivenConversationManager:
+    """Tests for ConversationManager with config-driven parameters."""
+    
+    def test_default_max_conversations(self):
+        """Without config, should use hardcoded default of 1000."""
+        set_config(None)
+        manager = ConversationManager()
+        assert manager.max_conversations == 1000
+    
+    def test_default_max_turns(self):
+        """Without config, should use hardcoded default of 50."""
+        set_config(None)
+        manager = ConversationManager()
+        assert manager.max_turns_per_conv == 50
+    
+    def test_explicit_params_override_config(self, sample_config_yaml):
+        """Explicit constructor params should override config values."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            manager = ConversationManager(max_conversations=42, max_turns_per_conv=7)
+            assert manager.max_conversations == 42
+            assert manager.max_turns_per_conv == 7
+        finally:
+            set_config(None)
+
+
+@pytest.mark.skipif(not YAML_AVAILABLE, reason="PyYAML not installed")
+class TestConfigDrivenUserSimulator:
+    """Tests for UserSimulator with config-driven parameters."""
+    
+    def test_user_templates_from_config(self, sample_config_yaml):
+        """UserSimulator should read templates from config."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            templates = UserSimulator._get_user_templates()
+            assert 'chatbot' in templates
+            assert 'coding' in templates
+            assert 'document' in templates
+            assert templates['chatbot']['context_range'] == (256, 1024)
+        finally:
+            set_config(None)
+    
+    def test_qos_distribution_from_config(self, sample_config_yaml):
+        """UserSimulator.generate_mixed_users should use config QoS distribution."""
+        loader = ConfigLoader(config_path=sample_config_yaml)
+        set_config(loader)
+        try:
+            # Generate many users to test distribution
+            users = UserSimulator.generate_mixed_users(1000)
+            # With 15% interactive probability, expect ~150 interactive users
+            interactive_count = sum(1 for u in users if u.qos_level == QoSLevel.INTERACTIVE)
+            # Allow 50% variance for randomness
+            assert 75 <= interactive_count <= 225, f"Expected ~150 interactive, got {interactive_count}"
+        finally:
+            set_config(None)
+
+
+# =============================================================================
+# Test 14: Stats Naming Convention (storage_* vs nvme_*)
+# =============================================================================
+
+class TestStatsNamingConvention:
+    """Tests that stats use 'storage_*' naming (not 'nvme_*') in 01-26-2026."""
+    
+    def test_stats_use_storage_prefix(self, multi_tier_cache):
+        """Stats should use 'storage_' prefix instead of 'nvme_'."""
+        multi_tier_cache.allocate_cache("test_entry", num_tokens=100)
+        multi_tier_cache.access_cache("test_entry", InferencePhase.DECODE)
+        stats = multi_tier_cache.get_stats(duration=1.0)
+        
+        # Check for storage_* naming
+        storage_keys = [k for k in stats.keys() if 'storage_' in k.lower()]
+        nvme_keys = [k for k in stats.keys() if 'nvme_' in k.lower()]
+        
+        # Should have storage_* keys
+        assert len(storage_keys) > 0, "Expected storage_* keys in stats"
+    
+    def test_tier_stats_key_format(self, multi_tier_cache):
+        """tier_storage_* keys should exist (renamed from tier_nvme_*)."""
+        multi_tier_cache.allocate_cache("test_entry", num_tokens=100)
+        stats = multi_tier_cache.get_stats(duration=1.0)
+        
+        # Check for tier_storage_* keys
+        tier_storage_keys = [k for k in stats.keys() if k.startswith('tier_storage_')]
+        assert len(tier_storage_keys) > 0, "Expected tier_storage_* keys in stats"
+
+
+# =============================================================================
+# Test 15: GPUMemoryBackend Eviction Callback (New in 01-26-2026)
+# =============================================================================
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestGPUMemoryBackendEvictionCallback:
+    """Tests for GPUMemoryBackend's on_eviction_callback feature."""
+    
+    def test_gpu_backend_accepts_callback(self):
+        """GPUMemoryBackend should accept on_eviction_callback parameter."""
+        evicted_keys = []
+        def callback(key, tier, size):
+            evicted_keys.append((key, tier, size))
+        
+        backend = GPUMemoryBackend(on_eviction_callback=callback)
+        assert backend.on_eviction_callback is callback
+        backend.clear()
+    
+    def test_gpu_backend_works_without_callback(self):
+        """GPUMemoryBackend should work without a callback (None)."""
+        backend = GPUMemoryBackend(on_eviction_callback=None)
+        assert backend.on_eviction_callback is None
+        backend.clear()
+
+
+# =============================================================================
+# Test 16: Input Validation (validate_args)
+# =============================================================================
+
+class TestValidateArgs:
+    """Tests for the validate_args() input validation function."""
+    
+    @pytest.fixture
+    def valid_args(self):
+        """Create a valid args namespace with all required attributes."""
+        import argparse
+        args = argparse.Namespace(
+            num_users=100,
+            duration=60,
+            gpu_mem_gb=16,
+            cpu_mem_gb=32,
+            rag_num_docs=10,
+            max_conversations=500,
+            max_concurrent_allocs=0,
+            request_rate=0,
+            max_requests=0,
+            target_saturation=0.8,
+            cache_dir=None
+        )
+        return args
+    
+    def test_valid_args_pass_through(self, valid_args):
+        """Valid arguments should pass validation and return unchanged."""
+        result = validate_args(valid_args)
+        assert result is valid_args
+        assert result.num_users == 100
+        assert result.duration == 60
+    
+    def test_num_users_zero_rejected(self, valid_args):
+        """num_users=0 should raise ValueError."""
+        valid_args.num_users = 0
+        with pytest.raises(ValueError, match="num-users must be positive"):
+            validate_args(valid_args)
+    
+    def test_num_users_negative_rejected(self, valid_args):
+        """Negative num_users should raise ValueError."""
+        valid_args.num_users = -5
+        with pytest.raises(ValueError, match="num-users must be positive"):
+            validate_args(valid_args)
+    
+    def test_num_users_exceeds_limit(self, valid_args):
+        """num_users exceeding MAX_USERS should raise ValueError."""
+        valid_args.num_users = MAX_USERS + 1
+        with pytest.raises(ValueError, match="num-users exceeds limit"):
+            validate_args(valid_args)
+    
+    def test_duration_zero_rejected(self, valid_args):
+        """duration=0 should raise ValueError."""
+        valid_args.duration = 0
+        with pytest.raises(ValueError, match="duration must be positive"):
+            validate_args(valid_args)
+    
+    def test_duration_negative_rejected(self, valid_args):
+        """Negative duration should raise ValueError."""
+        valid_args.duration = -10
+        with pytest.raises(ValueError, match="duration must be positive"):
+            validate_args(valid_args)
+    
+    def test_duration_exceeds_limit(self, valid_args):
+        """duration exceeding 24 hours should raise ValueError."""
+        valid_args.duration = MAX_DURATION_SECONDS + 1
+        with pytest.raises(ValueError, match="duration exceeds 24 hours"):
+            validate_args(valid_args)
+    
+    def test_gpu_mem_negative_rejected(self, valid_args):
+        """Negative gpu_mem_gb should raise ValueError."""
+        valid_args.gpu_mem_gb = -1
+        with pytest.raises(ValueError, match="gpu-mem-gb cannot be negative"):
+            validate_args(valid_args)
+    
+    def test_gpu_mem_zero_allowed(self, valid_args):
+        """gpu_mem_gb=0 should be valid (disables GPU tier)."""
+        valid_args.gpu_mem_gb = 0
+        result = validate_args(valid_args)
+        assert result.gpu_mem_gb == 0
+    
+    def test_gpu_mem_exceeds_limit(self, valid_args):
+        """gpu_mem_gb exceeding limit should raise ValueError."""
+        valid_args.gpu_mem_gb = MAX_GPU_MEMORY_GB + 1
+        with pytest.raises(ValueError, match="gpu-mem-gb exceeds limit"):
+            validate_args(valid_args)
+    
+    def test_cpu_mem_negative_rejected(self, valid_args):
+        """Negative cpu_mem_gb should raise ValueError."""
+        valid_args.cpu_mem_gb = -1
+        with pytest.raises(ValueError, match="cpu-mem-gb cannot be negative"):
+            validate_args(valid_args)
+    
+    def test_cpu_mem_zero_allowed(self, valid_args):
+        """cpu_mem_gb=0 should be valid."""
+        valid_args.cpu_mem_gb = 0
+        result = validate_args(valid_args)
+        assert result.cpu_mem_gb == 0
+    
+    def test_cpu_mem_exceeds_limit(self, valid_args):
+        """cpu_mem_gb exceeding limit should raise ValueError."""
+        valid_args.cpu_mem_gb = MAX_CPU_MEMORY_GB + 1
+        with pytest.raises(ValueError, match="cpu-mem-gb exceeds limit"):
+            validate_args(valid_args)
+    
+    def test_target_saturation_below_zero_rejected(self, valid_args):
+        """target_saturation < 0 should raise ValueError."""
+        valid_args.target_saturation = -0.1
+        with pytest.raises(ValueError, match="target-saturation must be between 0.0 and 1.0"):
+            validate_args(valid_args)
+    
+    def test_target_saturation_above_one_rejected(self, valid_args):
+        """target_saturation > 1 should raise ValueError."""
+        valid_args.target_saturation = 1.5
+        with pytest.raises(ValueError, match="target-saturation must be between 0.0 and 1.0"):
+            validate_args(valid_args)
+    
+    def test_target_saturation_boundaries_valid(self, valid_args):
+        """target_saturation at 0.0 and 1.0 should be valid."""
+        valid_args.target_saturation = 0.0
+        result = validate_args(valid_args)
+        assert result.target_saturation == 0.0
+        
+        valid_args.target_saturation = 1.0
+        result = validate_args(valid_args)
+        assert result.target_saturation == 1.0
+    
+    def test_rag_num_docs_negative_rejected(self, valid_args):
+        """Negative rag_num_docs should raise ValueError."""
+        valid_args.rag_num_docs = -1
+        with pytest.raises(ValueError, match="rag-num-docs cannot be negative"):
+            validate_args(valid_args)
+    
+    def test_max_conversations_zero_rejected(self, valid_args):
+        """max_conversations=0 should raise ValueError."""
+        valid_args.max_conversations = 0
+        with pytest.raises(ValueError, match="max-conversations must be positive"):
+            validate_args(valid_args)
+    
+    def test_max_concurrent_allocs_negative_rejected(self, valid_args):
+        """Negative max_concurrent_allocs should raise ValueError."""
+        valid_args.max_concurrent_allocs = -1
+        with pytest.raises(ValueError, match="max-concurrent-allocs cannot be negative"):
+            validate_args(valid_args)
+    
+    def test_request_rate_negative_rejected(self, valid_args):
+        """Negative request_rate should raise ValueError."""
+        valid_args.request_rate = -1
+        with pytest.raises(ValueError, match="request-rate cannot be negative"):
+            validate_args(valid_args)
+    
+    def test_max_requests_negative_rejected(self, valid_args):
+        """Negative max_requests should raise ValueError."""
+        valid_args.max_requests = -1
+        with pytest.raises(ValueError, match="max-requests cannot be negative"):
+            validate_args(valid_args)
+    
+    @pytest.mark.skipif(sys.platform == 'win32', reason="Unix paths not valid on Windows")
+    def test_forbidden_cache_dir_rejected(self, valid_args):
+        """Cache directories in system paths should be rejected."""
+        valid_args.cache_dir = '/etc/kv_cache'
+        with pytest.raises(ValueError, match="cannot be a system directory"):
+            validate_args(valid_args)
+    
+    def test_valid_cache_dir_allowed(self, valid_args, tmp_path):
+        """Valid cache directory should be accepted."""
+        valid_args.cache_dir = str(tmp_path / "kv_cache_test")
+        result = validate_args(valid_args)
+        assert result.cache_dir == str(tmp_path / "kv_cache_test")
+    
+    def test_multiple_errors_collected(self, valid_args):
+        """Multiple validation errors should all be reported."""
+        valid_args.num_users = -1
+        valid_args.duration = -1
+        valid_args.gpu_mem_gb = -1
+        with pytest.raises(ValueError) as exc_info:
+            validate_args(valid_args)
+        # All three errors should be in the message
+        error_msg = str(exc_info.value)
+        assert "num-users" in error_msg
+        assert "duration" in error_msg
+        assert "gpu-mem-gb" in error_msg
+
+
+# =============================================================================
+# Test 17: Per-Tier Phase Metrics
+# =============================================================================
+
+class TestPerTierPhaseMetrics:
+    """Tests for per-tier KV bytes tracking (prefill/decode per tier)."""
+    
+    @pytest.fixture
+    def tiny_model_config(self):
+        """Return the tiny-1b model config for fast tests."""
+        return MODEL_CONFIGS['tiny-1b']
+    
+    @pytest.fixture
+    def multi_tier_cache_cpu_only(self, tiny_model_config):
+        """Return a MultiTierCache in CPU-only mode (GPU disabled)."""
+        return MultiTierCache(
+            model_config=tiny_model_config,
+            gpu_memory_gb=0,
+            cpu_memory_gb=0.1,  # 100MB
+            seed=42
+        )
+    
+    def test_stats_have_tier_kv_bytes_written_keys(self, multi_tier_cache_cpu_only):
+        """Stats should include tier_*_kv_bytes_written keys."""
+        multi_tier_cache_cpu_only.allocate_cache("test_entry", num_tokens=100)
+        stats = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        
+        # Check for per-tier write tracking
+        assert 'tier_gpu_kv_bytes_written_gb' in stats
+        assert 'tier_cpu_kv_bytes_written_gb' in stats
+        assert 'tier_storage_kv_bytes_written_gb' in stats
+    
+    def test_stats_have_tier_kv_bytes_read_keys(self, multi_tier_cache_cpu_only):
+        """Stats should include tier_*_kv_bytes_read keys."""
+        multi_tier_cache_cpu_only.allocate_cache("test_entry", num_tokens=100)
+        multi_tier_cache_cpu_only.access_cache("test_entry", InferencePhase.DECODE)
+        stats = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        
+        # Check for per-tier read tracking
+        assert 'tier_gpu_kv_bytes_read_gb' in stats
+        assert 'tier_cpu_kv_bytes_read_gb' in stats
+        assert 'tier_storage_kv_bytes_read_gb' in stats
+    
+    def test_cpu_write_bytes_increment_on_allocate(self, multi_tier_cache_cpu_only):
+        """Allocating to CPU tier should increment tier_cpu_kv_bytes_written."""
+        # Get initial stats
+        stats_before = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        cpu_written_before = stats_before.get('tier_cpu_kv_bytes_written_gb', 0)
+        
+        # Allocate cache entry (goes to CPU since GPU is disabled)
+        success, location, _ = multi_tier_cache_cpu_only.allocate_cache("test_entry", num_tokens=100)
+        assert success
+        assert location == 'cpu'
+        
+        # Check that CPU write bytes increased
+        stats_after = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        cpu_written_after = stats_after.get('tier_cpu_kv_bytes_written_gb', 0)
+        
+        assert cpu_written_after > cpu_written_before, \
+            f"CPU write bytes should increase: {cpu_written_before} -> {cpu_written_after}"
+    
+    def test_cpu_read_bytes_increment_on_access(self, multi_tier_cache_cpu_only):
+        """Accessing from CPU tier should increment tier_cpu_kv_bytes_read."""
+        # Allocate first
+        multi_tier_cache_cpu_only.allocate_cache("test_entry", num_tokens=100)
+        
+        # Get stats before access
+        stats_before = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        cpu_read_before = stats_before.get('tier_cpu_kv_bytes_read_gb', 0)
+        
+        # Access the cache entry
+        location, _ = multi_tier_cache_cpu_only.access_cache("test_entry", InferencePhase.DECODE)
+        assert location == 'cpu'
+        
+        # Check that CPU read bytes increased
+        stats_after = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        cpu_read_after = stats_after.get('tier_cpu_kv_bytes_read_gb', 0)
+        
+        assert cpu_read_after > cpu_read_before, \
+            f"CPU read bytes should increase: {cpu_read_before} -> {cpu_read_after}"
+    
+    def test_gpu_bytes_zero_when_gpu_disabled(self, multi_tier_cache_cpu_only):
+        """With GPU disabled (0 GB), GPU tier bytes should remain zero."""
+        # Do some allocations and accesses
+        for i in range(5):
+            multi_tier_cache_cpu_only.allocate_cache(f"entry_{i}", num_tokens=100)
+        for i in range(5):
+            multi_tier_cache_cpu_only.access_cache(f"entry_{i}", InferencePhase.DECODE)
+        
+        stats = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        
+        # GPU bytes should be zero since GPU tier is disabled
+        assert stats.get('tier_gpu_kv_bytes_written_gb', 0) == 0, \
+            "GPU write bytes should be 0 when GPU disabled"
+        assert stats.get('tier_gpu_kv_bytes_read_gb', 0) == 0, \
+            "GPU read bytes should be 0 when GPU disabled"
+    
+    def test_storage_tier_overflow(self, tiny_model_config):
+        """When CPU is full, allocations should overflow to storage tier."""
+        # Create cache with very small CPU limit
+        cache = MultiTierCache(
+            model_config=tiny_model_config,
+            gpu_memory_gb=0,
+            cpu_memory_gb=0.001,  # 1MB - very small
+            seed=42
+        )
+        
+        # Allocate enough to overflow CPU
+        for i in range(20):
+            cache.allocate_cache(f"entry_{i}", num_tokens=1000)
+        
+        stats = cache.get_stats(duration=1.0)
+        
+        # Storage tier should have received some data
+        storage_written = stats.get('tier_storage_kv_bytes_written_gb', 0)
+        assert storage_written > 0, \
+            f"Storage tier should have data when CPU overflows: {storage_written}"
+    
+    def test_per_tier_bandwidth_calculated(self, multi_tier_cache_cpu_only):
+        """Per-tier bandwidth stats should be calculated."""
+        # Do some I/O
+        for i in range(10):
+            multi_tier_cache_cpu_only.allocate_cache(f"entry_{i}", num_tokens=100)
+        for i in range(10):
+            multi_tier_cache_cpu_only.access_cache(f"entry_{i}", InferencePhase.DECODE)
+        
+        stats = multi_tier_cache_cpu_only.get_stats(duration=1.0)
+        
+        # Bandwidth stats should exist
+        assert 'tier_cpu_read_bandwidth_gbps' in stats
+        assert 'tier_cpu_write_bandwidth_gbps' in stats
+        assert 'tier_storage_read_bandwidth_gbps' in stats
+        assert 'tier_storage_write_bandwidth_gbps' in stats
+
+
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
+class TestPerTierPhaseMetricsWithGPU:
+    """Tests for per-tier metrics when GPU is enabled."""
+    
+    @pytest.fixture
+    def tiny_model_config(self):
+        """Return the tiny-1b model config for fast tests."""
+        return MODEL_CONFIGS['tiny-1b']
+    
+    @pytest.fixture
+    def multi_tier_cache_with_gpu(self, tiny_model_config):
+        """Return a MultiTierCache with GPU enabled."""
+        return MultiTierCache(
+            model_config=tiny_model_config,
+            gpu_memory_gb=1.0,  # 1GB GPU
+            cpu_memory_gb=0.1,  # 100MB CPU
+            seed=42
+        )
+    
+    def test_gpu_write_bytes_increment_on_allocate(self, multi_tier_cache_with_gpu):
+        """Allocating to GPU tier should increment tier_gpu_kv_bytes_written."""
+        # Get initial stats
+        stats_before = multi_tier_cache_with_gpu.get_stats(duration=1.0)
+        gpu_written_before = stats_before.get('tier_gpu_kv_bytes_written_gb', 0)
+        
+        # Allocate cache entry (should go to GPU first)
+        success, location, _ = multi_tier_cache_with_gpu.allocate_cache("test_entry", num_tokens=100)
+        assert success
+        assert location == 'gpu'
+        
+        # Check that GPU write bytes increased
+        stats_after = multi_tier_cache_with_gpu.get_stats(duration=1.0)
+        gpu_written_after = stats_after.get('tier_gpu_kv_bytes_written_gb', 0)
+        
+        assert gpu_written_after > gpu_written_before, \
+            f"GPU write bytes should increase: {gpu_written_before} -> {gpu_written_after}"
+    
+    def test_gpu_read_bytes_increment_on_access(self, multi_tier_cache_with_gpu):
+        """Accessing from GPU tier should increment tier_gpu_kv_bytes_read."""
+        # Allocate first
+        multi_tier_cache_with_gpu.allocate_cache("test_entry", num_tokens=100)
+        
+        # Get stats before access
+        stats_before = multi_tier_cache_with_gpu.get_stats(duration=1.0)
+        gpu_read_before = stats_before.get('tier_gpu_kv_bytes_read_gb', 0)
+        
+        # Access the cache entry
+        location, _ = multi_tier_cache_with_gpu.access_cache("test_entry", InferencePhase.DECODE)
+        assert location == 'gpu'
+        
+        # Check that GPU read bytes increased
+        stats_after = multi_tier_cache_with_gpu.get_stats(duration=1.0)
+        gpu_read_after = stats_after.get('tier_gpu_kv_bytes_read_gb', 0)
+        
+        assert gpu_read_after > gpu_read_before, \
+            f"GPU read bytes should increase: {gpu_read_before} -> {gpu_read_after}"
+    
+    def test_gpu_bandwidth_calculated(self, multi_tier_cache_with_gpu):
+        """GPU tier bandwidth stats should be calculated."""
+        # Do some I/O
+        for i in range(5):
+            multi_tier_cache_with_gpu.allocate_cache(f"entry_{i}", num_tokens=100)
+        for i in range(5):
+            multi_tier_cache_with_gpu.access_cache(f"entry_{i}", InferencePhase.DECODE)
+        
+        stats = multi_tier_cache_with_gpu.get_stats(duration=1.0)
+        
+        # GPU bandwidth stats should exist
+        assert 'tier_gpu_read_bandwidth_gbps' in stats
+        assert 'tier_gpu_write_bandwidth_gbps' in stats
+
+
+# =============================================================================
 # Main entry point for running without pytest
 # =============================================================================
 
@@ -885,8 +1635,10 @@ def pytest_configure(config):
     """Add metadata to pytest-html report."""
     if hasattr(config, '_metadata'):
         config._metadata['Project'] = 'MLPerf v3 KV Cache Benchmark'
+        config._metadata['Source File'] = 'kv-cache.py'
         config._metadata['Models'] = 'tiny-1b, mistral-7b, llama2-7b, llama3.1-8b, llama3.1-70b-instruct'
         config._metadata['Test File'] = 'test_kv_cache.py'
+        config._metadata['New Features Tested'] = 'ConfigLoader, Extended QoS (p999/p9999), cfg() helper, storage_* naming'
 
 
 def pytest_html_report_title(report):
