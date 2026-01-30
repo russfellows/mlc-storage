@@ -120,6 +120,9 @@ python vdbbench/simple_bench.py --host 127.0.0.1 --collection <collection_name> 
 
 For comparison with HNSW indexing, use ```vdbbench/configs/10m_hnsw.yaml``` and update collection_name accordingly.
 
+```simple_bench.py``` script assumes default vector dimension as 1536.
+If collection was created with a different dimension value or if you encounter ```MilvusException: vector dimension mismatch``` use ```--vector-dim <dimension>``` parameter.
+
 ## Supported Databases
 Milvus with DiskANN, HNSW and AISAQ indexing (currently implemented)
 
