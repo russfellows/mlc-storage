@@ -795,27 +795,34 @@ Result: 4 old cache entries permanently lost, 1 new entry written
 
 #### Two Separate Eviction Mechanisms
 
-The benchmark has **two independent eviction systems** that can both trigger deletions:
+The benchmark has **two independent eviction systems**. Only one of them deletes files from disk:
 
-| Mechanism | Location | Trigger | What Gets Deleted |
-|-----------|----------|---------|-------------------|
-| **ConversationManager** | `conversation.py` | `len(conversations) >= max_conversations` | Conversation **metadata** only |
-| **MultiTierCache** | `cache.py` | `tier_usage >= capacity × target_ratio` | Actual cache **files** (.npy) |
+| Mechanism | Location | Trigger | What Happens |
+|-----------|----------|---------|--------------|
+| **ConversationManager** | `conversation.py` | `len(conversations) >= max_conversations` | Removes conversation **metadata** from memory. Cache files (.npy) **remain on disk**. |
+| **MultiTierCache** | `cache.py` | `tier_usage >= capacity × target_ratio` | Calls `path.unlink()` on .npy files, **permanently deleting them from the filesystem**. |
 
 **ConversationManager eviction (default: 1000 conversations):**
 ```python
 # conversation.py line 72-73
 if len(self.conversations) >= self.max_conversations:  # default 1000
-    self._evict_oldest_conversation()  # deletes metadata ONLY
+    self._evict_oldest_conversation()  # removes metadata dict entry ONLY
 ```
 
-This removes the conversation tracking record, but the **cache files stay on disk** until MultiTierCache evicts them.
+This removes the conversation tracking record (an in-memory dict entry). The **cache .npy files remain on disk** untouched; they are only deleted when MultiTierCache runs out of capacity.
 
 **MultiTierCache eviction (based on storage capacity):**
 ```python
-# cache.py - when NVMe is only tier and full
+# cache.py - when NVMe is the bottom tier and full
 if nvme_usage >= nvme_capacity * 0.8:
-    delete_lru_entries()  # actually unlinks .npy files
+    for lru_key in lru_entries_to_evict:
+        self.backends['nvme'].delete(lru_key)  # calls path.unlink() -> file permanently deleted
+
+# backends.py - NVMeBackend.delete()
+def delete(self, key):
+    path = self.base_path / f"{key}.npy"
+    path.unlink()          # POSIX unlink: permanently removes the file from the filesystem
+    del self.metadata[key]
 ```
 
 **Example timeline:**
@@ -823,12 +830,12 @@ if nvme_usage >= nvme_capacity * 0.8:
 t=0:   Conversation 1 started, cache file written (1.2 GB)
 t=10:  Conversation 1000 started
 t=11:  Conversation 1001 started
-       ├─ ConversationManager evicts conv 1 METADATA
-       └─ Cache file for conv 1 STILL ON DISK
+       ├─ ConversationManager evicts conv 1 metadata (dict entry removed)
+       └─ Cache .npy file for conv 1 STILL ON DISK (untouched)
 
 t=100: NVMe reaches 80% capacity
-       ├─ MultiTierCache evicts LRU files
-       └─ Conv 1's cache file finally DELETED from disk
+       ├─ MultiTierCache calls NVMeBackend.delete() on LRU entries
+       └─ Conv 1's .npy file permanently deleted from filesystem via path.unlink()
 ```
 
 **Config locations:**
