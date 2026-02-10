@@ -542,8 +542,8 @@ host_time = (pre_load - start) + (copy_done - load_done)
 Decode reads are batched to model realistic KV cache access:
 
 ```python
-decode_batch_size = 32  # Hardcoded
-num_reads = max(1, (generate_tokens + 31) // 32)
+decode_batch_size = cfg('decode', 'batch_size', default=32)  # config.yaml: decode.batch_size
+num_reads = max(1, (generate_tokens + decode_batch_size - 1) // decode_batch_size)
 ```
 
 | `generate_tokens` | Batched Reads |
