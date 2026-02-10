@@ -14,18 +14,42 @@
 # context_range: [min, max] tokens in the input prompt
 # generation_range: [min, max] tokens to generate in the response
 # think_time_range: [min, max] seconds between requests (simulated user delay)
+#
+# Sources:
+#   [1] OpenRouter "State of AI: An Empirical 100T Token Study" (arXiv:2601.10088)
+#       - Avg prompt tokens grew ~4x from ~1,500 to >6,000 (early 2024 → late 2025)
+#       - Avg completion tokens grew ~3x from ~150 to ~400
+#       - Programming workloads routinely exceed 20K input tokens
+#       - Non-programming categories remain "relatively flat and low-volume"
+#       - Overall input:output ratio ~15:1
+#   [2] BurstGPT (arXiv:2401.17644) — 10.31M traces from Azure OpenAI GPT
+#       - Request lengths follow a Zipf distribution (many short, long tail)
+#       - ChatGPT response lengths are bimodal with linear request-response
+#         correlation
 # =============================================================================
 user_templates:
   chatbot:
-    context_range: [256, 1024]
-    generation_range: [50, 150]
+    # General-purpose conversational use. Non-programming categories stay
+    # well below the platform average of ~6K input tokens [1]. Zipf-shaped
+    # request distribution means most chatbot prompts are short [2].
+    context_range: [512, 4096]
+    # Completions average ~400 tokens across all categories [1].
+    generation_range: [50, 200]
     think_time_range: [0.1, 0.5]
   coding:
-    context_range: [1024, 4096]
+    # Programming is the dominant context-length driver, "routinely exceeding
+    # 20K input tokens" and averaging 3-4x general-purpose prompts [1].
+    # Claude handles ~60% of coding workloads at >20K avg prompt tokens [1].
+    context_range: [4096, 25000]
+    # Output stays modest relative to input (~15:1 input:output ratio) [1].
     generation_range: [100, 500]
     think_time_range: [0.2, 1.0]
   document:
-    context_range: [2048, 8192]
+    # Long-context document analysis (summarization, Q&A over files).
+    # Sits between chatbot and coding; context-heavy but below coding peaks.
+    # Overall avg sequence length >5,400 tokens by late 2025 [1].
+    context_range: [4096, 16384]
+    # Longer outputs for summaries/analysis; still within ~400 avg [1].
     generation_range: [200, 800]
     think_time_range: [0.3, 1.5]
 
@@ -114,12 +138,30 @@ prefix_cache:
 # =============================================================================
 # RAG SETTINGS
 # Controls Retrieval-Augmented Generation workload simulation.
+#
+# retrieval_distribution options:
+#   - "zipfian": Earlier chunks more likely (realistic - document intros are often relevant)
+#   - "uniform": All chunks equally likely (random access pattern)
+#   - "random":  Alias for uniform
+#
+# Document token ranges are model-aware:
+#   - Large models (hidden_dim >= 8192 or layers >= 64) have bigger per-token KV cache,
+#     so we use fewer tokens per document to avoid memory pressure.
+#   - Smaller models can handle larger documents.
 # =============================================================================
 rag:
   chunk_size_tokens: 512          # Tokens per document chunk
   top_k_chunks: 5                 # Number of chunks retrieved per query
   max_chunk_bytes: 268435456      # 256MB max per chunk (256 * 1024 * 1024)
-
+  request_probability: 0.1        # Probability of RAG operation per request (0.0-1.0)
+  retrieval_distribution: "zipfian"  # Distribution for chunk selection: zipfian, uniform, random
+  max_documents: 0                # Max documents before eviction (0 = unlimited)
+  # Document token ranges (model-aware sizing)
+  large_model_doc_tokens_min: 1024   # Min tokens for large models (70B+)
+  large_model_doc_tokens_max: 4096   # Max tokens for large models
+  small_model_doc_tokens_min: 4000   # Min tokens for smaller models
+  small_model_doc_tokens_max: 12000  # Max tokens for smaller models
+  
 # =============================================================================
 # CONVERSATION SETTINGS
 # Controls multi-turn conversation behavior.
@@ -175,3 +217,141 @@ validation_limits:
   max_duration_seconds: 86400     # 24 hours max benchmark duration
   max_gpu_memory_gb: 1024         # 1TB max GPU memory
   max_cpu_memory_gb: 16384        # 16TB max CPU memory
+
+# A dictionary of pre-defined model configurations that can be selected via command line.
+
+# ...existing code...
+
+model_configs:
+# Formula: 2 × num_layers × 1 × kv_heads × head_dim
+# head_dim = hidden_dim / num_heads
+# Total Bytes = Total Elements × dtype_size (2 for float16)
+
+# Tiny 1B: Synthetic test model (no HuggingFace source — benchmark-internal config)
+# head_dim = 1024 / 8 = 128
+# Total Elements: 2 × 12 × 1 × 4 × 128 = 12288
+# Total Bytes: 12288 × 2 = 24576 bytes
+# KV Cache Size per token: 24576 / (1024³) ≈ 0.000023 GB (0.023 MB)
+  tiny-1b:
+    name: "Tiny 1B"
+    num_layers: 12
+    hidden_dim: 1024
+    num_heads: 8
+    kv_heads: 4
+    dtype: "float16"
+
+# Source: https://huggingface.co/mistralai/Mistral-7B-v0.1/blob/main/config.json
+# head_dim = 4096 / 32 = 128
+# Total Elements: 2 × 32 × 1 × 8 × 128 = 65536
+# Total Bytes: 65536 × 2 = 131072 bytes
+# KV Cache Size per token: 131072 / (1024³) ≈ 0.000122 GB (0.125 MB)
+  mistral-7b:
+    name: "Mistral 7B"
+    num_layers: 32
+    hidden_dim: 4096
+    num_heads: 32
+    kv_heads: 8
+    dtype: "float16"
+
+# Source: https://huggingface.co/meta-llama/Llama-2-7b-hf/blob/main/config.json
+# head_dim = 4096 / 32 = 128
+# Total Elements: 2 × 32 × 1 × 32 × 128 = 262144
+# Total Bytes: 262144 × 2 = 524288 bytes
+# KV Cache Size per token: 524288 / (1024³) ≈ 0.000488 GB (0.500 MB)
+  llama2-7b:
+    name: "Llama 2 7B"
+    num_layers: 32
+    hidden_dim: 4096
+    num_heads: 32
+    kv_heads: 32
+    dtype: "float16"
+
+# Source: https://huggingface.co/meta-llama/Llama-3.1-8B/blob/main/config.json
+# head_dim = 4096 / 32 = 128
+# Total Elements: 2 × 32 × 1 × 8 × 128 = 65536
+# Total Bytes: 65536 × 2 = 131072 bytes
+# KV Cache Size per token: 131072 / (1024³) ≈ 0.000122 GB (0.125 MB)
+  llama3.1-8b:
+    name: "Llama 3.1 8B"
+    num_layers: 32
+    hidden_dim: 4096
+    num_heads: 32
+    kv_heads: 8
+    dtype: "float16"
+
+# Source: https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct/blob/main/config.json
+# head_dim = 8192 / 64 = 128
+# Total Elements: 2 × 80 × 1 × 8 × 128 = 163840
+# Total Bytes: 163840 × 2 = 327680 bytes
+# KV Cache Size per token: 327680 / (1024³) ≈ 0.000305 GB (0.313 MB)
+  llama3.1-70b-instruct:
+    name: "Llama 3.1 70B Instruct"
+    num_layers: 80
+    hidden_dim: 8192
+    num_heads: 64
+    kv_heads: 8
+    dtype: "float16"
+
+# DeepSeek-v3 uses Multi-head Latent Attention (MLA).
+# MLA compresses K and V into a single latent vector (kv_lora_rank=512)
+# plus a decoupled RoPE key (qk_rope_head_dim=64), cached per layer.
+# Formula: num_layers × (kv_lora_rank + qk_rope_head_dim) × dtype_bytes
+# Total Elements: 61 × (512 + 64) = 61 × 576 = 35136
+# Total Bytes: 35136 × 2 = 70272 bytes
+# KV Cache Size per token: 70272 / (1024³) ≈ 0.000065 GB (0.067 MB)
+# Sources: DeepSeek-V3 Technical Report (arXiv:2412.19437), HuggingFace config.json
+  deepseek-v3:
+    name: "Deepseek v3"
+    num_layers: 61
+    num_heads: 128
+    hidden_dim: 7168
+    attention_type: "mla"
+    kv_lora_rank: 512
+    qk_rope_head_dim: 64
+    dtype: "float16"
+
+# Qwen3-32B: head_dim = 128 (explicitly set in HF config, NOT hidden_dim/num_heads=80)
+# Source: https://huggingface.co/Qwen/Qwen3-32B/blob/main/config.json
+# Total Elements: 2 × 64 × 1 × 8 × 128 = 131072
+# Total Bytes: 131072 × 2 = 262144 bytes
+# KV Cache Size per token: 262144 / (1024³) ≈ 0.000244 GB (0.250 MB)
+  qwen3-32b:
+    name: "Qwen 3 32B"
+    num_layers: 64
+    num_heads: 64
+    hidden_dim: 5120
+    kv_heads: 8
+    kv_dim_per_head: 128
+    dtype: "float16"
+
+# GPT-OSS 120B: MoE model (117B total, 5.1B active) - fits on single 80GB GPU
+# Source: https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json
+# Paper: https://arxiv.org/abs/2508.10925
+# head_dim = 64 (explicitly set in config.json, NOT hidden_dim/num_heads=45)
+# Total Elements: 2 × 36 × 1 × 8 × 64 = 36864
+# Total Bytes: 36864 × 2 = 73728 bytes
+# KV Cache Size per token: 73728 / (1024³) ≈ 0.000069 GB (0.070 MB)
+  gpt-oss-120b:
+    name: "GPT-OSS 120B (5.1B active)"
+    num_layers: 36
+    num_heads: 64
+    hidden_dim: 2880
+    kv_heads: 8
+    kv_dim_per_head: 64
+    dtype: "float16"
+
+# GPT-OSS 20B: MoE model (21B total, 3.6B active) - fits in 16GB memory
+# Source: https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json
+# Paper: https://arxiv.org/abs/2508.10925
+# head_dim = 64 (explicitly set in config.json, NOT hidden_dim/num_heads=45)
+# Total Elements: 2 × 24 × 1 × 8 × 64 = 24576
+# Total Bytes: 24576 × 2 = 49152 bytes
+# KV Cache Size per token: 49152 / (1024³) ≈ 0.000046 GB (0.047 MB)
+  gpt-oss-20b:
+    name: "GPT-OSS 20B (3.6B active)"
+    num_layers: 24
+    num_heads: 64
+    hidden_dim: 2880
+    kv_heads: 8
+    kv_dim_per_head: 64
+    dtype: "float16"

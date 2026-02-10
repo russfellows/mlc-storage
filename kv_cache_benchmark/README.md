@@ -5,7 +5,7 @@ A storage benchmarking tool for Large Language Model inference systems. This ben
 **Author:** Hazem Awadallah, Kingston Digital
 **License:** Apache 2.0
 **Version:** MLPerf Storage v3.0 (Enhanced)
-**Updated:** January 27, 2026
+**Updated:** February 4, 2026
 
 ---
 
@@ -13,18 +13,20 @@ A storage benchmarking tool for Large Language Model inference systems. This ben
 
 1. [What This Benchmark Does](#what-this-benchmark-does)
 2. [Architecture Overview](#architecture-overview)
-3. [System Requirements](#system-requirements)
-4. [Installation](#installation)
-5. [Configuration](#configuration)
-6. [Quick Start](#quick-start)
-7. [Running the Benchmark](#running-the-benchmark)
-8. [ShareGPT Replay Workloads](#sharegpt-replay-workloads)
-9. [Using the Wrapper Script](#using-the-wrapper-script)
-10. [Understanding Results](#understanding-results)
-11. [Unit Testing](#unit-testing)
-12. [Excel Export](#excel-export)
-13. [MLPerf Submission Guidelines](#mlperf-submission-guidelines)
-14. [Troubleshooting](#troubleshooting)
+3. [Project Structure](#project-structure)
+4. [System Requirements](#system-requirements)
+5. [Installation](#installation)
+6. [Configuration](#configuration)
+7. [Quick Start](#quick-start)
+8. [Running the Benchmark](#running-the-benchmark)
+9. [ShareGPT Replay Workloads](#sharegpt-replay-workloads)
+10. [BurstGPT Trace Replay](#burstgpt-trace-replay)
+11. [Using the Wrapper Script](#using-the-wrapper-script)
+12. [Understanding Results](#understanding-results)
+13. [Unit Testing](#unit-testing)
+14. [Excel Export](#excel-export)
+15. [MLPerf Submission Guidelines](#mlperf-submission-guidelines)
+16. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -32,14 +34,18 @@ A storage benchmarking tool for Large Language Model inference systems. This ben
 
 During LLM inference, models store intermediate attention data in a structure called the KV (Key-Value) cache. This cache grows with conversation length and can consume enormous amounts of memory. Production systems offload this cache from expensive GPU VRAM to cheaper CPU RAM or NVMe storage.
 
-This benchmark simulates that offloading behavior. It generates realistic multi-user inference workloads and measures how your storage performs under pressure. It measures these components:
+This benchmark simulates that offloading behavior. It generates realistic multi-user inference workloads and measures how your storage performs under pressure. It answers:
 
-- How many concurrent users your hardware can support
+- The real latency impact of each storage tier (GPU vs. CPU vs. NVMe)
 - Whether your NVMe drive is fast enough to handle cache spillover
-- The real latency impact of each storage tier
-- Where the bottleneck sits in your system
+- How many concurrent users your storage can sustain at a given throughput
+- Where the storage bottleneck sits in your system
 
 This is not a pass/fail test. It is a diagnostic tool for system architects and performance engineers.
+
+> **Note:** The benchmark uses a one-way waterfall — data flows from GPU → CPU → NVMe but is never promoted back on read. This maximizes storage stress but means capacity planning results reflect storage throughput limits, not end-to-end serving capacity (which depends on promotion policy). See the proposal §3.4 for design rationale.
+
+> **Terminology:** "NVMe" is used throughout as shorthand for the third storage tier. The benchmark accepts any block device or filesystem via `--cache-dir` (SATA SSD, HDD, RAM disk, NFS, etc.).
 
 ---
 
@@ -117,6 +123,53 @@ The benchmark implements a three-tier memory hierarchy that mirrors production L
 
 ---
 
+## Project Structure
+
+The benchmark uses a modular architecture for maintainability and extensibility:
+
+```
+mlperf-kv-cache/
+├── kv-cache.py           # CLI entry point (backward-compatible wrapper)
+├── config.yaml           # YAML configuration file
+├── pyproject.toml        # Python packaging configuration
+├── test_kv_cache.py      # Unit tests
+├── README.md             # This file
+│
+└── kv_cache/             # Core package
+    ├── __init__.py       # Package exports
+    ├── _compat.py        # Optional dependency detection
+    ├── backends.py       # Storage tier implementations (GPU/CPU/NVMe)
+    ├── benchmark.py      # IntegratedBenchmark orchestration
+    ├── cache.py          # MultiTierCache with waterfall eviction
+    ├── cli.py            # Argument parsing and main() entry point
+    ├── config.py         # ConfigLoader and cfg() helper
+    ├── conversation.py   # Multi-turn conversation state management
+    ├── models.py         # Model configs, QoS profiles, data classes
+    ├── monitoring.py     # Metrics collection and storage monitoring
+    ├── prefix_cache.py   # System prompt prefix caching
+    ├── rag.py            # RAG workload simulation
+    └── workload.py       # User simulation and request generation
+```
+
+### Module Responsibilities
+
+| Module | Purpose |
+|--------|---------|
+| `cli.py` | Parses CLI arguments, loads config, calls `IntegratedBenchmark` |
+| `config.py` | Loads `config.yaml`, provides `cfg()` helper for accessing nested values |
+| `models.py` | Defines `ModelConfig`, `QoSLevel`, `InferenceRequest`, and other data classes |
+| `cache.py` | Implements `MultiTierCache` with LRU eviction and tier management |
+| `backends.py` | `GPUMemoryBackend`, `CPUMemoryBackend`, `NVMeBackend` storage implementations |
+| `benchmark.py` | `IntegratedBenchmark` orchestrates the full benchmark run |
+| `workload.py` | `UserSimulator` generates realistic request patterns |
+| `conversation.py` | `ConversationManager` tracks multi-turn state |
+| `prefix_cache.py` | `PrefixMatcher` caches common system prompts |
+| `rag.py` | `RAGDocumentManager` simulates document retrieval |
+| `monitoring.py` | `StorageMonitor`, `QoSMonitor`, `WorkloadAutoscaler` for observability |
+| `_compat.py` | Detects optional dependencies (torch, cupy, tiktoken, etc.) |
+
+---
+
 ## System Requirements
 
 ### Minimum
@@ -125,7 +178,7 @@ The benchmark implements a three-tier memory hierarchy that mirrors production L
 - RAM: 32 GB
 - Storage: 256 GB free space on SSD
 - OS: Linux (Ubuntu 22.04, RHEL 9, or similar) or Windows
-- Python: 3.8 or higher
+- Python: 3.10 or higher
 - No GPU required (runs in CPU-only mode)
 
 ### Recommended
@@ -136,46 +189,150 @@ The benchmark implements a three-tier memory hierarchy that mirrors production L
 - Storage: 1 TB+ on NVMe (PCIe Gen4 or Gen5)
 - Tools: `bc`, `jq` for the wrapper script (Linux)
 
+### Memory Requirements by Model
+
+The benchmark's RAM usage depends on the model's KV cache size per token and the `--max-concurrent-allocs` setting. Use this table to select appropriate settings for your system.
+
+#### KV Cache Size Per Token
+
+| Model | Architecture | kv_heads | Bytes/Token | MB/Token |
+|-------|--------------|----------|-------------|----------|
+| `tiny-1b` | GQA | 4 | 24,576 | 0.023 |
+| `mistral-7b` | GQA | 8 | 131,072 | 0.125 |
+| `llama2-7b` | **MHA** | 32 | 524,288 | **0.500** |
+| `llama3.1-8b` | GQA | 8 | 131,072 | 0.125 |
+| `llama3.1-70b-instruct` | GQA | 8 | 327,680 | 0.313 |
+| `deepseek-v3` | MLA | 128 | 1,748,992 | 1.63 |
+| `qwen3-32b` | GQA | 8 | 163,840 | 0.153 |
+| `gpt-oss-120b` | MoE | 8 | 73,728 | 0.069 |
+| `gpt-oss-20b` | MoE | 8 | 49,152 | 0.046 |
+
+> **Note:** `llama2-7b` uses Multi-Head Attention (MHA) with 32 KV heads, making it **4× larger** than similarly-sized GQA models like `llama3.1-8b`. This is intentional for stress testing.
+
+#### Peak In-Flight RAM by `--max-concurrent-allocs`
+
+Formula: `Peak RAM = max_concurrent_allocs × avg_context_tokens × bytes_per_token`
+
+Assumes average context of 8,192 tokens (midpoint of coding user profile):
+
+| Model | Per User | 200 users (unlimited) | 16 allocs | 8 allocs | 4 allocs |
+|-------|----------|----------------------|-----------|----------|----------|
+| `tiny-1b` | 0.2 GB | 40 GB | 3.2 GB | 1.6 GB | 0.8 GB |
+| `mistral-7b` | 1.0 GB | 200 GB | 16 GB | 8 GB | 4 GB |
+| `llama2-7b` | **4.0 GB** | **800 GB** | **64 GB** | **32 GB** | **16 GB** |
+| `llama3.1-8b` | 1.0 GB | 200 GB | 16 GB | 8 GB | 4 GB |
+| `llama3.1-70b-instruct` | 2.5 GB | 500 GB | 40 GB | 20 GB | 10 GB |
+| `deepseek-v3` | **13.4 GB** | **2,680 GB** | **214 GB** | **107 GB** | **54 GB** |
+| `qwen3-32b` | 1.25 GB | 250 GB | 20 GB | 10 GB | 5 GB |
+| `gpt-oss-120b` | 0.56 GB | 112 GB | 9 GB | 4.5 GB | 2.3 GB |
+| `gpt-oss-20b` | 0.38 GB | 76 GB | 6 GB | 3 GB | 1.5 GB |
+
+#### Recommended Settings by System RAM
+
+| System RAM | Recommended `--max-concurrent-allocs` | Safe Models (unlimited) |
+|------------|---------------------------------------|-------------------------|
+| 32 GB | 4 | `tiny-1b`, `gpt-oss-20b` |
+| 64 GB | 8 | `mistral-7b`, `llama3.1-8b`, `qwen3-32b` |
+| 128 GB | 16 | All except `llama2-7b`, `deepseek-v3` |
+| 256 GB | 16–32 | All models with bounded concurrency |
+| 512 GB+ | 32–64 | All models |
+
+> **⚠️ Critical:** Running `llama2-7b` or `deepseek-v3` with `--max-concurrent-allocs 0` (unlimited) requires **800+ GB RAM**. Always set this parameter on memory-constrained systems.
+
+#### Impact on Benchmark Results
+
+The `--max-concurrent-allocs` parameter affects benchmark metrics in important ways:
+
+| Setting | Throughput | Latency | Realism | Use Case |
+|---------|------------|---------|---------|----------|
+| **0 (unlimited)** | Highest | Lower (less queueing) | Lower | Max hardware stress |
+| **16** | High | Moderate | Moderate | Storage stress testing |
+| **8** | Moderate | Higher (more queueing) | Higher | Production simulation |
+| **4** | Lower | Highest (significant queueing) | Highest | Memory-constrained systems |
+
+**Why this matters:**
+- **Lower values** (4–8) cause requests to queue, increasing measured latencies but reducing RAM usage. This better simulates production where admission control limits concurrency.
+- **Higher values** (16–32) maximize parallel I/O, showing peak hardware throughput but requiring more RAM.
+- **Unlimited (0)** removes all queueing delays but can exhaust RAM or cause artificial latency spikes from GC pressure.
+
+**For MLPerf submissions:** Use `--max-concurrent-allocs 16` for stress tests (Test 1) to balance throughput measurement with memory safety.
+
 ---
 
 ## Installation
 
-1. Clone or download this repository.
+### Option 1: Install as Package (Recommended)
 
-2. Install Python dependencies:
+Install the package with pip:
 
 ```bash
-pip install -r requirements.txt
+# Clone the repository
+git clone https://github.com/mlcommons/storage.git
+cd storage/kv-cache
+
+# (Optional) Upgrade pip and setuptools if you have an older version
+pip install --upgrade pip setuptools wheel
+
+# Install with all optional dependencies
+pip install ".[full]"
+
+# Or install with specific features
+pip install ".[yaml]"           # YAML config support only
+pip install ".[gpu]"            # GPU support (PyTorch + CuPy)
+pip install ".[tokenizer]"      # tiktoken for ShareGPT
+pip install ".[reporting]"      # pandas + openpyxl for Excel output
+pip install ".[dev]"            # Development tools (pytest, ruff, mypy)
 ```
 
-Or install core dependencies manually:
+After installation, run the benchmark from anywhere:
 
 ```bash
+kv-cache --help
+# or
+mlperf-kv-cache --help
+```
+
+### Option 2: Run Directly (No Install)
+
+```bash
+# Clone and enter the directory
+git clone https://github.com/mlcommons/storage.git
+cd storage/kv-cache
+
+# Install dependencies manually
 pip install numpy pyyaml
+
+# Run directly
+python kv-cache.py --help
 ```
 
-3. For GPU support (optional):
+### Optional Dependencies
+
+Install based on your needs:
 
 ```bash
-pip install torch  # or cupy-cuda12x for CuPy
+# GPU support
+pip install torch                    # PyTorch for GPU tensors
+pip install cupy-cuda12x             # CuPy for CUDA (adjust cuda version)
+
+# ShareGPT replay workloads
+pip install tiktoken                 # OpenAI tokenizer
+
+# Excel/CSV export
+pip install pandas openpyxl          # DataFrame and Excel support
 ```
 
-4. For ShareGPT replay workloads (optional):
+### Verify Installation
 
 ```bash
-pip install tiktoken
-```
+# Check CLI is working
+kv-cache --help
 
-5. For Excel export (optional):
+# Or if running directly
+python kv-cache.py --help
 
-```bash
-pip install pandas openpyxl
-```
-
-6. Verify the installation:
-
-```bash
-python3 kv-cache.py --help
+# Run unit tests
+pytest test_kv_cache.py -v
 ```
 
 ---
@@ -212,13 +369,13 @@ Controls the three simulated user personas. Each persona has distinct characteri
 
 | Parameter | Type | Default | Impact |
 |-----------|------|---------|--------|
-| `user_templates.chatbot.context_range` | [min, max] | [256, 1024] | **KV cache write size per request.** Smaller values reduce storage pressure; larger values stress NVMe throughput. |
-| `user_templates.chatbot.generation_range` | [min, max] | [50, 150] | **Decode phase duration.** More tokens = more cache reads per request. Affects read/write ratio. |
+| `user_templates.chatbot.context_range` | [min, max] | [512, 4096] | **KV cache write size per request.** Smaller values reduce storage pressure; larger values stress NVMe throughput. |
+| `user_templates.chatbot.generation_range` | [min, max] | [50, 200] | **Decode phase duration.** More tokens = more cache reads per request. Affects read/write ratio. |
 | `user_templates.chatbot.think_time_range` | [min, max] | [0.1, 0.5] | **Request inter-arrival time.** Shorter = higher request rate, more concurrent cache operations. |
-| `user_templates.coding.context_range` | [min, max] | [1024, 4096] | Medium-length contexts typical of code completion scenarios. 4× larger than chatbot. |
+| `user_templates.coding.context_range` | [min, max] | [4096, 25000] | Large contexts typical of code completion scenarios with full file context. Based on OpenRouter data showing programming workloads routinely exceed 20K input tokens. |
 | `user_templates.coding.generation_range` | [min, max] | [100, 500] | Code generation often produces longer outputs than conversational AI. |
 | `user_templates.coding.think_time_range` | [min, max] | [0.2, 1.0] | Developers pause to review generated code before next request. |
-| `user_templates.document.context_range` | [min, max] | [2048, 8192] | **Stress test scenarios.** 8K tokens creates ~1 GB of total KV cache data for 8B models (128 KB/token × 8,192 tokens). |
+| `user_templates.document.context_range` | [min, max] | [4096, 16384] | **Stress test scenarios.** 16K tokens creates ~2 GB of total KV cache data for 8B models (128 KB/token × 16,384 tokens). |
 | `user_templates.document.generation_range` | [min, max] | [200, 800] | Long-form analysis outputs (summaries, reports). |
 | `user_templates.document.think_time_range` | [min, max] | [0.3, 1.5] | Users read lengthy outputs before continuing. |
 
@@ -458,7 +615,7 @@ These arguments **must** be passed via command line (not configurable in config.
 |----------|------|---------|----------|-------------|
 | `--config` | str | None | No | Path to YAML configuration file |
 | `--log-level` | str | INFO | No | Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL |
-| `--model` | str | llama3.1-8b | Yes | Model config: tiny-1b, mistral-7b, llama2-7b, llama3.1-8b, llama3.1-70b-instruct |
+| `--model` | str | llama3.1-8b | Yes | Model config (see [Supported Models](#supported-models) below) |
 | `--num-users` | int | 100 | Yes | Number of concurrent users to simulate |
 | `--duration` | int | 60 | Yes | Benchmark duration in seconds |
 | `--gpu-mem-gb` | float | 16 | Yes | GPU VRAM budget in GB (0 to disable) |
@@ -483,7 +640,104 @@ These arguments **must** be passed via command line (not configurable in config.
 | `--max-concurrent-allocs` | int | 0 | No | Limit concurrent allocations (0=unlimited) |
 | `--request-rate` | float | 0 | No | Target request rate (req/sec, 0=unlimited) |
 | `--max-requests` | int | 0 | No | Stop after N requests (0=use duration) |
+| `--storage-capacity-gb` | float | 0 | No | NVMe tier capacity in GB (0=auto-detect from disk) |
+| `--precondition` | flag | False | No | Write 2× NVMe capacity before benchmark (SSD steady-state) |
+| `--precondition-size-gb` | float | 0 | No | Preconditioning volume in GB (0=2x NVMe capacity) |
+| `--precondition-threads` | int | 0 | No | Preconditioning writer threads (0=cpu_count) |
 | `--xlsx-output` | str | None | No | Excel/CSV output file path |
+| `--prefill-only` | flag | False | No | Write-heavy benchmark (skip decode reads) |
+| `--decode-only` | flag | False | No | Read-heavy benchmark (pre-populate cache, then read) |
+
+### Preconditioning vs Prefill-Only vs Decode-Only
+
+| Feature | `--precondition` | `--prefill-only` | `--decode-only` |
+|---------|------------------|------------------|-----------------|
+| **Purpose** | Reach SSD steady-state | Benchmark write performance | Benchmark read performance |
+| **When** | Before benchmark starts | During benchmark | During benchmark |
+| **I/O Pattern** | Sequential writes (fixed 2KB entries) | Write-heavy (+ prefix/multi-turn reads) | Reads from pre-populated cache |
+| **Data Volume** | 2× NVMe capacity | Depends on duration/users | N/A (reads only) |
+| **Stats Reset** | Yes (writes don't count) | No (writes ARE the metric) | Yes (pre-pop doesn't count) |
+| **Use Case** | Fair SSD comparison | Prefill node simulation | Decode node simulation |
+
+**Note on prefill-only reads:** Even in `--prefill-only` mode, reads still occur for:
+- Prefix cache hits (shared system prompts)
+- Multi-turn conversation history
+- RAG document chunks
+
+For **pure write testing** (no reads), combine flags:
+```bash
+python3 kv-cache.py --model llama3.1-70b-instruct --prefill-only \
+    --disable-multi-turn --disable-prefix-caching \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 300 --cache-dir /mnt/nvme
+```
+
+**Example: Full SSD benchmark with preconditioning + pure writes**
+```bash
+python3 kv-cache.py --model llama3.1-70b-instruct \
+    --precondition --prefill-only \
+    --disable-multi-turn --disable-prefix-caching \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 300 --cache-dir /mnt/nvme
+```
+This first fills the SSD to steady-state, then measures sustained write throughput with zero reads.
+
+### Disaggregated Inference Modes
+
+Modern inference systems often separate prefill and decode into different node pools:
+
+| Mode | Flag | I/O Pattern | Use Case |
+|------|------|-------------|----------|
+| Standard | *(none)* | Mixed R/W | Colocated prefill+decode |
+| Prefill-only | `--prefill-only` | **Write-heavy** | Prefill nodes, SSD endurance |
+| Decode-only | `--decode-only` | **Read-heavy** | Decode nodes, read IOPS/latency |
+
+**How decode-only works:** Before the benchmark, the cache is pre-populated with `num_users × 10` entries (simulating KV caches from prefill nodes). The benchmark then measures pure read performance.
+
+```bash
+# Simulate disaggregated prefill node (write-heavy)
+python3 kv-cache.py --model llama3.1-70b-instruct --prefill-only \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 120 --cache-dir /mnt/nvme
+
+# Simulate disaggregated decode node (read-heavy)  
+python3 kv-cache.py --model llama3.1-70b-instruct --decode-only \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 120 --cache-dir /mnt/nvme
+```
+
+### Supported Models
+
+The following models are pre-configured. You can add custom models by editing `config.yaml`.
+
+| Model Key | Name | Layers | Hidden Dim | Heads | KV Heads | KV Cache/Token |
+|-----------|------|--------|------------|-------|----------|----------------|
+| `tiny-1b` | Tiny 1B | 12 | 1024 | 8 | 4 | ~24 KB |
+| `mistral-7b` | Mistral 7B | 32 | 4096 | 32 | 8 | ~128 KB |
+| `llama2-7b` | Llama 2 7B | 32 | 4096 | 32 | 32 | ~512 KB |
+| `llama3.1-8b` | Llama 3.1 8B | 32 | 4096 | 32 | 8 | ~128 KB |
+| `llama3.1-70b-instruct` | Llama 3.1 70B | 80 | 8192 | 64 | 8 | ~320 KB |
+| `deepseek-v3` | DeepSeek V3 | 61 | 7168 | 128 | 128 | ~1.7 MB |
+| `qwen3-32b` | Qwen 3 32B | 64 | 5120 | 64 | 8 | ~160 KB |
+| `gpt-oss-120b` | GPT-OSS 120B (5.1B active) | 36 | 2880 | 64 | 8 | ~72 KB |
+| `gpt-oss-20b` | GPT-OSS 20B (3.6B active) | 24 | 2880 | 64 | 8 | ~48 KB |
+
+#### Adding Custom Models
+
+Add new models to `config.yaml` under `model_configs`:
+
+```yaml
+model_configs:
+  my-custom-model:
+    name: "My Custom Model"
+    num_layers: 40
+    hidden_dim: 5120
+    num_heads: 40
+    kv_heads: 8
+    dtype: "float16"
+```
+
+Then use it with `--model my-custom-model`.
 
 ### Test Scenarios
 
@@ -716,6 +970,137 @@ python3 kv-cache.py \
 
 **Use ShareGPT** when you want to model real chatbot/assistant usage.
 **Use Synthetic** when you want worst-case stress testing or controlled experiments.
+
+---
+
+## BurstGPT Trace Replay
+
+The **BurstGPT Trace Replay** feature drives the benchmark using real production LLM workload traces collected from Azure OpenAI GPT services. Unlike ShareGPT (which provides conversation content), BurstGPT provides request-level token counts and timing from 5.29 million production API calls over 121 days.
+
+**Paper:** Wang et al., "BurstGPT: A Real-world Workload Dataset to Optimize LLM Serving Systems" (arXiv:2401.17644, KDD '25)
+
+### Why Use BurstGPT?
+
+BurstGPT traces capture production workload characteristics that synthetic generation cannot replicate:
+
+- **Zipf-distributed request lengths**: Many short requests with a long tail of large ones, matching real API usage
+- **Bimodal response patterns**: ChatGPT responses cluster around two modes (short and medium)
+- **Realistic token distributions**: Average 621 request tokens, 126 response tokens (after filtering failures)
+- **Mixed model workloads**: Includes both ChatGPT (GPT-3.5) and GPT-4 request patterns
+
+### Downloading the BurstGPT Trace
+
+Clone the official BurstGPT repository from GitHub:
+
+```bash
+git clone https://github.com/HPMLL/BurstGPT.git
+```
+
+This downloads the trace CSV files into `BurstGPT/data/`. The default `--burst-trace-path` points to `BurstGPT/data/BurstGPT_1.csv`, so cloning into your benchmark directory is sufficient.
+
+| File | Rows | Description |
+|------|------|-------------|
+| `BurstGPT_1.csv` | 1,429,737 | First 2 months of traces (includes 25K failed requests with 0 response tokens) |
+
+Each row contains: `Timestamp`, `Model`, `Request tokens`, `Response tokens`, `Total tokens`, `Log Type`.
+
+The benchmark reads only the `Request tokens` and `Response tokens` columns. Rows with parse errors are silently skipped.
+
+### Basic BurstGPT Invocation
+
+```bash
+python3 kv-cache.py \
+    --config config.yaml \
+    --model llama3.1-8b \
+    --use-burst-trace \
+    --burst-trace-path BurstGPT/data/BurstGPT_1.csv \
+    --num-users 50 \
+    --duration 300 \
+    --gpu-mem-gb 0 \
+    --cpu-mem-gb 0 \
+    --generation-mode none \
+    --cache-dir /mnt/nvme \
+    --seed 42 \
+    --output results_burstgpt.json
+```
+
+### BurstGPT with Storage Capacity Tracking
+
+Track NVMe usage and enable eviction when the drive fills up:
+
+```bash
+python3 kv-cache.py \
+    --config config.yaml \
+    --model llama3.1-8b \
+    --use-burst-trace \
+    --burst-trace-path BurstGPT/data/BurstGPT_1.csv \
+    --num-users 100 \
+    --duration 300 \
+    --gpu-mem-gb 0 \
+    --cpu-mem-gb 4 \
+    --storage-capacity-gb 100 \
+    --generation-mode none \
+    --cache-dir /mnt/nvme \
+    --seed 42 \
+    --output results_burstgpt_capped.json
+```
+
+### BurstGPT with Preconditioning
+
+Precondition the SSD to steady state before measuring (recommended for consistent results on fresh drives):
+
+```bash
+python3 kv-cache.py \
+    --config config.yaml \
+    --model llama3.1-8b \
+    --use-burst-trace \
+    --burst-trace-path BurstGPT/data/BurstGPT_1.csv \
+    --num-users 50 \
+    --duration 300 \
+    --gpu-mem-gb 0 \
+    --cpu-mem-gb 0 \
+    --storage-capacity-gb 100 \
+    --precondition \
+    --precondition-size-gb 200 \
+    --precondition-threads 16 \
+    --generation-mode none \
+    --cache-dir /mnt/nvme \
+    --seed 42 \
+    --output results_burstgpt_preconditioned.json
+```
+
+### BurstGPT Throughput Profile
+
+Use the throughput performance profile to focus on bandwidth metrics without QoS latency targets:
+
+```bash
+python3 kv-cache.py \
+    --config config.yaml \
+    --model llama3.1-8b \
+    --use-burst-trace \
+    --burst-trace-path BurstGPT/data/BurstGPT_1.csv \
+    --num-users 100 \
+    --duration 300 \
+    --gpu-mem-gb 0 \
+    --cpu-mem-gb 0 \
+    --performance-profile throughput \
+    --generation-mode none \
+    --cache-dir /mnt/nvme \
+    --seed 42 \
+    --output results_burstgpt_throughput.json
+```
+
+### Comparing Workload Sources
+
+| Metric | Synthetic | ShareGPT | BurstGPT |
+|--------|-----------|----------|----------|
+| Source | Random from user templates | Real conversations (Hugging Face) | Production API traces (Azure OpenAI) |
+| Mean Context Size | ~2,676 tokens | ~133 tokens | ~622 tokens |
+| Mean Response Size | ~275 tokens | ~150 tokens | ~126 tokens |
+| Request Distribution | Uniform within ranges | Natural conversation | Zipf (many short, long tail) |
+| Cache Hit Rate | 50-70% | 85-97% | Varies by trace segment |
+| NVMe Stress | Extreme | Moderate | Moderate-High |
+| Best For | Worst-case stress testing | Chatbot/assistant simulation | Production workload modeling |
 
 ---
 
@@ -1312,10 +1697,11 @@ If you see "Unknown configuration key" errors, check your `config.yaml` for typo
 
 ## Files in This Package
 
-- `kv-cache.py`: Main benchmark implementation with ShareGPT support
+- `kv-cache.py`: Main benchmark implementation with ShareGPT and BurstGPT support
 - `config.yaml`: YAML configuration file for internal parameters
 - `test_kv_cache.py`: Pytest unit test suite
 - `requirements.txt`: Python dependencies
+- `BurstGPT/`: BurstGPT trace dataset (clone from https://github.com/HPMLL/BurstGPT)
 - `README.md`: This documentation
 - `MLperf v3 KV cache proposal.md`: Detailed technical documentation
 
