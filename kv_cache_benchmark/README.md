@@ -202,7 +202,7 @@ The benchmark's RAM usage depends on the model's KV cache size per token and the
 | `llama2-7b` | **MHA** | 32 | 524,288 | **0.500** |
 | `llama3.1-8b` | GQA | 8 | 131,072 | 0.125 |
 | `llama3.1-70b-instruct` | GQA | 8 | 327,680 | 0.313 |
-| `deepseek-v3` | MLA | 128 | 1,748,992 | 1.63 |
+| `deepseek-v3` | **MLA** | N/A | 70,272 | 0.067 |
 | `qwen3-32b` | GQA | 8 | 163,840 | 0.153 |
 | `gpt-oss-120b` | MoE | 8 | 73,728 | 0.069 |
 | `gpt-oss-20b` | MoE | 8 | 49,152 | 0.046 |
@@ -222,7 +222,7 @@ Assumes average context of 8,192 tokens (midpoint of coding user profile):
 | `llama2-7b` | **4.0 GB** | **800 GB** | **64 GB** | **32 GB** | **16 GB** |
 | `llama3.1-8b` | 1.0 GB | 200 GB | 16 GB | 8 GB | 4 GB |
 | `llama3.1-70b-instruct` | 2.5 GB | 500 GB | 40 GB | 20 GB | 10 GB |
-| `deepseek-v3` | **13.4 GB** | **2,680 GB** | **214 GB** | **107 GB** | **54 GB** |
+| `deepseek-v3` | 0.54 GB | 107 GB | 9 GB | 4.3 GB | 2.1 GB |
 | `qwen3-32b` | 1.25 GB | 250 GB | 20 GB | 10 GB | 5 GB |
 | `gpt-oss-120b` | 0.56 GB | 112 GB | 9 GB | 4.5 GB | 2.3 GB |
 | `gpt-oss-20b` | 0.38 GB | 76 GB | 6 GB | 3 GB | 1.5 GB |
@@ -233,11 +233,11 @@ Assumes average context of 8,192 tokens (midpoint of coding user profile):
 |------------|---------------------------------------|-------------------------|
 | 32 GB | 4 | `tiny-1b`, `gpt-oss-20b` |
 | 64 GB | 8 | `mistral-7b`, `llama3.1-8b`, `qwen3-32b` |
-| 128 GB | 16 | All except `llama2-7b`, `deepseek-v3` |
+| 128 GB | 16 | All except `llama2-7b` |
 | 256 GB | 16–32 | All models with bounded concurrency |
 | 512 GB+ | 32–64 | All models |
 
-> **⚠️ Critical:** Running `llama2-7b` or `deepseek-v3` with `--max-concurrent-allocs 0` (unlimited) requires **800+ GB RAM**. Always set this parameter on memory-constrained systems.
+> **⚠️ Critical:** Running `llama2-7b` with `--max-concurrent-allocs 0` (unlimited) requires **800+ GB RAM**. Always set this parameter on memory-constrained systems. Note: `deepseek-v3` uses MLA which compresses KV cache ~25× vs MHA, so it requires far less RAM than its parameter count suggests.
 
 #### Impact on Benchmark Results
 
@@ -717,7 +717,7 @@ The following models are pre-configured. You can add custom models by editing `c
 | `llama2-7b` | Llama 2 7B | 32 | 4096 | 32 | 32 | ~512 KB |
 | `llama3.1-8b` | Llama 3.1 8B | 32 | 4096 | 32 | 8 | ~128 KB |
 | `llama3.1-70b-instruct` | Llama 3.1 70B | 80 | 8192 | 64 | 8 | ~320 KB |
-| `deepseek-v3` | DeepSeek V3 | 61 | 7168 | 128 | 128 | ~1.7 MB |
+| `deepseek-v3` | DeepSeek V3 (MLA) | 61 | 7168 | 128 | N/A | ~69 KB |
 | `qwen3-32b` | Qwen 3 32B | 64 | 5120 | 64 | 8 | ~160 KB |
 | `gpt-oss-120b` | GPT-OSS 120B (5.1B active) | 36 | 2880 | 64 | 8 | ~72 KB |
 | `gpt-oss-20b` | GPT-OSS 20B (3.6B active) | 24 | 2880 | 64 | 8 | ~48 KB |
