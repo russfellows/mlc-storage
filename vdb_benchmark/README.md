@@ -32,7 +32,9 @@ The docker-compose.yml file will configure a 3-container instance of Milvus data
  - Minio Object Storage
  - etcd 
 
-The docker-compose.yml file uses ```/mnt/vdb``` as the root directory for the required docker volumes. You can modify the compose file for your environment or ensure that your target storage is mounted at this location.
+The docker-compose.yml file uses ```/mnt/vdb``` as the root directory for the required docker volumes.
+You can either set environment variable DOCKER_VOLUME_DIRECTORY or modify the compose file for your environment to point to target location.
+Otherwise ensure that your target storage is mounted at ```/mnt/vdb```.
 
 For testing more than one storage solution, there are two methods:
 1. Create a set of containers for each storage solution with modified docker-compose.yml files pointing to different root directories. Each set of containers will also need a different port to listen on. You may need to limit how many instances you can run depending on the available memory in your system
@@ -118,8 +120,11 @@ python vdbbench/simple_bench.py --host 127.0.0.1 --collection <collection_name> 
 
 For comparison with HNSW indexing, use ```vdbbench/configs/10m_hnsw.yaml``` and update collection_name accordingly.
 
+```simple_bench.py``` script assumes default vector dimension as 1536.
+If collection was created with a different dimension value or if you encounter ```MilvusException: vector dimension mismatch``` use ```--vector-dim <dimension>``` parameter.
+
 ## Supported Databases
-Milvus with DiskANN & HNSW indexing (currently implemented)
+Milvus with DiskANN, HNSW and AISAQ indexing (currently implemented)
 
 # Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
