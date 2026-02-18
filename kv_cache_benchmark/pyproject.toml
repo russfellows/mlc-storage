@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlperf-kv-cache"
+version = "3.0.0"
+description = "MLPerf KV Cache Benchmark - Multi-Tier Performance Comparison for LLM Inference"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Hazem Awadallah", email = "hazem_awadallah@kingston.com"},
+    {name = "Kingston Digital"},
+    {name = "MLPerf Storage Working Group"},
+]
+keywords = [
+    "mlperf",
+    "benchmark",
+    "kv-cache",
+    "llm",
+    "inference",
+    "gpu",
+    "storage",
+    "multi-tier",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: GPU",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Benchmark",
+]
+requires-python = ">=3.10"
+
+# Core dependencies (minimal set for basic functionality)
+dependencies = []
+
+[project.optional-dependencies]
+# YAML config file support
+yaml = ["pyyaml>=6.0"]
+
+# GPU support
+gpu = [
+    "torch>=2.0",
+    "cupy-cuda12x>=12.0",  # Adjust cuda version as needed
+]
+
+# Tokenization
+tokenizer = ["tiktoken>=0.5"]
+
+# Excel/DataFrame output
+reporting = [
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+]
+
+# Full installation with all optional dependencies
+full = [
+    "pyyaml>=6.0",
+    "torch>=2.0",
+    "tiktoken>=0.5",
+    "pandas>=2.0",
+    "openpyxl>=3.1",
+]
+
+# Development dependencies
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.0",
+]
+
+[project.scripts]
+kv-cache = "kv_cache.cli:main"
+mlperf-kv-cache = "kv_cache.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mlcommons/storage"
+Documentation = "https://mlcommons.org/en/groups/research-storage/"
+Repository = "https://github.com/mlcommons/storage"
+Issues = "https://github.com/mlcommons/storage/issues"
+
+[tool.setuptools]
+packages = ["kv_cache"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]  # Line too long (handled by formatter)
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "."]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
