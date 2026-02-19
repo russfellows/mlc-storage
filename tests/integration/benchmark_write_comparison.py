@@ -5,7 +5,6 @@ Supports head-to-head comparison between:
 - s3dlio: Zero-copy, Rust-based (S3/Azure/GCS/file/direct)
 - s3torchconnector: AWS official S3 library
 - minio: MinIO official Python SDK (S3-compatible)
-- azstoragetorch: Azure Storage for PyTorch
 
 Target: 20-30 GB/s storage throughput with 32+ threads, 200+ GB total data.
 
@@ -22,10 +21,6 @@ Example usage:
     
     # Azure Blob with s3dlio
     python benchmark_write_comparison.py --library s3dlio --endpoint az://account/container
-    
-    # Azure Blob with azstoragetorch
-    python benchmark_write_comparison.py --library azstoragetorch \
-      --endpoint https://account.blob.core.windows.net --bucket container
     
     # Large-scale test (200+ GB, 32-64 threads, 16+ MB files)
     python benchmark_write_comparison.py --files 2000 --size 100 --threads 32 --compare-all
@@ -275,43 +270,6 @@ def test_write_performance(endpoint, bucket, num_files, file_size, threads, libr
                 current_throughput = ((i + 1) * file_size) / (1024**3) / elapsed
                 print(f"  Progress: {progress*100:5.1f}% | {i+1:,}/{num_files:,} files | {current_throughput:.2f} GB/s")
     
-    elif library_name == "azstoragetorch":
-        # Azure Blob Storage: BlobIO file-like API
-        # Endpoint format: https://<account>.blob.core.windows.net
-        # Uses DefaultAzureCredential for authentication
-        
-        for i in range(num_files):
-            # Generate UNIQUE data for this file using dgen-py
-            gen = dgen_py.Generator(size=file_size, compress_ratio=1.0, dedup_ratio=1.0)
-            buffer = bytearray(gen.chunk_size)
-            data_parts = []
-            bytes_generated = 0
-            while bytes_generated < file_size:
-                nbytes = gen.fill_chunk(buffer)
-                if nbytes == 0:
-                    break
-                data_parts.append(bytes(buffer[:nbytes]))
-                bytes_generated += nbytes
-            data_bytes = b''.join(data_parts)
-            
-            # Construct blob URL
-            blob_name = f"test-data/file_{i:06d}.bin"
-            if endpoint.endswith("/"):
-                blob_url = f"{endpoint}{bucket}/{blob_name}"
-            else:
-                blob_url = f"{endpoint}/{bucket}/{blob_name}"
-            
-            # Write using BlobIO (file-like interface)
-            with BlobIO(blob_url, "wb") as f:
-                f.write(data_bytes)
-            
-            # Progress update every 10%
-            if (i + 1) % max(1, num_files // 10) == 0:
-                elapsed = time.time() - start_time
-                progress = (i + 1) / num_files
-                current_throughput = ((i + 1) * file_size) / (1024**3) / elapsed
-                print(f"  Progress: {progress*100:5.1f}% | {i+1:,}/{num_files:,} files | {current_throughput:.2f} GB/s")
-    
     else:
         raise ValueError(f"Unknown library: {library_name}")
     
@@ -385,16 +343,6 @@ def import_library(library_name):
         except ImportError:
             print(f"❌ ERROR: minio not installed")
             print("Install: pip install minio")
-            return False
-    
-    elif library_name == "azstoragetorch":
-        try:
-            from azstoragetorch.io import BlobIO as BlobIOClass
-            BlobIO = BlobIOClass
-            return True
-        except ImportError:
-            print(f"❌ ERROR: azstoragetorch not installed")
-            print("Install: pip install azstoragetorch")
             return False
     
     return False
@@ -531,13 +479,13 @@ Examples:
     )
     
     parser.add_argument("--library", 
-                        choices=["s3dlio", "s3torchconnector", "minio", "azstoragetorch"], 
+                        choices=["s3dlio", "s3torchconnector", "minio"], 
                         default="s3dlio",
                         help="Library to use (default: s3dlio)")
     parser.add_argument("--compare-libraries", action="store_true",
                         help="Run s3dlio vs s3torchconnector (legacy 2-way comparison)")
     parser.add_argument("--compare", nargs="+", metavar="LIB",
-                        help="Compare specific libraries (e.g., --compare s3dlio minio azstoragetorch)")
+                        help="Compare specific libraries (e.g., --compare s3dlio minio)")
     parser.add_argument("--compare-all", action="store_true",
                         help="Compare all installed libraries")
     
@@ -562,7 +510,7 @@ Examples:
     if args.compare_all:
         # Test all installed libraries
         print("🔍 Checking for installed libraries...")
-        all_libs = ["s3dlio", "s3torchconnector", "minio", "azstoragetorch"]
+        all_libs = ["s3dlio", "s3torchconnector", "minio"]
         for lib in all_libs:
             if import_library(lib):
                 libraries_to_test.append(lib)
@@ -572,7 +520,7 @@ Examples:
         
         if not libraries_to_test:
             print("\n❌ ERROR: No libraries installed!")
-            print("Install at least one: uv pip install s3dlio s3torchconnector minio azstoragetorch")
+            print("Install at least one: uv pip install s3dlio s3torchconnector minio")
             sys.exit(1)
         
         print(f"\nWill test {len(libraries_to_test)} libraries: {', '.join(libraries_to_test)}\n")
@@ -581,9 +529,9 @@ Examples:
         # Test specific libraries
         print("🔍 Checking for requested libraries...")
         for lib in args.compare:
-            if lib not in ["s3dlio", "s3torchconnector", "minio", "azstoragetorch"]:
+            if lib not in ["s3dlio", "s3torchconnector", "minio"]:
                 print(f"❌ ERROR: Unknown library '{lib}'")
-                print("Valid options: s3dlio, s3torchconnector, minio, azstoragetorch")
+                print("Valid options: s3dlio, s3torchconnector, minio")
                 sys.exit(1)
             
             if import_library(lib):

@@ -5,7 +5,6 @@ Supports comparison between:
 - s3dlio: Zero-copy reads using BytesView (S3/Azure/GCS/file/direct)
 - s3torchconnector: AWS official library
 - minio: MinIO Python SDK (S3-compatible)
-- azstoragetorch: Azure Storage for PyTorch (BlobIO API)
 
 Target: 20-30 GB/s read throughput with 200+ GB total data.
 
@@ -120,18 +119,6 @@ def test_read_performance(endpoint, bucket, num_files, file_size, library_name):
             response.release_conn()
             total_bytes_read += len(data)
         
-        elif library_name == "azstoragetorch":
-            # Azure Blob Storage: BlobIO file-like API
-            blob_name = f"test-data/file_{i:06d}.bin"
-            if endpoint.endswith("/"):
-                blob_url = f"{endpoint}{bucket}/{blob_name}"
-            else:
-                blob_url = f"{endpoint}/{bucket}/{blob_name}"
-            
-            with BlobIO(blob_url, "rb") as f:
-                data = f.read()
-            total_bytes_read += len(data)
-        
         else:
             raise ValueError(f"Unknown library: {library_name}")
         
@@ -213,17 +200,6 @@ def import_library(library_name):
         except ImportError:
             print(f"❌ ERROR: minio not installed")
             print("Install: pip install minio")
-            return False
-    
-    elif library_name == "azstoragetorch":
-        try:
-            from azstoragetorch.io import BlobIO as BlobIOClass
-            BlobIO = BlobIOClass
-            globals()['BlobIO'] = BlobIO
-            return True
-        except ImportError:
-            print(f"❌ ERROR: azstoragetorch not installed")
-            print("Install: pip install azstoragetorch")
             return False
     
     else:
@@ -355,13 +331,13 @@ Examples:
     )
     
     parser.add_argument("--library", 
-                        choices=["s3dlio", "s3torchconnector", "minio", "azstoragetorch"], 
+                        choices=["s3dlio", "s3torchconnector", "minio"], 
                         default="s3dlio",
                         help="Library to use (default: s3dlio)")
     parser.add_argument("--compare-libraries", action="store_true",
                         help="Run s3dlio vs s3torchconnector (legacy 2-way comparison)")
     parser.add_argument("--compare", nargs="+", metavar="LIB",
-                        help="Compare specific libraries (e.g., --compare s3dlio minio azstoragetorch)")
+                        help="Compare specific libraries (e.g., --compare s3dlio minio)")
     parser.add_argument("--compare-all", action="store_true",
                         help="Compare all installed libraries")
     
@@ -380,7 +356,7 @@ Examples:
     if args.compare_all:
         # Test all installed libraries
         print("🔍 Checking for installed libraries...")
-        all_libs = ["s3dlio", "s3torchconnector", "minio", "azstoragetorch"]
+        all_libs = ["s3dlio", "s3torchconnector", "minio"]
         for lib in all_libs:
             if import_library(lib):
                 libraries_to_test.append(lib)
@@ -390,7 +366,7 @@ Examples:
         
         if not libraries_to_test:
             print("\n❌ ERROR: No libraries installed!")
-            print("Install at least one: uv pip install s3dlio s3torchconnector minio azstoragetorch")
+            print("Install at least one: uv pip install s3dlio s3torchconnector minio")
             sys.exit(1)
         
         print(f"\nWill test {len(libraries_to_test)} libraries: {', '.join(libraries_to_test)}\n")
@@ -399,9 +375,9 @@ Examples:
         # Test specific libraries
         print("🔍 Checking for requested libraries...")
         for lib in args.compare:
-            if lib not in ["s3dlio", "s3torchconnector", "minio", "azstoragetorch"]:
+            if lib not in ["s3dlio", "s3torchconnector", "minio"]:
                 print(f"❌ ERROR: Unknown library '{lib}'")
-                print("Valid options: s3dlio, s3torchconnector, minio, azstoragetorch")
+                print("Valid options: s3dlio, s3torchconnector, minio")
                 sys.exit(1)
             
             if import_library(lib):
