@@ -58,7 +58,7 @@ reader:
     secret_access_key: minioadmin
 ```
 
-**Note:** Only `s3dlio` and `s3torchconnector` are supported via DLIO config. For MinIO and Azure, use benchmark scripts directly.
+**Note:** Only `s3dlio` and `s3torchconnector` are supported via DLIO config. `s3dlio` supports S3/Azure/GCS via `az://` and `gs://` URIs. MinIO can be used via benchmark scripts directly.
 
 ### Option 2: Benchmark Scripts (All Libraries)
 

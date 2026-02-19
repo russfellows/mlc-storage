@@ -4,8 +4,9 @@ This package provides unified interfaces to multiple storage systems:
 - Local filesystem (with optional O_DIRECT)
 - s3dlio multi-protocol (S3, Azure, GCS, file, direct)
 - s3torchconnector (AWS S3-specific)
-- Azure Blob Storage
 - MinIO S3-compatible storage
+
+Note: Azure Blob Storage is supported exclusively via s3dlio (az:// URIs).
 
 Use StorageWriterFactory.create() to automatically select the appropriate
 backend based on URI scheme or explicit backend name.
@@ -33,8 +34,9 @@ class StorageWriterFactory:
         
         Args:
             uri_or_path: URI or file path (file://, s3://, az://, gs://, direct://, or path)
-            backend: Explicit backend name ('file', 's3dlio', 's3torchconnector',  'minio', 'azure')
+            backend: Explicit backend name ('file', 's3dlio', 's3torchconnector', 'minio')
                     If None, auto-detects from URI scheme
+                    Note: For Azure (az://), use backend='s3dlio'
             use_direct_io: Enable O_DIRECT for file:// backend (requires aligned buffers)
             use_fadvise: Use posix_fadvise hints to bypass page cache (default: True)
             **kwargs: Backend-specific options
@@ -89,20 +91,11 @@ class StorageWriterFactory:
                         "Install with: pip install minio"
                     )
             
-            elif backend == 'azure':
-                try:
-                    from .azure_writer import AzureStorageWriter
-                    return AzureStorageWriter(**kwargs)
-                except ImportError:
-                    raise ImportError(
-                        "azure backend requires azure-storage-blob package. "
-                        "Install with: pip install azure-storage-blob"
-                    )
-            
             else:
                 raise ValueError(
                     f"Unknown backend: {backend}. "
-                    f"Supported: file, s3dlio, s3torchconnector, minio, azure"
+                    f"Supported: file, s3dlio, s3torchconnector, minio\n"
+                    f"Note: For Azure Blob Storage, use backend='s3dlio' with az:// URIs"
                 )
         
         # Auto-detect from URI scheme
@@ -122,18 +115,13 @@ class StorageWriterFactory:
         
         elif (uri_or_path.startswith('az://') or
               (uri_or_path.startswith('https://') and 'blob.core.windows.net' in uri_or_path)):
-            # Try s3dlio (supports Azure), fallback to native Azure client
+            # Azure Blob Storage via s3dlio only
             try:
                 return S3DLIOStorageWriter(uri_or_path, **kwargs)
             except ImportError:
-                try:
-                    from .azure_writer import AzureStorageWriter
-                    return AzureStorageWriter(**kwargs)
-                except ImportError:
-                    raise ImportError(
-                        "No Azure-capable backend found. "
-                        "Install s3dlio or azure-storage-blob"
-                    )
+                raise ImportError(
+                    "Azure Blob Storage requires s3dlio. Install with: pip install s3dlio"
+                )
         
         elif uri_or_path.startswith('gs://'):
             return S3DLIOStorageWriter(uri_or_path, **kwargs)
