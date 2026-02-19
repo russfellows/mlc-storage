@@ -104,7 +104,7 @@ Expected: > 50 GB/s data generation
 
 ## Quick Comparison Test
 
-### Compare All Installed Libraries (s3dlio, minio, s3torchconnector, azstoragetorch)
+### Compare All Installed Libraries (s3dlio, minio, s3torchconnector)
 ```bash
 python benchmark_write_comparison.py \
   --compare-all \

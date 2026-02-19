@@ -80,14 +80,6 @@ reader = client.get_object('bucket', 'file.parquet', start=5001, end=5999)
 data = reader.read()
 ```
 
-### azstoragetorch
-```python
-# Byte range via seek + read
-blob = BlobIO(container, 'file.parquet', 'r')
-blob.seek(5001)
-data = blob.read(999)
-```
-
 ---
 
 ## Parquet Efficiency Example
@@ -310,7 +302,7 @@ table = pq.read_table('bucket/file.parquet',
 
 ## Summary
 
-- **All 4 libraries** (s3dlio, minio, s3torchconnector, azstoragetorch) support byte-range reads
+- **All 3 supported libraries** (s3dlio, minio, s3torchconnector) support byte-range reads
 - **PyArrow** handles Parquet structure, calculates byte ranges
 - **Storage libraries** are format-agnostic, just provide `get_range()` API
 - **No s3dlio changes needed** for Parquet support

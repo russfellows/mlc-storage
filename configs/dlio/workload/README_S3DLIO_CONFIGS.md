@@ -38,7 +38,7 @@ This directory contains example configurations for using s3dlio with MLPerf Stor
 - ❌ Cloud protocols: s3://, az://, gs:// URIs with s3dlio
 - ❌ Multi-endpoint load balancing
 - ❌ S3/Azure credentials and authentication
-- ❌ Other libraries: minio, s3torchconnector, azstoragetorch
+- ❌ Other libraries: minio, s3torchconnector
 
 ---
 
