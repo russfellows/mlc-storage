@@ -15,13 +15,7 @@ dependencies = [
     "dlio-benchmark @ git+https://github.com/russfellows/dlio_benchmark.git@main",
     "psutil>=5.9",
     "pyarrow",
-    "s3dlio"
-]
-
-[project.optional-dependencies]
-# Use local s3dlio for development
-dev = [
-    "s3dlio @ file:///${PROJECT_ROOT}/../s3dlio"
+    "s3dlio>=0.9.50"
 ]
 
 [project.urls]
