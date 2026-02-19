@@ -1,17 +1,16 @@
 # Storage Libraries Guide
 
-Complete guide to all 4 supported storage libraries for MLPerf Storage benchmarks.
+Complete guide to all 3 supported storage libraries for MLPerf Storage benchmarks.
 
 ---
 
 ## Overview
 
-MLPerf Storage supports **4 storage libraries** for maximum flexibility:
+MLPerf Storage supports **3 storage libraries** for maximum flexibility:
 
 1. **s3dlio** - High-performance multi-protocol library (Rust + Python, zero-copy)
 2. **s3torchconnector** - AWS official S3 connector for PyTorch
 3. **minio** - MinIO Python SDK (S3-compatible)
-4. **azstoragetorch** - Azure Blob Storage for PyTorch
 
 ---
 
@@ -19,10 +18,9 @@ MLPerf Storage supports **4 storage libraries** for maximum flexibility:
 
 | Library | Protocols | Zero-Copy | Performance | Best For |
 |---------|-----------|-----------|-------------|----------|
-| **s3dlio** | S3/Azure/GCS/file/direct | ✅ Yes | ⭐⭐⭐⭐⭐ 20-30 GB/s | Maximum performance, multi-cloud |
-| **s3torchconnector** | S3 only | ❌ No | ⭐⭐⭐ 5-10 GB/s | AWS S3, standard PyTorch |
-| **minio** | S3-compatible | ❌ No | ⭐⭐⭐⭐ 10-15 GB/s | MinIO servers, native SDK |
-| **azstoragetorch** | Azure Blob | ❌ No | ⭐⭐⭐ 5-10 GB/s | Azure Blob Storage |
+| **s3dlio** | S3/Azure/GCS/file/direct | ✅ Yes | ⭐⭐⭐⭐⭐ Highest | Maximum performance, multi-cloud |
+| **s3torchconnector** | S3 only | ❌ No | ⭐⭐⭐ Good | AWS S3, standard PyTorch |
+| **minio** | S3-compatible | ❌ No | ⭐⭐⭐⭐ Very Good | MinIO servers, native SDK |
 
 ---
 
@@ -42,11 +40,6 @@ pip install s3torchconnector
 ### minio
 ```bash
 pip install minio
-```
-
-### azstoragetorch
-```bash
-pip install azstoragetorch
 ```
 
 ---
@@ -74,7 +67,7 @@ reader:
 python benchmark_write_comparison.py --compare-all
 
 # Compare specific libraries
-python benchmark_write_comparison.py --compare s3dlio minio azstoragetorch
+python benchmark_write_comparison.py --compare s3dlio minio
 
 # Test single library
 python benchmark_write_comparison.py --library s3dlio
@@ -189,79 +182,6 @@ data = response.read()
 
 ---
 
-### azstoragetorch
-
-**Advantages:**
-- Azure Blob Storage integration
-- PyTorch compatibility
-- File-like API
-
-**API:**
-```python
-from azstoragetorch import BlobIO
-
-blob_url = 'https://account.blob.core.windows.net/container/blob'
-
-# Write
-with BlobIO(blob_url, 'wb') as f:
-    f.write(data_bytes)
-
-# Read
-with BlobIO(blob_url, 'rb') as f:
-    data = f.read()
-```
-
-**Byte-Range Read:**
-```python
-# Read specific byte range
-with BlobIO(blob_url, 'rb') as f:
-    f.seek(1000)     # Seek to offset
-    data = f.read(999)  # Read 999 bytes
-```
-
----
-
-## Performance Comparison
-
-### Write Performance (2000 files × 100 MB = 200 GB)
-
-```bash
-python benchmark_write_comparison.py \
-  --compare-all \
-  --files 2000 \
-  --size 100 \
-  --threads 32
-```
-
-**Typical Results:**
-
-| Library | Throughput | Time | Files/sec | Notes |
-|---------|-----------|------|-----------|-------|
-| s3dlio | 25.4 GB/s | 7.9s | 253 | Zero-copy |
-| minio | 12.1 GB/s | 16.5s | 121 | S3 SDK |
-| s3torchconnector | 8.3 GB/s | 24.1s | 83 | AWS SDK |
-| azstoragetorch | 7.2 GB/s | 27.8s | 72 | Azure Blob |
-
-### Read Performance
-
-```bash
-python benchmark_read_comparison.py \
-  --compare-all \
-  --files 2000 \
-  --size 100
-```
-
-**Typical Results:**
-
-| Library | Throughput | Time | Files/sec |
-|---------|-----------|------|-----------|
-| s3dlio | 18.9 GB/s | 10.6s | 189 |
-| minio | 10.8 GB/s | 18.5s | 108 |
-| s3torchconnector | 7.1 GB/s | 28.2s | 71 |
-
----
-
-## Authentication
 
 ### S3-Compatible (s3dlio, s3torchconnector, minio)
 
@@ -289,17 +209,20 @@ client = Minio('localhost:9000',
                secret_key='minioadmin')
 ```
 
-### Azure (azstoragetorch)
+### Azure Storage (s3dlio only)
 
-**DefaultAzureCredential (automatic):**
-```bash
-# No config needed - uses Azure CLI/managed identity
-az login
-```
+For Azure Blob Storage, use s3dlio with the `az://` protocol:
 
-**Or Connection String:**
-```bash
-export AZURE_STORAGE_CONNECTION_STRING="..."
+```python
+import s3dlio
+
+# Azure authentication via environment variables
+# export AZURE_STORAGE_ACCOUNT=myaccount
+# export AZURE_STORAGE_KEY=mykey
+
+# Or use Azure CLI authentication (az login)
+s3dlio.put_bytes('az://container/file', data)
+data = s3dlio.get('az://container/file')
 ```
 
 ---
@@ -347,14 +270,6 @@ curl http://localhost:9000/minio/health/live
 ```bash
 mc alias set local http://localhost:9000 minioadmin minioadmin
 mc ls local/
-```
-
-### azstoragetorch: Authentication failed
-
-**Login via Azure CLI:**
-```bash
-az login
-az account show
 ```
 
 ---
@@ -405,11 +320,6 @@ chunk = s3dlio.get_range('s3://bucket/file.parquet', offset=1000, length=999)
 # minio
 response = client.get_object('bucket', 'file.parquet', offset=1000, length=999)
 
-# azstoragetorch
-with BlobIO(url, 'rb') as f:
-    f.seek(1000)
-    chunk = f.read(999)
-
 # s3torchconnector
 reader = client.get_object('bucket', 'file.parquet', start=1000, end=1998)
 ```
@@ -433,8 +343,7 @@ reader = client.get_object('bucket', 'file.parquet', start=1000, end=1998)
 - **s3dlio**: Best performance, multi-protocol, zero-copy (RECOMMENDED)
 - **minio**: Good for MinIO servers, S3-compatible API  
 - **s3torchconnector**: Standard AWS S3, PyTorch integration
-- **azstoragetorch**: Azure-only, file-like API
 
-**For maximum performance:** Use s3dlio with zero-copy verification.
-**For cloud compatibility:** Use s3dlio (works with S3/Azure/GCS).
-**For specific platforms:** Use minio (MinIO) or azstoragetorch (Azure).
+**For maximum performance:** Use s3dlio with zero-copy verification.  
+**For cloud compatibility:** Use s3dlio (works with S3/Azure/GCS).  
+**For MinIO servers:** Use minio or s3dlio.
