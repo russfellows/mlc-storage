@@ -72,3 +72,6 @@ Thumbs.db
 hydra_log/
 minio_test/
 Test-Backup/
+
+# Dependencies (installed via pip)
+dlio_benchmark/
