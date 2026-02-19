@@ -1,2 +1,0 @@
-prune docs
-recursive-include dlio_benchmark/configs *.yaml

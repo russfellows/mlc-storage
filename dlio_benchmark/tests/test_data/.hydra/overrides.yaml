@@ -1,2 +1,0 @@
-- workload=unet3d
-- ++workload.train.epochs=2
