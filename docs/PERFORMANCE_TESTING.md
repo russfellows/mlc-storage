@@ -19,7 +19,7 @@ python benchmark_write_comparison.py \
 ```
 
 **What this does:**
-- Tests ALL installed libraries (s3dlio, minio, s3torchconnector, azstoragetorch)
+- Tests ALL installed libraries (s3dlio, minio, s3torchconnector)
 - Writes 2,000 files × 100 MB = 200 GB per library
 - Uses 32 threads for data generation
 - Shows side-by-side comparison with speedup factors
@@ -34,21 +34,11 @@ python benchmark_write_comparison.py \
 python benchmark_write_comparison.py --compare-all
 ```
 
-**Output:**
-```
-================================================================================
-MULTI-LIBRARY COMPARISON RESULTS
-================================================================================
-
-Library              Throughput (GB/s)  Time (sec)  Files/sec  Relative Speed
-------------------------------------------------------------------------------
-s3dlio               25.40              7.87        254.1      Baseline (fastest)
-minio                12.10              16.53       121.0      0.48x
-s3torchconnector     8.30               24.10       83.0       0.33x
-azstoragetorch       7.20               27.78       72.0       0.28x
-
-🏆 WINNER: s3dlio (25.40 GB/s)
-```
+**Output shows:**
+- Throughput (GB/s) for each library
+- Total time and files per second
+- Relative performance comparison
+- Winner highlighted with speedup factors
 
 ### Mode 2: Compare Specific Libraries
 
@@ -65,6 +55,7 @@ python benchmark_write_comparison.py --compare-libraries
 ```bash
 python benchmark_write_comparison.py --library s3dlio
 python benchmark_write_comparison.py --library minio
+python benchmark_write_comparison.py --library s3torchconnector
 ```
 
 ---
@@ -175,7 +166,7 @@ python benchmark_s3dlio_write.py \
   --threads 16
 ```
 
-**Expected:** > 50 GB/s data generation (300+ GB/s capable)
+**Note:** s3dlio provides high-performance data generation for testing.
 
 ---
 
@@ -197,27 +188,30 @@ python benchmark_s3dlio_write.py \
 
 ---
 
-## Expected Performance Results
+## Performance Characteristics
 
-### Write Throughput (100 Gbps network, NVMe storage)
+### Relative Performance (General Observations)
 
-| Library | Throughput | Relative |
-|---------|-----------|----------|
-| s3dlio | 20-30 GB/s | Baseline |
-| minio | 10-15 GB/s | 0.5x |
-| s3torchconnector | 5-10 GB/s | 0.3x |
-| azstoragetorch | 5-8 GB/s | 0.3x |
+Based on testing across various configurations:
 
-### Read Throughput
+**Write Operations:**
+- **s3dlio**: Fastest throughput due to zero-copy architecture
+- **minio**: Moderate to good performance with native MinIO SDK
+- **s3torchconnector**: Standard performance with AWS SDK
 
-| Library | Throughput | Relative |
-|---------|-----------|----------|
-| s3dlio | 15-25 GB/s | Baseline |
-| minio | 8-12 GB/s | 0.5x |
-| s3torchconnector | 5-8 GB/s | 0.3x |
-| azstoragetorch | 4-7 GB/s | 0.3x |
+**Read Operations:**
+- **s3dlio**: Highest throughput with zero-copy reads
+- **minio**: Good performance for S3-compatible storage
+- **s3torchconnector**: Standard AWS S3 read performance
 
-**Note:** Actual performance depends on network bandwidth, storage backend, CPU, and file size.
+**Note:** Actual performance varies significantly based on:
+- Network bandwidth (10 Gbps vs 100+ Gbps)
+- Storage backend (SATA SSD vs NVMe RAID)
+- CPU cores and memory
+- File size and count
+- Server configuration
+
+Run your own benchmarks to determine performance for your specific environment.
 
 ---
 
@@ -225,34 +219,34 @@ python benchmark_s3dlio_write.py \
 
 Before running benchmarks:
 
-- [ ] **Network:** Run `iperf3 -c server` (need > 25 Gbps for 20+ GB/s)
-- [ ] **Storage:** Run `fio` test (need > 30 GB/s read/write)
-- [ ] **CPU:** Check `lscpu` (16+ cores recommended for 32 threads)
-- [ ] **Memory:** Check `free -h` (need 16+ GB for large tests)
+- [ ] **Network:** Run `iperf3 -c server` to verify network throughput
+- [ ] **Storage:** Run `fio` test to check storage backend performance
+- [ ] **CPU:** Check `lscpu` - more cores enable higher thread counts
+- [ ] **Memory:** Check `free -h` - sufficient RAM prevents swapping during tests
 - [ ] **Zero-copy:** Run `benchmark_s3dlio_write.py --skip-write-test` (s3dlio only)
 
 ---
 
 ## Troubleshooting
 
-### Problem: Low throughput (< 5 GB/s)
+### Problem: Lower than expected throughput
 
 **Network bottleneck check:**
 ```bash
 iperf3 -c your-server
-# Need: > 25 Gbps (3.125 GB/s) for 20 GB/s storage
+# Verify network bandwidth meets or exceeds storage throughput needs
 ```
 
 **Storage bottleneck check:**
 ```bash
 fio --name=seq --rw=write --bs=4M --size=10G --numjobs=8 --group_reporting
-# Need: > 30 GB/s write throughput
+# Verify storage backend can sustain high throughput
 ```
 
 **CPU bottleneck check:**
 ```bash
 python benchmark_s3dlio_write.py --skip-write-test --threads 32
-# Should show > 50 GB/s data generation
+# Verify data generation is faster than storage throughput
 ```
 
 ### Problem: Zero-copy not working (s3dlio)
@@ -362,11 +356,8 @@ python benchmark_write_comparison.py \
   --size 100 \
   --threads 32 > perf_results_${DATE}.log
 
-# Alert if s3dlio < 20 GB/s
-THROUGHPUT=$(grep "s3dlio" perf_results_${DATE}.log | awk '{print $2}')
-if (( $(echo "$THROUGHPUT < 20" | bc -l) )); then
-    echo "⚠️  WARNING: s3dlio throughput degraded: $THROUGHPUT GB/s"
-fi
+# Review results and compare against baseline
+echo "Performance test complete. Results: perf_results_${DATE}.log"
 ```
 
 ---
@@ -401,4 +392,4 @@ python benchmark_write_comparison.py \
 python benchmark_s3dlio_write.py --skip-write-test
 ```
 
-**Expected:** s3dlio 20-30 GB/s, minio 10-15 GB/s, others 5-10 GB/s.
+**Note:** Performance varies by environment. s3dlio typically shows the highest throughput due to zero-copy architecture.

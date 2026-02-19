@@ -1,129 +1,289 @@
-# Storage Library Testing Status
+# Storage Library Testing Guide
 
 ## Overview
-This document tracks testing status for the 4 new storage libraries integrated with MLPerf Storage benchmarks.
 
-**Test Date**: February 7, 2026  
-**Focus**: Validating new storage libraries (NOT default framework I/O)
+This guide shows how to test the 3 storage libraries (s3dlio, minio, s3torchconnector) integrated with MLPerf Storage benchmarks.
 
 ---
 
-## The 4 New Storage Libraries
+## Quick Test Commands
 
-### 1. s3dlio ✅ TESTED
-**Status**: ✅ WORKING with both PyTorch and TensorFlow
+### Test All Libraries
 
-**Framework Support**:
-- ✅ PyTorch + s3dlio + NPZ format (unet3d)
-- ✅ TensorFlow + s3dlio + TFRecord format (resnet50)
+```bash
+# Compare all installed libraries
+cd ~/Documents/Code/mlp-storage
+source .venv/bin/activate
 
-**Protocols Tested**:
-- ✅ `file://` - Local filesystem via s3dlio
+python benchmark_write_comparison.py --compare-all \
+  --endpoint http://localhost:9000 \
+  --bucket benchmark \
+  --files 100 \
+  --size 100 \
+  --threads 8
+```
 
-**Protocols NOT Tested**:
-- ❌ `s3://` - S3-compatible storage
-- ❌ `az://` - Azure Blob Storage
-- ❌ `gs://` - Google Cloud Storage
+### Test Individual Libraries
 
-**Performance**:
-- PyTorch test: 5 steps in 0.46s (complete round-trip: generate NPZ → read with s3dlio)
-- TensorFlow test: 12 steps in 0.06s (complete round-trip: generate TFRecord → read with s3dlio)
+```bash
+# Test s3dlio
+python benchmark_write_comparison.py --library s3dlio
 
-**Documentation**: [docs/S3DLIO_TEST_RECORD.md](S3DLIO_TEST_RECORD.md)
+# Test minio
+python benchmark_write_comparison.py --library minio
 
----
-
-### 2. minio ❌ NOT TESTED
-**Status**: Not tested yet
-
-**Expected Support**:
-- PyTorch + minio
-- TensorFlow + minio
-- S3-compatible protocol only
-
-**Next Steps**:
-- Test with MinIO server (S3-compatible)
-- Validate credentials and authentication
-- Compare performance against s3dlio
+# Test s3torchconnector
+python benchmark_write_comparison.py --library s3torchconnector
+```
 
 ---
 
-### 3. s3torchconnector ❌ NOT TESTED
-**Status**: Not tested yet
+## Test with DLIO Workloads
 
-**Expected Support**:
-- ✅ PyTorch + s3torchconnector (PyTorch-only library)
-- ❌ TensorFlow + s3torchconnector (NOT compatible)
-- S3-compatible protocol only
+### PyTorch Workload with s3dlio
 
-**Next Steps**:
-- Test with PyTorch workflows
-- Validate S3 authentication
-- Compare performance against s3dlio + PyTorch
+```bash
+mlpstorage training run \
+  --model unet3d \
+  --params reader.storage_library=s3dlio \
+  --params reader.data_loader_root=file:///tmp/benchmark-data \
+  --params reader.storage_options.endpoint_url=http://localhost:9000 \
+  --max-steps 10
+```
+
+### TensorFlow Workload with s3dlio
+
+```bash
+mlpstorage training run \
+  --model resnet50 \
+  --params reader.storage_library=s3dlio \
+  --params reader.data_loader_root=s3://benchmark/data \
+  --params reader.storage_options.endpoint_url=http://localhost:9000 \
+  --max-steps 10
+```
+
+### s3torchconnector (PyTorch only)
+
+```bash
+mlpstorage training run \
+  --model unet3d \
+  --params reader.storage_library=s3torchconnector \
+  --params reader.data_loader_root=s3://benchmark/data \
+  --max-steps 10
+```
 
 ---
 
-### 4. azstoragetorch ❌ NOT TESTED
-**Status**: Not tested yet
+## Test Scripts Reference
 
-**Expected Support**:
-- ✅ PyTorch + azstoragetorch (PyTorch-only library)
-- ❌ TensorFlow + azstoragetorch (NOT compatible)
-- Azure Blob Storage protocol only (`az://`)
+### Write Performance Tests
 
-**Next Steps**:
-- Test with Azure Blob Storage
-- Validate Azure authentication (account key, connection string, managed identity)
-- Compare performance against s3dlio + PyTorch + Azure
+| Script | Purpose |
+|--------|---------|
+| `tests/scripts/test_mlp_s3dlio.sh` | s3dlio write test |
+| `tests/scripts/test_mlp_minio.sh` | minio write test |
+| `tests/scripts/test_mlp_s3torch.sh` | s3torchconnector write test |
+
+### Streaming Checkpoint Tests
+
+```bash
+# Test all backends
+cd tests/checkpointing
+python test_streaming_backends.py
+
+# Quick demo
+bash test_demo.sh
+```
+
+### Comparison Tests
+
+```bash
+# Write comparison
+python benchmark_write_comparison.py --compare-all
+
+# Read comparison
+python benchmark_read_comparison.py --compare-all
+```
+
+---
+
+## Multi-Protocol Testing (s3dlio)
+
+s3dlio supports multiple protocols - test each one:
+
+### S3-Compatible Storage
+
+```bash
+# Set environment
+export AWS_ENDPOINT_URL=http://localhost:9000
+export AWS_ACCESS_KEY_ID=minioadmin
+export AWS_SECRET_ACCESS_KEY=minioadmin
+
+# Test
+python -c "import s3dlio; s3dlio.put_bytes('s3://test-bucket/test.bin', b'test')"
+```
+
+### Azure Blob Storage
+
+```bash
+# Set environment
+export AZURE_STORAGE_ACCOUNT=myaccount
+export AZURE_STORAGE_KEY=mykey
+
+# Or use Azure CLI
+az login
+
+# Test
+python -c "import s3dlio; s3dlio.put_bytes('az://container/test.bin', b'test')"
+```
+
+### Google Cloud Storage
+
+```bash
+# Set environment
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# Test
+python -c "import s3dlio; s3dlio.put_bytes('gs://bucket/test.bin', b'test')"
+```
+
+### Local File System
+
+```bash
+# Test
+python -c "import s3dlio; s3dlio.put_bytes('file:///tmp/test.bin', b'test')"
+```
+
+---
+
+## Multi-Endpoint Testing (s3dlio)
+
+Test load balancing across multiple endpoints:
+
+```bash
+# Create config with multiple endpoints
+cat > multi_endpoint_test.yaml << 'EOF'
+reader:
+  storage_library: s3dlio
+  data_loader_root: s3://benchmark/data
+  endpoint_uris:
+    - http://minio1:9000
+    - http://minio2:9000
+    - http://minio3:9000
+  load_balance_strategy: round_robin
+EOF
+
+# Run test
+mlpstorage training run --model resnet50 --config multi_endpoint_test.yaml --max-steps 10
+```
+
+**See:** [MULTI_ENDPOINT_GUIDE.md](../MULTI_ENDPOINT_GUIDE.md) for complete multi-endpoint testing guide.
+
+---
+
+## Zero-Copy Verification (s3dlio)
+
+Verify s3dlio's zero-copy architecture:
+
+```bash
+python benchmark_s3dlio_write.py --skip-write-test
+```
+
+**Expected output:**
+```
+✅ memoryview() works - buffer protocol supported
+✅ torch.frombuffer() works
+✅ np.frombuffer() works
+✅ Zero-copy verified throughout the stack!
+```
+
+---
+
+## Troubleshooting Tests
+
+### Library Not Installed
+
+```bash
+# Install missing library
+pip install s3dlio
+pip install minio  
+pip install s3torchconnector
+```
+
+### MinIO Connection Issues
+
+```bash
+# Check MinIO is running
+curl http://localhost:9000/minio/health/live
+
+# Verify credentials
+mc alias set local http://localhost:9000 minioadmin minioadmin
+mc ls local/
+```
+
+### S3 Authentication Issues
+
+```bash
+# Verify environment variables
+echo $AWS_ENDPOINT_URL
+echo $AWS_ACCESS_KEY_ID
+echo $AWS_SECRET_ACCESS_KEY
+
+# Test connection
+aws s3 ls --endpoint-url $AWS_ENDPOINT_URL
+```
+
+---
+
+## Test Data Generation
+
+All test scripts automatically generate data. To generate test data manually:
+
+```bash
+# Generate NPZ files (PyTorch)
+python -m dlio_benchmark.data_generator \
+  --num-files 100 \
+  --file-size 100 \
+  --format npz \
+  --output-dir /tmp/test-data
+
+# Generate TFRecord files (TensorFlow)
+python -m dlio_benchmark.data_generator \
+  --num-files 100 \
+  --file-size 100 \
+  --format tfrecord \
+  --output-dir /tmp/test-data
+```
+
+---
+
+## Related Documentation
+
+- **[Performance Testing](PERFORMANCE_TESTING.md)** - Comprehensive benchmarking guide
+- **[Storage Libraries](STORAGE_LIBRARIES.md)** - Library comparison and features
+- **[Multi-Endpoint Guide](../MULTI_ENDPOINT_GUIDE.md)** - Load balancing configuration
+- **[Streaming Checkpointing](../Streaming-Chkpt-Guide.md)** - Checkpoint testing
 
 ---
 
 ## Summary
 
-### Tested Libraries
-| Library | Framework Support | Protocols Tested | Status |
-|---------|------------------|------------------|--------|
-| **s3dlio** | PyTorch ✅, TensorFlow ✅ | file:// ✅ | ✅ WORKING |
-| **minio** | PyTorch ❓, TensorFlow ❓ | None | ❌ NOT TESTED |
-| **s3torchconnector** | PyTorch only | None | ❌ NOT TESTED |
-| **azstoragetorch** | PyTorch only | None | ❌ NOT TESTED |
-
-### Testing Priority
-1. **s3dlio with cloud protocols** (s3://, az://, gs://) - Highest priority since library already validated
-2. **minio** - Test S3-compatible storage with dedicated MinIO library
-3. **s3torchconnector** - PyTorch-specific S3 library
-4. **azstoragetorch** - PyTorch-specific Azure library
-
-### Key Findings
-1. ✅ **s3dlio is framework-agnostic** - Works with BOTH PyTorch and TensorFlow
-2. ✅ **Complete round-trips validated** - Generate → Read cycle works for both frameworks
-3. ✅ **Command-line overrides work** - Can specify storage_library via --params
-4. ✅ **file:// protocol works** - Local testing validated before cloud testing
-5. ⚠️ **PyTorch requires NPZ format** - TFRecord not supported by PyTorch in DLIO
-6. ⚠️ **TensorFlow can use TFRecord or NPZ** - Both formats work with TensorFlow
-
----
-
-## Next Steps
-
-### Immediate: Test s3dlio with Cloud Storage
-Since s3dlio is validated with `file://`, test cloud protocols next:
-
+**Quick test all libraries:**
 ```bash
-# s3dlio + PyTorch + S3
-mlpstorage training run \
-  --model unet3d \
-  --params reader.storage_library=s3dlio \
-  --params reader.storage_root=s3://bucket-name/unet3d \
-  ...
-
-# s3dlio + TensorFlow + Azure
-mlpstorage training run \
-  --model resnet50 \
-  --params reader.storage_library=s3dlio \
-  --params reader.storage_root=az://container/resnet50 \
-  ...
+python benchmark_write_comparison.py --compare-all
 ```
 
-### Then: Test Other Libraries
-Once s3dlio cloud testing is complete, test the other 3 libraries with their respective protocols.
+**Test specific library:**
+```bash
+python benchmark_write_comparison.py --library s3dlio
+```
+
+**Test with DLIO workload:**
+```bash
+mlpstorage training run --model unet3d --params reader.storage_library=s3dlio --max-steps 10
+```
+
+**Zero-copy verification:**
+```bash
+python benchmark_s3dlio_write.py --skip-write-test
+```
