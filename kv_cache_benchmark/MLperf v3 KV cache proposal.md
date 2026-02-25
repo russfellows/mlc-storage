@@ -1,68 +1,92 @@
+# MLPerf KV Cache Benchmark v3.0
+## Technical Specification and Implementation Guide
 
-
-**Date:** November 5, 2025
-**Subject:** A detailed technical explanation of the `kv-cache.py` benchmark for system architects and performance engineers.
-
-**Authorship Note:** The benchmark architecture, scenario planning, and debugging were led by Hazem Awadallah <hazem_awadallah@kingston.com> decisions; AI tooling was used selectively to draft code under that direction.
-
----
-
-## 1. Introduction: Solving the LLM Memory Problem
-
-At the heart of an LLM's ability to understand context is the attention mechanism, which relies on a data structure called the KV Cache. During inference, LLMs generate text one token at a time in a process called autoregressive decoding. To generate the next token accurately, the model must consider all the preceding tokens in the sequence.
-
-Instead of wastefully re-calculating the contextual meaning of the entire sequence for every new token, the model uses the KV Cache. This cache stores the intermediate attention data, specifically, the "Key" and "Value" vectors, for every token already processed. When generating a new token, the model reuses these cached values, which dramatically reduces computation and speeds up response generation.
-
-The bottleneck emerges from the cache's memory consumption. The size of the KV Cache grows linearly with the length of the token sequence. For applications involving long context windows, such as multi-turn conversations or analyzing large documents, the cache can become enormous, quickly consuming the limited and expensive high-speed memory (VRAM) on a GPU
-
-This creates a critical system design challenge: **where do you store the KV cache?** Offloading it from expensive GPU VRAM to more abundant CPU RAM or even NVMe storage is a cost-effective solution, but it introduces latency. Moving data is always slower than accessing it locally.
-
-This benchmark was designed to solve this exact problem. It provides a sophisticated, configurable tool that allows system architects to **quantify the performance trade-offs of different storage tiers.** By simulating a realistic multi-tenant inference workload, it helps you answer critical questions:
-
-*   How much GPU VRAM and CPU RAM do I need for my target user load?
-*   Is my NVMe drive fast enough to handle the spillover?
-*   What is the real-world latency impact of offloading to a specific tier?
-*   Where is the bottleneck in my system: the GPU, the CPU, or the storage?
-
-**How to Use This Benchmark Properly:**
-This is not a simple "pass/fail" test. It's a diagnostic tool.
-1.  **Start with the `storage-only` workload.** This isolates your storage device and tells you its absolute performance limits. If your drive fails this test, it will be a bottleneck in any multi-tier configuration.
-2.  **Run the `cpu-storage` and `gpu-cpu-storage` tests.** These represent realistic production scenarios. Compare the latency and throughput to understand the value of each tier.
-3.  **Use the `autoscale` workload.** This is the most valuable test. It automatically finds the maximum number of concurrent users your specific hardware configuration can support before performance degrades unacceptably. Use this number to configure your production environment.
+**Date:** January 27, 2026  
+**Author:** Hazem Awadallah <hazem_awadallah@kingston.com>, Kingston Digital  
+**Note:** AI tooling was used to draft code under architectural direction.
 
 ---
 
-## 2. Recommended Benchmark Invocations
+## Executive Summary
 
-Here are the specific commands to run for a thorough analysis of your system. These examples assume you are testing the `llama3.1-8b` model and have a cache directory at `/mnt/nvme`.
+### The Problem
 
-### Step 1: Isolate and Test Storage Performance
+Large Language Models generate text one token at a time, maintaining context through a data structure called the **KV Cache** that stores attention state. This cache eliminates redundant computation but grows linearly with sequence length; a single 8K-token conversation with a 70B model consumes **2.5 GB of memory**.
 
-This command uses a minimal CPU RAM budget (0.5 GB) to force all I/O to your NVMe drive. It establishes the performance baseline for your storage. Using a fixed `--seed` ensures that the "random" workload is identical every time, making results comparable.
+At scale, this quickly exhausts GPU VRAM, forcing systems to offload data to slower tiers: CPU RAM or NVMe storage. The challenge: **quantifying the performance trade-offs** of multi-tier storage architectures.
+
+### The Solution
+
+This benchmark simulates realistic LLM inference workloads to answer critical capacity planning questions:
+
+- **Tier Performance:** How much faster is GPU vs. CPU vs. NVMe?
+- **Capacity Planning:** How many concurrent users can my storage sustain at a given throughput? (See note below on tier promotion.)
+- **Hardware Validation:** Which NVMe drive delivers optimal throughput for LLM inference?
+- **Bottleneck Identification:** Where is the storage bottleneck in my system? (See note below on tier promotion.)
+
+> **Scope note; no tier promotion:** The benchmark uses a one-way waterfall: data flows from GPU → CPU → NVMe but is never promoted back to a faster tier on read. This is intentional for isolating storage performance; it ensures NVMe is stressed on every read. However, production inference engines (vLLM, TensorRT-LLM) promote hot entries back to GPU, which reduces NVMe read traffic and increases GPU/CPU memory pressure. As a result, **Capacity Planning** results reflect storage throughput limits, not end-to-end serving capacity (which depends on promotion policy and working set size). **Bottleneck Identification** accurately identifies storage bottlenecks but may not surface GPU/CPU memory pressure caused by promotion traffic in production. See §3.4 for the waterfall design rationale.
+
+> **Terminology; "NVMe" as shorthand:** Throughout this document, "NVMe" refers to the benchmark's third storage tier (the `--cache-dir` filesystem path). The benchmark is not NVMe-specific; it writes `.npy` files via standard POSIX I/O and works with any block device or filesystem: SATA SSD, HDD, RAM disk, NFS, EBS, etc. "NVMe" is used as shorthand because NVMe SSDs are the primary target for production KV cache offloading.
+
+### Architecture Overview
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Workload Generator  →  Multi-Tier Cache  →  Storage Tiers │
+│  (Requests/Users)       (Waterfall LRU)      (GPU/CPU/NVMe)│
+│                                                             │
+│  ↓                      ↓                     ↓             │
+│  Telemetry             Priority Queue        Device I/O    │
+│  (4 Latency Layers)    (QoS Classes)         (Hardware)    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Key Features:**
+- **Waterfall LRU:** Hot data stays in fast tiers; cold data cascades to storage
+- **Hardware Validation:** Bypasses OS caching (`posix_fadvise`) for true device measurement
+- **Autoscaling:** Automatically discovers maximum sustainable load
+- **Production Realism:** Simulates GPU compute, RAG workloads, prefix caching, multi-turn conversations
+
+---
+
+## 1. Quick Start: Four Essential Tests
+
+All examples use `llama3.1-8b` and assume `/mnt/nvme` as the cache directory. Use `--seed 42` for reproducibility.
+
+### Test 1: Storage Baseline (Device Isolation)
+
+**Purpose:** Measure raw NVMe performance by forcing 100% storage utilization.
 
 ```bash
-# Test 1: Storage-Only Workload
 python3 kv-cache.py \
+    --config config.yaml \
     --model llama3.1-8b \
-    --num-users 50 \
-    --duration 180 \
+    --num-users 200 \
+    --duration 300 \
     --gpu-mem-gb 0 \
-    --cpu-mem-gb 0.5 \
-    --generation-mode realistic \
+    --cpu-mem-gb 0 \
+    --max-concurrent-allocs 16 \
+    --generation-mode none \
     --cache-dir /mnt/nvme \
     --seed 42 \
-    --output results_storage_only.json
+    --output results_storage_baseline.json
 ```
-**What to look for:** Check the **NVMe Throughput** in the `STORAGE PERFORMANCE ASSESSMENT` section of the output. For this saturation test, high latency is expected and acceptable; the key metric is the sustained **tokens/sec** your drive can handle. This value represents your storage's performance ceiling. Compare it across different drives to find the best one for your workload.
 
-### Step 2: Test a Realistic Multi-Tier Configuration
+**Key Metrics:**
+- `decode_bytes_read_gb` – I/O volume (2.6× differentiation fast/slow drives)
+- `avg_throughput_tokens_per_sec` – Wall-clock throughput (2.4× differentiation)
+- `nvme_read_device_p95_ms` – Hardware read latency (P95)
+- `nvme_write_device_p95_ms` – Hardware write latency (P95)
 
-This command simulates a production environment with a full three-tier hierarchy. It uses a larger, more realistic CPU memory budget and enables the GPU if available.
+---
+
+### Test 2: Production Simulation (Three-Tier)
+
+**Purpose:** Model realistic workload with GPU/CPU/NVMe hierarchy and simulated inference compute.
 
 ```bash
-# Test 2: Full Three-Tier Realistic Workload
-# (Set --gpu-mem-gb to your available VRAM, or 0 if none)
 python3 kv-cache.py \
+    --config config.yaml \
     --model llama3.1-8b \
     --num-users 100 \
     --duration 300 \
@@ -71,18 +95,23 @@ python3 kv-cache.py \
     --generation-mode realistic \
     --cache-dir /mnt/nvme \
     --seed 42 \
-    --output results_realistic_production.json
+    --output results_production.json
 ```
-**What to look for:** Compare the `end_to_end_latency_ms` from this test to the storage-only test. You should see a dramatic improvement. Also, check the `cache_hit_rate` and tier distribution (`gpu_entries`, `cpu_entries`, `nvme_entries`) to see how effectively your system is using the faster tiers.
 
-### Step 3: Discover Your System's Maximum User Load (QoS Mode)
+**Key Metrics:**
+- `end_to_end_latency_p95_ms` – User-facing latency
+- `cache_hit_rate` – % served from fast tiers
+- Tier distribution – `gpu_entries`, `cpu_entries`, `nvme_entries`
 
-This command enables the default **Quality of Service (QoS)** autoscaler. It finds the optimal number of concurrent users your hardware can support *while maintaining acceptable latency*. It starts with a low user count and adds more users until the system's storage latency indicates it is becoming saturated.
+---
+
+### Test 3: Capacity Planning (QoS Autoscaler)
+
+**Purpose:** Discover maximum users while maintaining latency SLAs.
 
 ```bash
-# Test 3: Autoscaling Discovery (QoS Mode)
-# (Set --gpu-mem-gb to your available VRAM, or 0 if none)
 python3 kv-cache.py \
+    --config config.yaml \
     --model llama3.1-8b \
     --num-users 20 \
     --duration 300 \
@@ -93,17 +122,22 @@ python3 kv-cache.py \
     --generation-mode realistic \
     --cache-dir /mnt/nvme \
     --seed 42 \
-    --output results_autoscaling_qos.json
+    --output results_qos.json
 ```
-**What to look for:** The output JSON will contain an `autoscaling_stats` section. The last entry in this list will show the final, stable user count your system settled on. This is your evidence-based maximum user load for a latency-sensitive production environment.
 
-### Step 4: Discover Your System's Peak Throughput (Capacity Mode)
+**Key Metrics:**
+- `autoscaling_stats[last].users` – Final stabilized count
+- `qos_stats` – Per-class latency vs. SLA
 
-This command uses the new **Capacity** autoscaler. Its goal is different: it ignores latency and aggressively adds users to find the absolute maximum I/O throughput (in tokens/sec) your storage hardware can sustain. This is the best way to measure the raw power of your drive.
+---
+
+### Test 4: Peak Throughput (Capacity Autoscaler)
+
+**Purpose:** Find absolute maximum I/O throughput (ignores latency).
 
 ```bash
-# Test 4: Autoscaling Discovery (Capacity Mode)
 python3 kv-cache.py \
+    --config config.yaml \
     --model llama3.1-70b-instruct \
     --num-users 10 \
     --duration 180 \
@@ -114,1091 +148,2532 @@ python3 kv-cache.py \
     --generation-mode none \
     --cache-dir /mnt/nvme \
     --seed 42 \
-    --output results_autoscaling_capacity.json
+    --output results_capacity.json
 ```
-**What to look for:** In the `autoscaling_stats` section, look for the `reason` field. The test finishes when it detects that throughput has stopped increasing. The final log will state `Peak capacity found`. The `peak_throughput` value associated with that step is the maximum performance of your storage device. Note the use of `--generation-mode none` to ensure the storage is the only bottleneck.
+
+**Key Metrics:**
+- `peak_throughput` – Max tokens/sec
+- `reason: "Peak capacity found"` in `autoscaling_stats`
 
 ---
 
-## 3. Hardware Requirements
+## 2. Hardware Requirements
 
-To effectively run this benchmark and obtain meaningful results, your system should meet certain hardware specifications. The benchmark is flexible, but the quality of your results will depend on the hardware's capabilities, especially the storage subsystem. This is an enterprise storage test, and the recommendations reflect server-grade hardware.
+### Minimum (Basic Validation)
+- **CPU:** 8-core server-grade (AMD EPYC/Intel Xeon Bronze)
+- **RAM:** 32 GB ECC
+- **GPU:** Optional (can run `--gpu-mem-gb 0`)
+- **Storage:** 256 GB+ data center SATA/SAS SSD
+- **OS:** Linux (Ubuntu 22.04+, RHEL 9+)
 
-### Minimum Requirements
-These specifications are sufficient to run the basic `storage-only` workload and validate the functionality of the benchmark with a low user count.
+### Recommended (Full Test Suite)
+- **CPU:** 32-core server-grade (EPYC 9354/Xeon Gold 4510+)
+- **RAM:** 128 GB+ ECC
+- **GPU:** NVIDIA Data Center (A100/H100) with 40GB+ HBM
+- **Storage:** 1 TB+ PCIe Gen4/Gen5 NVMe
+- **OS:** Linux (Ubuntu 22.04+, RHEL 9+)
 
-*   **CPU:** 8+ Core Server-Grade CPU (e.g., AMD EPYC, Intel Xeon Bronze/Silver)
-*   **System RAM:** 32 GB ECC RAM
-*   **GPU:** Not required. The benchmark can run in CPU-only mode (`--gpu-mem-gb 0`).
-*   **Storage:** 256 GB+ of free space on a data center-class SATA/SAS SSD.
-*   **Operating System:** A modern Linux distribution (e.g., Ubuntu 22.04, RHEL 9) is required for best performance and compatibility.
+### 2.1 Scaling the Benchmark to Different Hardware
 
-### Recommended Specifications
-These specifications are recommended for running the full suite of tests, including the `realistic` multi-tier and `autoscale` workloads with a high user count. This configuration will provide a robust analysis of your system's ability to handle a production-level inference load.
+The benchmark is **storage-agnostic**; `--cache-dir` can point to any mounted filesystem. The key scaling parameters are:
 
-*   **CPU:** 32+ Core Server-Grade CPU (e.g., AMD EPYC 9354 "Genoa", Intel Xeon Gold/Platinum 4510+)
-*   **System RAM:** 128 GB ECC RAM or more. This allows for a significant CPU cache tier (`--cpu-mem-gb 64` or higher).
-*   **GPU:** An NVIDIA Data Center GPU (e.g., A100, H100) with 40GB+ of HBM. This is necessary to test the complete three-tier hierarchy at scale.
-*   **Storage:** 1 TB+ of free space on a high-performance, data center-class NVMe SSD (e.g., PCIe Gen4 or Gen5). The primary goal of this benchmark is to measure the performance of this tier.
-*   **Operating System:** A modern Linux distribution (e.g., Ubuntu 22.04, RHEL 9).
+| Parameter | What It Controls | Scaling Impact |
+|-----------|------------------|----------------|
+| `--cache-dir` | Storage target path | Point to any mounted device (NVMe, SATA SSD, SAN, NFS, RAM disk) |
+| `--num-users` | Concurrent simulated users | More users = higher I/O parallelism |
+| `--max-concurrent-allocs` | Parallel write operations | Limits concurrent I/O to prevent OOM |
+| `--precondition-threads` | Preconditioning parallelism | 0 = auto-detect from `os.cpu_count()` |
+| `--gpu-mem-gb` / `--cpu-mem-gb` | Tier capacities | 0 disables tier, data goes directly to next tier |
 
----
-
-## 4. Automating the Benchmark with `kv-cache-wrapper.sh`
-
-While you can run each test scenario manually using `kv-cache.py`, the repository includes a powerful wrapper script, `kv-cache-wrapper.sh`, to automate the entire process. This script is the recommended way to get a comprehensive performance profile of your system with minimal effort.
-
-The wrapper script will:
-1.  **Automatically detect your hardware:** It checks for available GPU(s), total CPU RAM, and the best path for storage testing.
-2.  **Calculate optimal parameters:** It determines reasonable user counts and memory budgets based on your hardware to ensure the tests are meaningful but not destructive.
-3.  **Run a full suite of 9 tests:** It executes a series of pre-configured benchmarks to compare every possible tier configuration and stress test the system.
-4.  **Generate a summary report:** After all tests are complete, it prints a detailed comparison table, allowing you to easily see the performance trade-offs for your specific hardware.
-
-### How to Use the Wrapper
-
-Running the script is simple. From your terminal, execute it directly. It's a good idea to pipe the output to a log file for later review.
+#### Example 1: Enterprise SATA SSD (Dell PowerEdge with RAID)
 
 ```bash
-# Run the full benchmark suite with default settings
-./kv-cache-wrapper.sh | tee benchmark_summary.log
-
-# Run the suite with a different model
-./kv-cache-wrapper.sh -m llama3.1-70b-instruct
-
-# Run only specific workloads, like the production and autoscale tests
-./kv-cache-wrapper.sh -w production,autoscale
-```
-
-The script runs the following nine scenarios automatically:
-
-*   **Test 1: GPU Only:** A baseline for best-case latency, limited by VRAM.
-*   **Test 2: CPU Only:** A typical production setup using only system RAM.
-*   **Test 3: Storage Only:** Isolates the NVMe drive to measure its raw performance.
-*   **Test 4: GPU + CPU:** A two-tier configuration without storage spillover.
-*   **Test 5: CPU + Storage:** Simulates a budget-friendly setup with RAM and NVMe.
-*   **Test 6: GPU + CPU + Storage:** The full three-tier hierarchy for maximum capacity and performance.
-*   **Test 7: Storage Saturation:** A stress test to find the breaking point of your NVMe drive.
-*   **Test 8: Realistic Production:** A balanced, steady-state test mimicking a normal day.
-*   **Test 9: Autoscaling Discovery:** Automatically finds the maximum number of users your system can handle.
-
-At the end of the ~30-minute run, the script will output a detailed report comparing the throughput, latency, and cache distribution for each scenario, giving you a clear, evidence-based picture of how your system performs.
-
----
-
-## 5. A Look Under the Hood: How It Works
-
- In the KV cache benchmark, a **user request** is an `InferenceRequest` data structure that simulates a single interaction, or "turn," with a Large Language Model.
-
-*   Each `InferenceRequest` object contains several key fields to model this interaction:
-    *   **`context_tokens`**: The number of tokens in the user's prompt. This directly determines the size of the initial KV cache that needs to be written to storage in the "prefill" phase.
-    *   **`generate_tokens`**: The number of tokens the model is asked to generate. In the "decode" phase, this influences how many times the existing KV cache is read from storage
-    *   **`phase`**: The type of I/O operation, which can be `PREFILL` (write-heavy), `DECODE` (read-heavy), or a combination of both (`PREFILL_DECODE`)
-    *   **`cache_key`**, **`conversation_id`**, and **`turn_number`**: These fields link requests to simulate multi-turn conversations, where the cache from a previous turn must be read to generate the next response.
-
-*   Cache hit categories (e.g., `'system'`, `'common'`, `'multi_turn'`, `'user'`) are determined by a `cache_type` hint that the `process_requests` function passes to the `access_cache` method. This categorization is provided by the caller at the time of access, so `InferenceRequest` remains agnostic.
-
-*   The benchmark measures two critical types of latency for each request:
-    *   **Storage I/O Latency**: This metric measures the time elapsed from the moment a cache operation (`access_cache` for reads or `allocate_cache` for writes) is invoked until it returns. Critically, this duration includes not only the hardware I/O time but also all user-space software overhead within those functions, such as the CPU-intensive process of serializing or deserializing NumPy arrays. It does *not* include time the request spent waiting in the main application queue.
-    *   **End-to-End Latency**: This is the total time the user experiences, measured from request creation (`submit_time`) to completion (`complete_time`). It is the sum of **Queue Wait Time** + **Storage I/O Latency** + **Token Generation Latency**.
-
-*   A `UserSimulator` generates a mix of these requests based on different user "personas" (e.g., 'chatbot', 'coding') to create a realistic workload with varied prompt sizes and response lengths
-
-The benchmark uses these requests to simulate the two primary phases of inference, which have distinct I/O patterns:
-
-1.  **Initial Prefill (Turn 1):** For the first request in a conversation, the benchmark generates a NumPy array for the user's `context_tokens` and writes it to a storage tier using the `MultiTierCache.allocate_cache` function. This is a single, write-heavy operation.
-
-2.  **Subsequent Prefills (Turn > 1):** For the next turn in the same conversation, the process simulates loading the existing context before adding new information in a read-then-write pattern:
-    *   **Read Previous Context:** The `process_requests` loop first performs a **read** operation. It calls `self.cache.access_cache` on the cache key from the *previous* turn (e.g., `conversation-ID_turn_1`) to simulate loading the conversational history.
-    *   **Write New Context:** It then generates a new NumPy array for the *new* `context_tokens` of the current turn and performs a **write** operation by calling `self.cache.allocate_cache` with a new key (e.g., `conversation-ID_turn_2`)
-
- How are the KV cache entries are stored on the XFS file system?
-
-- a unique cache_key is generated for every request.
-- The InferenceRequest class generates a key based on its context. For multiturn conversation its tied to a turn number.
-- The key is then used to create a unique filepath, then the data is saved to that single file (per request).
-
-    def __post_init__(_self_):
-
-        _if_ _self_.cache_key is None:
-
-            _if_ _self_.conversation_id:
-
-                _self_.cache_key = f"{_self_.conversation_id}_turn_{_self_.turn_number}"
-
-            _else_:
-
-                _self_.cache_key = f"{_self_.user_id}_ctx"
-
-class NVMeBackend(StorageBackend):
-
-    def _get_path(_self_, _key_: str) -> Path:
-
-        """Constructs the file path for a given cache key."""
-
-        _return_ _self_.base_path / f"{_key_}.npy"
-
-    def write(_self_, _key_: str, _data_: np.ndarray) -> StorageBackend.IOTiming:
-
-        path = _self_._get_path(_key_)
-
-        _with_ open(path, 'wb') _as_ f:
-
-            np.save(f, _data_, _allow_pickle_=False)
-
-### A. The Three-Tier Architecture: A Hierarchy of Speed
-
-The benchmark's core is the `MultiTierCache` class, which implements a classic three-tier memory hierarchy. The goal is to keep the "hottest" (most frequently accessed) data in the fastest tier (GPU) and the "coldest" data in the slowest but largest tier (NVMe).
-
-1.  **Tier 1: GPU VRAM (`GPUMemoryBackend`)**: The fastest tier. Data is stored as PyTorch or CuPy tensors for near-instant access. Capacity is extremely limited and expensive.
-2.  **Tier 2: CPU RAM (`CPUMemoryBackend`)**: The "warm" tier. Data is stored as NumPy arrays in system memory. It's an order of magnitude slower than VRAM but much larger and cheaper.
-3.  **Tier 3: NVMe Storage (`NVMeBackend`)**: The "cold" tier. Data is written to `.npy` files on disk. It offers massive capacity at the lowest cost but with the highest latency.
-
-**How Data Placement is Decided (`allocate_cache`):**
-When a new KV cache entry needs to be created (during the "prefill" phase), the benchmark follows a simple, top-down logic:
-
-```python
-# From kv-cache.py, inside MultiTierCache.allocate_cache
-with self.memory_lock:
-    # Tier 1: GPU. Check if there's space in the GPU budget (with a 20% buffer).
-    if 'gpu' in self.backends and self.gpu_memory_used + size_bytes < self.gpu_memory_limit * 0.8:
-        self.gpu_memory_used += size_bytes
-        allocated_tier = 'gpu'
-    # Tier 2: CPU. Check if there's space in the CPU budget.
-    elif self.cpu_memory_used + size_bytes < self.cpu_memory_limit * 0.8:
-        self.cpu_memory_used += size_bytes
-        allocated_tier = 'cpu'
-    # Tier 3: NVMe. If no space in RAM, offload to disk.
-    else:
-        allocated_tier = 'nvme'
-```
-
-**Real-World Implication:** This logic simulates how a real inference server would operate. It prioritizes the fastest memory available. If you configure the benchmark with a small GPU and CPU memory budget, you are forcing data to spill over to the NVMe drive, allowing you to measure the performance penalty of that spillover.
-
-
-
-### B. Memory Clamps: The 80% Rule
-
-You'll notice the `* 0.8` in the allocation logic. This is a crucial design choice. The benchmark intentionally leaves a **20% headroom** on both the GPU and CPU memory limits.
-
-**Why?**
-This prevents the system from running completely out of memory, which can cause crashes, operating system swapping (thrashing), or out-of-memory (OOM) errors. It ensures that there is always a small buffer available for system processes and other application needs.
-
-**Real-World Implication:** This is a best practice in production systems. You never want to run your memory at 100% utilization. The 80% rule provides stability and ensures that performance remains predictable. When sizing your own hardware, you should apply a similar rule: if you calculate that you need 64 GB of RAM, you should provision at least 80 GB.
-
-### C. Latency Calculation: User Experience vs. Hardware Speed
-
-The benchmark reports two different types of latency, and the distinction is critical.
-
-```
-+--------------------------------+
-|  Application (kv-cache.py) [1] |
-|   - Request Queue (piles up) --------> "Queue Wait" is the dominant latency component [4]
-|   - Multiple Worker Threads    |
-+--------------------------------+
-             |
-             | A single worker thread grabs one request.
-             v
-+--------------------------------+
-|   Worker Thread & Sync I/O     |
-|  Issues 1 x LARGE, BLOCKING    |
-|   Write/Read (e.g., 1 GB)      |
-|                                |
-|  [SUBMISSION QD = 1]          | --------> The thread BLOCKS and WAITS for completion.
-+--------------------------------+
-             |
-             | OS receives the single large request.
-             v
-+--------------------------------+
-|          Kernel / OS           |
-|    Performs "I/O Splitting"    | --------> Splits 1 large I/O into hundreds of small ones.
-+--------------------------------+
-             |
-             | Drive receives hundreds of small requests.
-             v
-+--------------------------------+
-|     NVMe Storage Device        |
-|  [DEVICE QD > 700] [3]           | --------> The drive is heavily utilized in a short burst.
-|   Processes many small I/Os    |
-|        in parallel           |
-+--------------------------------+
-
-```
-
-1.  **Storage I/O Latency:** This is the pure hardware time. It measures the time taken for a read or write operation to complete on a specific tier, **excluding any queue wait time.** It is accumulated within the `process_requests` loop every time `self.cache.access_cache` or `self.cache.allocate_cache` is called.
-
-2.  **End-to-End Latency:** This is the total time the user waits. It is measured from the moment a request is created (`submit_time`) to the moment it is finished (`complete_time`). It is the sum of **Queue Wait Time + Storage I/O Latency + Generation Latency.**
-
-**Real-World Implication:**
-*   **Storage I/O Latency** tells you how good your hardware is. A low number means your drive is fast.
-*   **End-to-End Latency** tells you how good your system architecture is. A high number, even with a fast drive, indicates a bottleneck elsewhere—most commonly, in the request queue. As seen in the provided logs, the queue wait time can be orders of magnitude larger than the storage latency, proving that the system is overloaded.
-
-### D. Validating Latency with Block Tracing: Application vs. Hardware
-
-As discussed in the previous section, the total **End-to-End Latency** is the sum of *Queue Wait Time* and *Storage I/O Latency*. The analysis below focuses on dissecting the *Storage I/O Latency* component, as this is where a crucial software bottleneck is revealed.
-
-A common and important question is why the benchmark's "Storage I/O Latency" can be seconds long, even on a high-performance NVMe drive, while low-level tools like `btrace` show the drive is responding in milliseconds. This discrepancy is not an error; it is a key finding that reveals a crucial software bottleneck.
-
-The two tools are measuring latency at different layers of the system:
-
-1.  **Application-Level I/O Latency (The Benchmark's Metric):** This is the total time spent inside the `NVMeBackend.read()` or `write()` methods in Python. This includes not only the time waiting for the disk, but also all associated software overhead, most notably the CPU-intensive process of serializing (saving) or deserializing (loading) the Python data structures (NumPy arrays) to and from a binary format on disk.
-
-2.  **Hardware-Level I/O Latency (`btrace`'s Metric):** This is the pure hardware time. It measures the time from when an I/O request hits the Linux block layer until the physical NVMe drive signals that the operation is complete. This is the true speed of your storage device.
-
-#### Case Study: Analyzing the Discrepancy with Real Data
-
-Let's examine the results from a real test run to see this in action.
-
-*   **From the Benchmark Log (`mlperf_log_run4.txt`):**
-    The benchmark reports a P95 NVMe read latency of **12.39 seconds**.
-    ```
-    ### TIER-SPECIFIC LATENCIES ###
-      NVME Read P95: 12390.15 ms
-    ```
-
-*   **From the Block Trace Log (`btrace_analysis_btrace_read.txt`):**
-    In contrast, a `btrace` analysis of the same workload shows the P95 hardware read latency was only **9.74 milliseconds**.
-    ```
-    D2C Latency Analysis: ... Latency (ms) 9.74
-    ```
-
-**The Analysis:**
-
-The massive difference between these two numbers exposes the software overhead.
-
-| Metric                        | Source          | Time          |
-| :---------------------------- | :-------------- | :------------ |
-| **Total Application Latency** | Benchmark Log   | **12,390 ms** |
-| **Actual Hardware Latency**   | `btrace` Log    | **~10 ms**    |
-| **Software Overhead (CPU Serialization)** | (Difference)    | **~12,380 ms**|
-
-This clearly shows that for a P95 read operation, **over 99.9% of the time was spent in the CPU-bound `numpy.load()` function**, deserializing the data. The physical drive responded in under 10 milliseconds.
-
-**Conclusion:** The `btrace` logs confirm the storage hardware is not the problem. The benchmark is correctly revealing a significant software bottleneck in the Python-based I/O path. A real-world, high-performance inference engine written in C++ or using technologies like GPUDirect Storage would aim to minimize or eliminate this CPU serialization step, resulting in application latency much closer to the hardware latency shown in `btrace`. This is a key finding of the benchmark: it successfully models not just the storage hardware's performance, but also the overhead of the software stack used to access it.
-
-### E. So, How Should You Interpret the Latency Numbers?
-
-Given the different layers of latency, here is a simple guide to interpreting the results:
-
-*   **Use `End-to-End Latency` to judge User Experience.** This is the total time a user has to wait for a response. If this number exceeds your Service Level Agreement (SLA), your system is too slow for its workload, regardless of the reason.
-
-*   **Use `Queue Wait Time` to diagnose Overload.** If this number is high (or makes up a large portion of the End-to-End Latency), it is a clear sign that your system is receiving requests faster than it can process them. The bottleneck is system capacity.
-
-*   **Use `Storage I/O Latency` to evaluate the Application's I/O Path.** This number tells you the performance of your Python storage backend. If this number is high, it indicates a bottleneck in the software layer (like CPU serialization), as demonstrated in the case study above.
-
-*   **Use `btrace` (Hardware Latency) to evaluate the Physical Drive.** This number tells you the true speed of your NVMe device. If this number is low, your storage hardware is performing well.
-
-In short, `btrace` checks the disk, `Storage I/O Latency` checks the application's I/O efficiency, `Queue Wait Time` checks for system overload, and `End-to-End Latency` checks the final user experience.
-
-### F. QoS Classes: Prioritizing Users
-
-Not all inference requests are created equal. A user interacting with a chatbot needs an instant response, while a batch job summarizing a document can wait. The benchmark models this with three Quality of Service (QoS) levels defined in the `QoSLevel` enum.
-
-### G. The MLPerf Storage Submission: Finding the Breaking Point
-
-The "MLPerf Storage" tests included in the wrapper script are designed to do one thing: find the absolute performance limit of the system by intentionally overloading it. When looking at the results, it's common to see extremely high latency numbers, which might seem alarming. However, in the context of a benchmark, this is not only expected, it is a sign of a successful test.
-
-This state, often called "thrashing," is when the system is receiving requests so much faster than it can process them that it spends most of its time managing the backlog. This is the most demanding scenario for a storage subsystem.
-
-#### Case Study: Interpreting a "Thrashing" Result
-
-Let's analyze the provided results for the 8B model submission:
-
-```
-End-to-end latency: mean 317.96s, P50 322.10s, P95 635.48s
-Approximate mean queue wait: 274.08s
-Storage I/O latency: mean 37.04s, P95 138.50s
-Potential bottlenecks:
-  - Queue wait dominates (~274.08s mean).
-```
-
-**The Analysis:**
-
-1.  **The System is Overloaded:** The most telling metric is the `Approximate mean queue wait` of **274 seconds**. This means that, on average, a request spent over 4.5 minutes waiting in a queue before the system even began to process it.
-
-2.  **The Bottleneck is System Capacity:** The fact that queue wait time accounts for ~86% of the total end-to-end latency (274s out of 318s) is a definitive sign that the system as a whole cannot keep up with the request rate.
-
-3.  **The Storage is Under Extreme Stress:** Even after the long wait, the P95 `Storage I/O latency` is over two minutes (138.5s). As established previously, this is mostly due to application-level overhead, but it demonstrates the immense pressure on the I/O path. The system is desperately reading and writing from the NVMe drive to serve the KV cache for many concurrent users.
-
-**Why This is a Good Benchmark Result:**
-
-This is a valuable result precisely *because* it pushed the system to failure.
-
-*   **It finds the true bottleneck:** The test proves that under heavy load, the primary bottleneck isn't just the disk, but the system's overall capacity to handle concurrent requests, leading to massive queue times.
-*   **It validates the storage:** Despite the system thrashing, the storage subsystem continued to operate and serve terabytes of I/O without failing. This is the goal of the MLPerf Storage test: to certify that the storage solution is robust enough to handle a worst-case "denial-of-service" style workload.
-*   **It measures maximum throughput:** The reported `312.2 tok/s` is the throughput the system could sustain while being completely saturated. This represents the performance floor under maximum stress.
-
-In conclusion, the MLPerf submission is not measuring performance under ideal conditions. It is a stress test designed to find the breaking point, and the resulting high latency numbers are a clear and useful indicator of where that breaking point is.
-
-```python
-# From kv-cache.py
-class QoSLevel(Enum):
-    INTERACTIVE = "interactive" # Highest priority, for real-time applications (e.g., chatbot UI).
-    RESPONSIVE = "responsive"   # High priority, for near real-time tasks.
-    BATCH = "batch"             # Low priority, for offline processing.
-```
-
-Each QoS level has a Service Level Agreement (SLA) with a target P95 latency. The benchmark uses a `PriorityQueue` to ensure that `INTERACTIVE` requests are always processed before `BATCH` requests, simulating how a real production scheduler would work.
-
-**Real-World Implication:** This feature allows you to test whether your hardware can meet the strict latency demands of high-priority users while still processing a background load of low-priority tasks.
-
-### F. Autoscaling: Finding Your System's True Limit
-
-The `WorkloadAutoscaler` is perhaps the most powerful feature of the benchmark. Instead of guessing the number of users or throughput your system can handle, it finds it automatically using one of two modes, selectable with the `--autoscaler-mode` flag.
-
-#### Mode 1: `qos` (Quality of Service)
-
-This is the default mode, designed for system architects tuning a **production environment**. Its goal is to find the maximum number of users the system can support while keeping latency low to ensure a good user experience.
-
-**How it works:**
-1.  The `StorageMonitor` periodically collects key performance indicators (KPIs), primarily P95 read latency from the storage tiers.
-2.  It uses these KPIs to calculate a `saturation` score from 0.0 (idle) to 1.0 (fully saturated). A key heuristic is rising latency.
-3.  The `WorkloadAutoscaler` compares this saturation score to a target (defaulting to `0.8`, or 80%).
-    *   If saturation is too low, it increases the number of simulated users.
-    *   If saturation is too high, it decreases the number of users.
-    *   It includes a "cooldown" period after a scale-down to allow the system to stabilize.
-
-**Real-World Implication:** This mode allows you to provision your hardware with confidence. By running this test, you can determine the maximum safe user load for your specific server configuration and use that number to set the limits in your production load balancer, ensuring good performance.
-
-#### Mode 2: `capacity` (Peak Throughput)
-
-This mode is designed for hardware vendors and performance engineers who want to find the **absolute peak throughput** of a storage device, ignoring user-facing latency.
-
-**How it works:**
-1.  The autoscaler starts with a low user count.
-2.  It aggressively doubles, then increases the user count by 1.5x in stages, monitoring the total `tokens/sec` throughput at each stage.
-3.  When it detects that adding more users causes the throughput to *decrease* (meaning the point of diminishing returns has been passed), the test concludes.
-4.  The result is the highest throughput measured before the drop.
-
-**Real-World Implication:** This is the purest test of raw hardware performance. By combining it with `--generation-mode none`, you can remove all other bottlenecks and measure the maximum I/O your storage can deliver. This is invaluable for comparing the performance of different SSDs in an "apples-to-apples" test.
-
-### G. RAG Workflow: Simulating Modern Workloads
-
-Retrieval-Augmented Generation (RAG) is a popular technique where an LLM's context is "augmented" with relevant documents. This creates a unique I/O pattern that the benchmark simulates with the `RAGDocumentManager`.
-
-**How it works:**
-1.  **Ingestion (`ingest_document`):** The benchmark simulates the "ingestion" of large documents by splitting them into chunks and pre-calculating and storing the KV cache for each chunk across the three-tier hierarchy.
-2.  **Retrieval (`retrieve_chunks`):** When a RAG query is simulated, the benchmark retrieves the `top_k` most relevant chunks. This simulates a vector database lookup.
-3.  **Inference:** The retrieved chunks are then used as the context for the LLM, which involves reading the pre-calculated KV cache for each chunk from storage.
-
-**Real-World Implication:** RAG workloads place immense stress on the storage system because they involve loading very large contexts (many document chunks) into memory at the start of a request. This feature allows you to test whether your storage can handle the bursty, high-throughput read demands of a RAG-based application.
-
-### H. Generation Mode: Simulating GPU Backpressure
-
-A storage benchmark for LLM inference would be incomplete if it only measured I/O. In a real system, the GPU is constantly performing computations to generate the next token. This computation time creates **backpressure** on the I/O subsystem. The benchmark cannot make another I/O request until the GPU is finished with its current work. Without simulating this, the benchmark would flood the storage with requests at an unrealistic rate.
-
-The `--generation-mode` flag controls this simulation by adding a small `time.sleep()` for each token generated.
-
-```python
-# From kv-cache.py
-class GenerationMode(Enum):
-    NONE = "none"           # Pure storage benchmark. No simulated sleep. Latency is 100% I/O.
-    FAST = "fast"           # Simulates a very fast GPU (2ms/token) to model some backpressure.
-    REALISTIC = "realistic" # Simulates a realistic GPU (30ms/token) for end-to-end latency analysis.
-
-GENERATION_TIMING = {
-    GenerationMode.NONE: 0.0,
-    GenerationMode.FAST: 0.002,
-    GenerationMode.REALISTIC: 0.030,
-}
-```
-
-**How These Values Were Derived:**
-
-*   **`none` (0 ms/token):** This is for pure storage hardware validation. It removes all simulated GPU processing time to measure the absolute maximum I/O throughput the storage can handle. This mode is useful for finding the raw performance of a drive but does not represent a real-world LLM serving scenario.
-
-*   **`realistic` (30 ms/token):** This is the most important mode for system-level testing and is **required for MLPerf submissions**. The 30ms value was derived from empirical measurements of modern data center GPUs (like the NVIDIA A100 or H100) running medium-sized models (7B-8B parameters). This latency corresponds to a generation speed of approximately **33 tokens per second**, which is a standard and widely accepted performance figure for these models in production. Using this mode ensures the benchmark paces its I/O requests at a rate that a real GPU could sustain.
-
-*   **`fast` (2 ms/token):** This mode simulates a very high-performance or next-generation accelerator, capable of generating **500 tokens per second**. It is useful for modeling "what-if" scenarios where the GPU is so fast that it is almost never the bottleneck, thereby placing maximum stress on the memory and storage hierarchy.
-
-**Real-World Implication:** For any test that aims to measure system-level performance (like the `realistic` or `autoscale` workloads), you must use `--generation-mode realistic`. Failure to do so will result in misleadingly high throughput numbers and will not accurately represent the performance of a balanced, production-ready system.
-
----
-
-### I. Shared System Prompts and Prefix Reuse
-
-Most chat products send the same “system prompt” (for example, *“You are a helpful assistant.”*) before every user message. In real deployments the platform tries to reuse that prompt instead of regenerating it every time:
-
-1. The first conversation runs the full prefill step and stores the prompt’s KV cache in fast memory (GPU or CPU).
-2. Later conversations look up that stored block. If it is still around, they read it and skip the extra work. If it has been evicted, they rebuild it and store it again.
-
-The benchmark copies that pattern with three simple pieces:
-
-* **Detect:** `PrefixMatcher` pretends ~20 % of requests start with one of three common prompts. It hashes the text so everyone shares the same key (`kv_system_<hash>`).
-* **Count reuse attempts:** `PrefixCacheManager` records how often the matcher sees the prompt. The `system_prompt_reuse` counter therefore means “we spotted the pattern,” even if the cache entry is missing.
-* **Count real hits:** `MultiTierCache.access_cache` tries to read the shared key. If the block exists, `system_prompt_hits` increments. If not, the request falls back to a normal prefill.
-
-In the summary you will see both numbers. A high reuse count with few hits simply says the prompt was detected but the stored copy had already been evicted, just like what operators watch for in production.
-
-### J. ShareGPT Replay: Realistic Workload Simulation
-
-While synthetic workloads (using random token counts within a range) are excellent for controlled stress testing, they may not fully capture the nuances of human-AI interaction. The **ShareGPT Replay** feature addresses this by loading real conversation trees from the ShareGPT dataset.
-
-**How it works:**
-1.  **Ingestion:** The `ShareGPTDatasetLoader` parses a JSON dataset of real conversations. It uses a tokenizer to calculate the exact `context_tokens` (user prompt) and `generate_tokens` (model response) for every turn.
-2.  **Replay:** Instead of generating random requests, the benchmark feeds these real token counts into the `InferenceRequest` queue.
-3.  **Structure Preservation:** Crucially, it preserves the multi-turn structure of the data. Request 2 is guaranteed to be a follow-up to Request 1, testing the `MultiTierCache`'s ability to handle real conversational locality.
-
-**Case Study: Analyzing ShareGPT Results**
-Running a replay with the `llama3.1-70b-instruct` model on a memory-constrained system (2GB CPU RAM) reveals bottlenecks often hidden by uniform random distributions.
-
-*   **High Cache Hit Rate (97.2%):** Real conversations exhibit high locality. Users ask follow-up questions, allowing the system to reuse the KV cache effectively.
-*   **NVMe Read Latency Spikes (291ms P95):** Unlike synthetic tests which might average around a mean, real user inputs vary wildly. A single request with a 16k token context can saturate the read bandwidth, pushing the P95 latency above the 200ms target, resulting in a "FAIL" assessment for storage even if throughput is high.
-
-**Sample Output Summary:**
-```text
-### STORAGE PERFORMANCE ASSESSMENT: FAIL ✗ ###
-  Criteria Passed: 3/4
-  ✓ NVMe Write P95 < 500ms: 54.50ms
-  ✗ NVMe Read P95 < 200ms: 291.11ms (Target: 200ms)
-  ✓ Cache Hit Rate > 30%: 97.2%
-
-### CACHE TIER DISTRIBUTION ###
-  GPU Entries: 0 (0.00 GB)
-  CPU Entries: 156 (1.60 GB)
-  NVMe Entries: 1772 (92% of cache on slow storage)
-```
-
-### K. The Importance of Realism: A Comparative Case Study
-
-To illustrate why workload realism matters, we compared two runs of the benchmark on identical hardware (50 users, 70B model, NVMe-only cache).
-
-**Run A: Real Workload (ShareGPT)**
-This run uses the actual conversation data, reflecting human usage patterns.
-```bash
-python3 kv-cache_sharegpt_replay.py \
-    --model llama3.1-70b-instruct \
-    --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
-    --gpu-mem-gb 0 --cpu-mem-gb 2 --cache-dir /mnt/nvme \
-    --num-users 50 --duration 300 --generation-mode none
-```
-
-**Run B: Synthetic Workload (Random)**
-This run omits the dataset, causing the benchmark to fall back to generating random, full-length contexts. This represents a "worst-case" scenario (e.g., massive document processing) rather than a chat workload.
-```bash
-python3 kv-cache_sharegpt_replay.py \
-    --model llama3.1-70b-instruct \
-    --gpu-mem-gb 0 --cpu-mem-gb 2 --cache-dir /mnt/nvme \
-    --num-users 50 --duration 300 --generation-mode none
-```
-
-The results were dramatically different:
-
-| Metric | Run A: ShareGPT (Real) | Run B: Synthetic (Random) | Difference |
-| :--- | :--- | :--- | :--- |
-| **Workload Type** | Human Conversations | Random Large Contexts | |
-| **Mean Context Size** | **133 tokens** (~41 MB) | **2,676 tokens** (~836 MB) | **20x Larger Data** |
-| **Throughput** | **2,610 tok/sec** | **362 tok/sec** | **7.2x Slower** |
-| **NVMe Read P95** | **291 ms** | **6,752 ms** (6.7s) | **23x Slower** |
-| **End-to-End P50** | 93 ms | 121,158 ms (2 min) | **System Collapse** |
-
-**Key Findings:**
-1.  **Context Size Explosion:** Real human queries are concise (avg 133 tokens). The synthetic generator, aiming for coverage, produced contexts averaging 2,676 tokens. This forced the storage system to read/write **20x more data per request** in the synthetic run.
-2.  **System Collapse:** In the synthetic run, the P50 end-to-end latency ballooned to **2 minutes**, while the storage latency was only ~4 seconds. This indicates the system was in a state of **thrashing**, where requests spent 95% of their time waiting in the queue because the storage was saturated handling massive files.
-3.  **Cache Efficiency:** Real conversations have high locality (85.9% multi-turn hit rate) because users ask follow-up questions. The synthetic run had a much lower hit rate (60.1%), further stressing the storage.
-
-**Conclusion:** Run A represents a realistic chatbot application, where the NVMe drive is nearly sufficient. Run B represents a worst-case scenario, proving that for such heavy workloads, the current hardware configuration is inadequate.
-
----
-
-## 6. Current Work: Validating Simulation Accuracy with vLLM
-
-The primary goal of `kv-cache.py` is to provide a reliable *simulation* of a multi-tiered KV Cache system. But how do we know the simulation is accurate? We must validate it against a real-world, high-performance inference engine. For this, we use **vLLM**, a state-of-the-art LLM serving library.
-
-Our validation process is divided into two essential steps:
-
-1.  **Baseline Validation (GPU-Only):** First, we establish a performance baseline by running both `kv-cache.py` and vLLM in a GPU-only configuration. This test ensures that the core token generation logic of the simulator is accurate when no memory offloading occurs.
-2.  **Offloading Validation (GPU + CPU):** Second, we validate the primary feature of the benchmark: cache offloading. We configure both tools with limited GPU memory to force the KV cache to spill into CPU RAM, and then we compare the performance impact.
-
-The pass/fail criterion for both steps is the same: the **tokens per second** reported by `kv-cache.py` should be within **±5%** of the tokens per second reported by vLLM's benchmark tool.
-
-### Step 1: Baseline Validation (GPU-Only)
-
-In this step, we configure both tools to use a small model and a low user count, ensuring all KV cache data remains within the GPU's VRAM. This isolates the performance of the GPU and the core generation loop.
-
-**A. `kv-cache.py` Command (GPU-Only):**
-
-We run the benchmark with a high GPU memory budget and zero CPU/NVMe budget. This forces all allocations into the `GPUMemoryBackend`. Using a fixed seed ensures the workload is identical for comparison.
-
-```bash
-# Validation Step 1: Run kv-cache.py in GPU-only mode
-python3 kv-cache.py \
+# Mount the RAID array
+sudo mount /dev/sda1 /mnt/sata_raid
+
+# Run benchmark on SATA RAID (expect ~500-800 MB/s)
+python -m kv_cache.cli \
     --model llama3.1-8b \
-    --num-users 10 \
-    --duration 120 \
-    --gpu-mem-gb 24 \
-    --cpu-mem-gb 0 \
-    --generation-mode deterministic \
-    --seed 42 \
-    --output validation_kv_cache_gpu_only.json
-```
-
-**B. vLLM Command (GPU-Only):**
-
-We run vLLM's offline benchmark without providing any swap space. This ensures vLLM does not offload any cache data to the CPU. The `--num-prompts` should match the `--num-users` from the `kv-cache.py` command. If you haven't already, you can install vLLM with pip:
-```bash
-pip install vllm
-```
-
-Now, run the vLLM benchmark:
-```bash
-# Validation Step 1: Run vLLM benchmark in GPU-only mode
-python3 -m vllm.entrypoints.cli.main bench throughput \
-    --model meta-llama/Llama-3.1-8B \
-    --dataset-name random \
-    --num-prompts 10 \
-    --input-len 1024 \
-    --output-len 1024
-```
-
-**C. Compare Results:**
-
-Compare the `total_tokens_per_sec` from `validation_kv_cache_gpu_only.json` with the `total tokens/s` from the vLLM output. They should be within 5% of each other.
-
-### Step 2: Offloading Validation (GPU + CPU)
-
-Here, we validate the simulator's main purpose: measuring the performance impact of cache offloading. We reduce the available GPU memory to force both `kv-cache.py` and vLLM to use CPU RAM as a secondary cache tier.
-
-**A. `kv-cache.py` Command (GPU + CPU):**
-
-We reduce the GPU memory budget to force allocations to spill over to the `CPUMemoryBackend`.
-
-```bash
-# Validation Step 2: Run kv-cache.py with GPU-to-CPU offloading
-python3 kv-cache.py \
-    --model llama3.1-8b \
-    --num-users 20 \
-    --duration 120 \
-    --gpu-mem-gb 8 \
-    --cpu-mem-gb 32 \
-    --generation-mode deterministic \
-    --seed 42 \
-    --output validation_kv_cache_offload.json
-```
-
-**B. vLLM Command (GPU + CPU):**
-
-We use the `--swap-space` argument to tell vLLM to allocate a KV cache in CPU RAM. The user count is increased to ensure this space is utilized.
-
-```bash
-# Validation Step 2: Run vLLM benchmark with GPU-to-CPU offloading
-python3 -m vllm.entrypoints.cli.main bench throughput \
-    --model meta-llama/Llama-3.1-8B \
-    --dataset-name random \
-    --num-prompts 20 \
-    --input-len 1024 \
-    --output-len 1024 \
-    --swap-space 16
-```
-
-**C. Compare Results:**
-
-Again, compare the `total_tokens_per_sec` from `validation_kv_cache_offload.json` with the `total tokens/s` from the vLLM output. A successful validation will see the results within the ±5% margin, confirming that `kv-cache.py` accurately models the performance penalty of offloading.
-
-### Hardware & Software Requirements for Validation
-
-To run this validation, you will need:
-*   **Hardware:** An NVIDIA GPU with at least 16 GB of VRAM and Compute Capability 7.0+ (e.g., V100, T4, A100, RTX 30/40 series).
-*   **Environment:** A Linux environment (or WSL 2 on Windows).
-*   **Software:** Python 3.10+, PyTorch, and vLLM installed (`pip install vllm`).
-
----
-
-## 7. MLPerf v3.0 Submission Guidelines
-
-For submitting official results to the MLPerf v3.0 benchmark, it is critical to use a standardized, repeatable methodology that isolates the component being tested. When evaluating a storage device's capability for KV cache offloading, the goal is to measure the performance of the storage subsystem under a consistent and saturating load, even on systems without a high-end GPU.
-
-### Recommended Invocations for Storage Submission
-
-Two primary scenarios should be submitted to give a comprehensive view of storage performance: a standard test with a medium-sized model (Llama 3.1 8B) and a high-stress test with a large model (Llama 3.1 70B).
-
-#### Standard Submission: `llama3.1-8b`
-
-This workload provides a baseline for storage performance under typical conditions. **Note:** We set `cpu-mem-gb 0` to disable the caching tier entirely, forcing every token to hit the NVMe drive. This ensures the benchmark measures the storage hardware, not the OS file cache.
-
-```bash
-# MLPerf v3.0 Recommended Invocation: Storage Saturation Test (8B Model)
-python3 kv-cache-waterfall-lru.py \
-    --model llama3.1-8b \
-    --num-users 150 \
-    --duration 600 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 0 \
-    --generation-mode realistic \
-    --performance-profile throughput \
-    --seed 42 \
-    --output mlperf_v3_storage_submission_8b.json
-```
-
-#### Large Model Submission: `llama3.1-70b-instruct`
-
-This workload tests the storage's ability to handle a much heavier load, as the KV cache for a 70B model is significantly larger. The user count is reduced to reflect the increased memory pressure per user.
-
-```bash
-# MLPerf v3.0 Recommended Invocation: Storage Saturation Test (70B Model)
-python3 kv-cache-waterfall-lru.py \
-    --model llama3.1-70b-instruct \
-    --num-users 40 \
-    --duration 600 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 0 \
-    --generation-mode realistic \
-    --performance-profile throughput \
-    --seed 42 \
-    --output mlperf_v3_storage_submission_70b.json
-```
-
-**Why `cpu-mem-gb 0`?**
-In previous versions, a small CPU budget (e.g., 2GB) was allowed. However, analysis showed that operating system file caching (Page Cache) could absorb write bursts within this budget, artificially lowering latency metrics. Setting both GPU and CPU memory to 0 forces the "Waterfall" logic to bypass all caching layers and write directly to the NVMe backend, providing the most rigorous and honest assessment of storage I/O performance.
-
-**Key Parameters Explained:**
-*   `--num-users 150`: A high, fixed user count is used to ensure the storage device is placed under significant and continuous load.
-*   `--duration 600`: A 10-minute duration ensures the benchmark reaches a stable, steady-state performance level, which is a standard requirement for MLPerf results.
-*   `--gpu-mem-gb 0`: **This is the critical parameter for a storage-focused test.** It ensures the benchmark does not allocate any GPU memory, making it suitable for systems without a GPU or for isolating storage performance.
-*   `--cpu-mem-gb 2`: This small memory budget is intentionally chosen to be insufficient for the user load, forcing the system to bypass this faster tier and offload almost all KV cache data directly to the NVMe storage.
-*   `--generation-mode realistic`: This is essential for a valid submission. It adds a 30ms emulated sleep for each token generated, accurately simulating the backpressure from a real GPU's computation time. Without this, the benchmark would incorrectly measure storage performance in an unrealistic, I/O-only scenario.
-*   `--performance-profile throughput`: This new parameter is crucial for official submissions. It instructs the benchmark to use **throughput (tokens/second) as the sole pass/fail metric**, ignoring latency. This is because the high user count and low memory budget are *designed* to cause high latency to saturate the storage. This profile ensures the benchmark correctly evaluates the storage device's ability to sustain a high data rate under stress, which is the true goal of this test.
-*   `--seed 42`: **This parameter is mandatory for a valid submission.** It ensures that the pseudo-random workload (user request timings, context lengths, etc.) is identical across all test runs and systems. This removes workload variance as a factor and guarantees a true "apples-to-apples" comparison of hardware performance. The final report will include the seed used.
-
-### Interpreting Throughput: System vs. Storage (Read Amplification)
-
-When you run the benchmark with the `throughput` profile, the summary report presents two different throughput numbers that can differ significantly. Understanding this difference is key to correctly interpreting the results.
-
-1.  **System Throughput (`total_tokens_per_sec`):** This is the "Overall Performance" metric. It represents the end-to-end throughput of the entire system from the user's perspective: the number of new tokens generated per second across all users. It is a measure of the system's generative capacity.
-
-2.  **Storage Throughput (`nvme_throughput`):** This is the "Storage Performance Assessment" metric. It represents the raw I/O performance of the NVMe tier, measuring how many tokens' worth of KV cache data are read from or written to the storage device per second.
-
-#### Why Are They So Different? The Concept of Read Amplification
-
-The Storage Throughput is often an order of magnitude higher than the System Throughput. This is not a bug; it is a fundamental characteristic of LLM inference called **Read Amplification**.
-
-During the "decode" phase, to generate a single new token, the model must read the *entire KV cache for all preceding tokens in the conversation*.
-
-*   **Example:** A user has a context of 1000 tokens. To generate the 1001st token, the system must read the KV cache for all 1000 previous tokens from storage.
-    *   **System Tokens Generated:** 1
-    *   **Storage Tokens Read:** 1000
-
-This creates a massive amplification effect where a small amount of user-facing work (generating one token) triggers a large amount of backend I/O (reading the entire history). This is precisely the behavior this benchmark is designed to measure, as it is the primary source of stress on the storage subsystem in a real-world KV cache offloading scenario.
-
-#### Code Snippets
-
-**1. System Throughput Calculation:**
-This metric is calculated in the `_calculate_stats` method and is based on the number of new tokens generated.
-
-```python
-# From IntegratedBenchmark._calculate_stats in kv-cache.py
-total_tokens_generated = self.stats['tokens_generated']
-if duration > 0:
-    self.stats['total_tokens_per_sec'] = total_tokens_generated / duration
-```
-
-**2. Storage Throughput Calculation:**
-This metric is calculated in the `_evaluate_storage_performance` method and is based on the `nvme_tokens_processed` counter, which tracks all I/O to the NVMe tier.
-
-```python
-# From MultiTierCache._evaluate_storage_performance in kv-cache.py
-nvme_tokens = self.stats.get('nvme_tokens_processed', 0)
-if duration > 0:
-    nvme_throughput = nvme_tokens / duration
-```
-
-**3. How Storage Tokens are Counted:**
-The `nvme_tokens_processed` counter is incremented during both writes (`allocate_cache`) and reads (`access_cache`) that involve the NVMe tier.
-
-*Writing to NVMe (Prefill):*
-```python
-# From MultiTierCache.allocate_cache in kv-cache.py
-if allocated_tier == 'nvme':
-    # For throughput calculation, track tokens written to NVMe
-    if self.performance_profile == 'throughput':
-        self.stats['nvme_tokens_processed'] += num_tokens
-```
-
-*Reading from NVMe (Decode):*
-```python
-# From MultiTierCache.access_cache in kv-cache.py
-elif key in self.nvme_entries:
-    # ...
-    # For throughput calculation, track tokens read from NVMe
-    if self.performance_profile == 'throughput':
-        entry_size = self.nvme_entries[key]['size']
-        num_tokens = entry_size // self.model_config.kv_cache_size_per_token
-        self.stats['nvme_tokens_processed'] += num_tokens
-```
-
-By understanding read amplification, you can correctly interpret a high Storage Throughput not as an error, but as an accurate measurement of the intense I/O load the storage device is successfully handling.
-
-### What About RAG Workloads?
-
-The benchmark includes a Retrieval-Augmented Generation (RAG) simulation mode (`--enable-rag`), which models workloads that inject large documents into the context. This creates a very large, write-heavy prefill phase and is an excellent way to stress-test a storage device's ability to handle bursty I/O.
-
-However, for an official MLPerf submission, **it is recommended *not* to use the RAG workload.** The standard conversational workload provides a more consistent and repeatable I/O profile that is better suited for "apples-to-apples" comparisons between different storage solutions.
-
-The RAG workload can be considered an optional, supplementary test. Vendors are encouraged to run it and report the results separately to showcase performance on this specific, demanding use case, but it should not replace the standard Storage Saturation test for the official submission.
-
-### Why Not Use Autoscaling for Submission?
-
-The autoscaling feature (`--enable-autoscaling`) is an invaluable tool for system architects to discover the maximum user capacity of a *specific, balanced hardware configuration*. It is designed for system tuning and capacity planning, not for standardized component benchmarking.
-
-For an official MLPerf submission focused on storage, a fixed-load test is superior for two reasons:
-1.  **Repeatability:** A fixed user count ensures that every test run applies the exact same load, leading to highly repeatable and consistent results. Autoscaling, by its nature, adjusts the load based on system performance, which can introduce variability between runs.
-2.  **Comparability:** The goal of MLPerf is to compare components on an "apples-to-apples" basis. By using a standardized, high-load command, we can directly compare the performance of different storage devices under the exact same conditions. Autoscaling would result in different final user counts for different systems, making direct comparison of the storage's throughput and latency difficult.
-
-Therefore, the **Storage Saturation** test with a fixed, high user count is the correct methodology for generating official, comparable MLPerf v3.0 results for KV cache storage offloading.
-
----
-
-## 8. Known Limitations and Future Work
-
-This benchmark is a sophisticated tool for simulating KV cache offloading, but like any simulation, it has limitations. Understanding these is key to interpreting the results correctly and identifying areas for future improvement.
-
-*   **NumPy Serialization Overhead:** The `NVMeBackend` uses `numpy.save()` and `numpy.load()` to write and read cache entries to disk. While efficient, this process involves CPU-bound serialization and deserialization steps. A real-world inference engine might use more advanced techniques like GPUDirect Storage to move data directly from the GPU to NVMe, bypassing the CPU and avoiding this overhead. Therefore, the measured NVMe latency in this benchmark may be slightly higher than what is achievable with a fully optimized, custom storage pipeline.
-
-*   **Abstracted Storage Backends:** The benchmark currently provides a file-based `NVMeBackend`. It does not include built-in backends for other storage systems like object storage (e.g., S3), network file systems (NFS), or in-memory databases (e.g., Redis). While the `StorageBackend` class is extensible, testing these other systems would require implementing new backend classes.
-
-*   **Single-Node Architecture:** The simulation runs on a single machine, modeling multiple users through threading. It does not account for network latency or bandwidth, which would be a significant factor in a distributed inference environment where the KV cache might be stored on a separate, networked storage server.
-
-*   **Simulated GPU Backpressure:** The `--generation-mode` flag uses `time.sleep()` to emulate the time a GPU would spend on computation. This is a fixed-time approximation. It does not model the complex, dynamic nature of real GPU workloads, including variations in kernel execution times or PCIe bus contention between compute and I/O operations.
-
-*   **Simplified Eviction Policy:** The benchmark employs a straightforward Least Recently Used (LRU) policy for evicting old conversations when memory limits are reached. Production inference servers may use more complex eviction algorithms (e.g., Least Frequently Used, size-based eviction) to optimize cache hit rates.
-
-### An Invitation to Collaborate
-
-This benchmark is an open-source effort driven by the MLPerf Storage Working Group. We welcome contributions from the community to help address these limitations and make the tool even more representative of real-world inference workloads.
-
-If you are an expert in storage systems, GPU programming, or LLM inference and are interested in contributing, please consider getting involved. Areas where we would particularly value collaboration include:
-*   Developing new storage backends (e.g., for object storage or RDMA).
-*   Integrating more sophisticated GPU simulation models.
-*   Implementing alternative cache eviction policies.
-*   Expanding the benchmark to a distributed, multi-node architecture.
-
-By working together, we can create a world-class, open standard for evaluating storage performance for AI.
-
----
-
-## H. How to Calculate Memory Requirements
-
-A common point of confusion is the memory consumption of the benchmark, especially when testing large models like `llama3.1-70b-instruct`. It's natural to see a 70B model and expect memory usage to be in the hundreds of gigabytes, yet the benchmark process might only consume 15-20 GB of RAM.
-
-This discrepancy arises because **the benchmark only simulates the I/O for the Key-Value (KV) cache; it does not load the model's actual weights.**
-
-The primary goal of this tool is to measure the performance of your memory and storage subsystems under the specific I/O patterns generated by moving the KV cache between tiers. The 140GB+ of the model's weights are assumed to be static and already loaded in GPU VRAM. The benchmark focuses on the dynamic part: the KV cache, which is generated on-the-fly for each user.
-
-#### The KV Cache Size Formula
-
-The size of the KV cache for a single token can be calculated using the model's architectural parameters. The formula is:
-**Bytes per Token = `num_layers` × 2 × `kv_heads` × (`hidden_dim` / `num_heads`) × `bytes_per_dtype`**
-
-Where:
-*   `num_layers`: The number of transformer layers in the model.
-*   `2`: Represents the two components of the cache: the Key (K) and the Value (V).
-*   `kv_heads`: The number of attention heads for Keys/Values. For models using Grouped-Query Attention (GQA), this is smaller than `num_heads`.
-*   `hidden_dim / num_heads`: This calculates the dimension of a single attention head.
-*   `bytes_per_dtype`: The number of bytes for the data type (e.g., 2 for `float16`).
-
-#### Calculation for Each Model
-
-Here is the full calculation for each model defined in `kv-cache.py`:
-
-*   **`tiny-1b`**:
-    *   `32 × 2 × 4 × (1024 / 8) × 2` = **24,576 Bytes/Token** (~0.02 MB/Token)
-
-*   **`mistral-7b`**:
-    *   `32 × 2 × 8 × (4096 / 32) × 2` = **131,072 Bytes/Token** (~0.13 MB/Token)
-
-*   **`llama2-7b`** (Uses Multi-Head Attention, so `kv_heads` = `num_heads`):
-    *   `32 × 2 × 32 × (4096 / 32) × 2` = **524,288 Bytes/Token** (~0.50 MB/Token)
-
-*   **`llama3.1-8b`**:
-    *   `32 × 2 × 8 × (4096 / 32) × 2` = **131,072 Bytes/Token** (~0.13 MB/Token)
-
-*   **`llama3.1-70b-instruct`**:
-    *   `80 × 2 × 8 × (8192 / 64) × 2` = **327,680 Bytes/Token** (~0.31 MB/Token)
-
-#### Memory per User for an 8K Context
-
-Using these values, we can create a table showing the total KV cache size for a single user with a context of 8,192 tokens. This is crucial for capacity planning.
-
-| Model | Bytes per Token | Cache Size for 8,192 Tokens |
-| :--- | :--- | :--- |
-| `tiny-1b` | 24,576 | ~192 MB |
-| `mistral-7b` | 131,072 | ~1,024 MB (1 GB) |
-| `llama2-7b` | 524,288 | ~4,096 MB (4 GB) |
-| `llama3.1-8b` | 131,072 | ~1,024 MB (1 GB) |
-| `llama3.1-70b-instruct` | 327,680 | ~2,560 MB (2.5 GB) |
-
-This table clearly illustrates the memory pressure. If you are running the `llama3.1-70b-instruct` model with 40 users, the total active KV cache size the benchmark needs to manage is `40 users * 2.5 GB/user = 100 GB`. If you only provide 4 GB of CPU RAM (`--cpu-mem-gb 4`), the benchmark will correctly offload the other ~96 GB to your NVMe drive, allowing you to measure the performance of your storage under that specific, heavy load.
-
----
-
-## 9. Smoke Test: Quick Validation Suite
-
-This section provides a collection of key benchmark invocations that can be used as a "smoke test" to quickly validate different aspects of your system's performance. Each test is designed to isolate a specific component or behavior. For all commands, it is assumed the cache directory is `/mnt/nvme`.
-
-### Test 1: Storage-Only Saturation
-
-**Purpose:** Establishes the baseline performance of your storage device by forcing all I/O to it. This is the best way to measure your drive's raw throughput.
-
-```bash
-python3 kv-cache.py \
-    --model llama3.1-8b \
+    --cache-dir /mnt/sata_raid/kv_benchmark \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
     --num-users 50 \
-    --duration 180 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 0 \
-    --generation-mode realistic \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_storage_only.json
+    --max-concurrent-allocs 8 \
+    --duration 300 \
+    --performance-profile throughput
 ```
 
-### Test 2: Realistic Three-Tier Workload
-
-**Purpose:** Simulates a balanced, production-level environment using GPU, CPU, and NVMe tiers. Use this to measure end-to-end latency in a typical setup.
+#### Example 2: Network-Attached Storage (NFS/SMB)
 
 ```bash
-python3 kv-cache.py \
+# Mount NFS share from storage array
+sudo mount -t nfs storage.local:/exports/benchmark /mnt/nfs
+
+# Run benchmark on NFS (expect ~200-1000 MB/s depending on network)
+python -m kv_cache.cli \
     --model llama3.1-8b \
+    --cache-dir /mnt/nfs/kv_benchmark \
+    --gpu-mem-gb 0 --cpu-mem-gb 4 \
+    --num-users 25 \
+    --max-concurrent-allocs 4 \
+    --duration 300
+```
+
+#### Example 3: SAN Storage (Fibre Channel / iSCSI)
+
+```bash
+# Mount iSCSI LUN
+sudo iscsiadm -m node --login
+sudo mount /dev/sdb1 /mnt/iscsi_lun
+
+# Run benchmark on SAN (expect ~1-4 GB/s for enterprise arrays)
+python -m kv_cache.cli \
+    --model llama3.1-70b-instruct \
+    --cache-dir /mnt/iscsi_lun/kv_benchmark \
+    --gpu-mem-gb 0 --cpu-mem-gb 32 \
     --num-users 100 \
-    --duration 300 \
-    --gpu-mem-gb 16 \
-    --cpu-mem-gb 32 \
-    --generation-mode realistic \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_realistic_production.json
+    --max-concurrent-allocs 16 \
+    --duration 600
 ```
 
-### Test 3: Autoscaling for Max Users (QoS Mode)
-
-**Purpose:** **This is the key command for sizing your production environment.** It automatically discovers the maximum number of concurrent users your system can support while maintaining a low-latency user experience (Quality of Service).
+#### Example 4: RAM Disk (Maximum Speed Baseline)
 
 ```bash
-python3 kv-cache.py \
+# Create RAM disk (requires sufficient RAM)
+sudo mkdir -p /mnt/ramdisk
+sudo mount -t tmpfs -o size=64G tmpfs /mnt/ramdisk
+
+# Run benchmark on RAM disk (expect ~10-20 GB/s)
+python -m kv_cache.cli \
     --model llama3.1-8b \
-    --num-users 20 \
-    --duration 300 \
-    --gpu-mem-gb 16 \
-    --cpu-mem-gb 32 \
-    --enable-autoscaling \
-    --autoscaler-mode qos \
-    --generation-mode realistic \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_autoscaling_qos.json
+    --cache-dir /mnt/ramdisk/kv_benchmark \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 200 \
+    --duration 60
 ```
 
-### Test 4: Autoscaling for Peak Throughput (Capacity Mode)
-
-**Purpose:** Ignores latency to find the absolute maximum I/O throughput (tokens/sec) your storage hardware can sustain. This is the ultimate test of your drive's raw power.
+#### Example 5: Cloud Block Storage (AWS EBS, Azure Disk, GCP PD)
 
 ```bash
-python3 kv-cache.py \
-    --model llama3.1-70b-instruct \
-    --num-users 10 \
-    --duration 180 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 0 \
-    --enable-autoscaling \
-    --autoscaler-mode capacity \
-    --generation-mode none \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_autoscaling_capacity.json
-```
+# AWS EBS io2 volume (mounted at /dev/nvme1n1)
+sudo mkfs.xfs /dev/nvme1n1
+sudo mount /dev/nvme1n1 /mnt/ebs
 
-### Test 5: MLPerf Storage Submission (8B Model)
-
-**Purpose:** A standardized, high-load stress test designed to saturate the storage device and measure its sustained throughput for an official MLPerf submission.
-
-```bash
-python3 kv-cache.py \
+# Run benchmark (expect varies: gp3 ~1GB/s, io2 ~4GB/s)
+python -m kv_cache.cli \
     --model llama3.1-8b \
-    --num-users 150 \
-    --duration 600 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 2 \
-    --generation-mode realistic \
-    --performance-profile throughput \
-    --seed 42 \
-    --output mlperf_v3_storage_submission_8b.json
+    --cache-dir /mnt/ebs/kv_benchmark \
+    --gpu-mem-gb 0 --cpu-mem-gb 8 \
+    --num-users 100 \
+    --storage-capacity-gb 500 \
+    --duration 300
 ```
 
-### Test 6: MLPerf Storage Submission (70B Model)
+#### Scaling Guidelines
 
-**Purpose:** A heavier version of the MLPerf stress test using a large model to generate a more intense I/O load, further testing the limits of the storage subsystem.
+| Storage Type | Expected Bandwidth | Recommended `--num-users` | `--max-concurrent-allocs` |
+|--------------|-------------------|---------------------------|---------------------------|
+| HDD RAID | 100-300 MB/s | 10-25 | 0 (unlimited) |
+| SATA SSD | 400-550 MB/s | 25-50 | 0 (unlimited) |
+| SAS SSD | 800-1200 MB/s | 50-100 | 0 (unlimited) |
+| NFS (10GbE) | 500-1200 MB/s | 25-50 | 0 (unlimited) |
+| SAN (FC/iSCSI) | 1-4 GB/s | 50-150 | 0 (unlimited) |
+| PCIe Gen3 NVMe | 2-3.5 GB/s | 100-200 | 0 (unlimited) |
+| PCIe Gen4 NVMe | 5-7 GB/s | 150-300 | 0 (unlimited) |
+| PCIe Gen5 NVMe | 10-14 GB/s | 200-500 | 0 (unlimited) |
+| RAM Disk | 10-25 GB/s | 200-500 | 0 (unlimited) |
+
+**Note on `--max-concurrent-allocs`:**
+- **MLPerf submissions:** Always use `0` (unlimited) to measure true hardware capability
+- **Production simulation:** Set non-zero to simulate memory-constrained environments
+- **OOM prevention:** Use `4-16` if benchmark exhausts system RAM during parallel writes
+
+The `--max-concurrent-allocs` flag is a **limiter**, not a performance target. Higher values don't improve throughput; they cap it.
+
+| Symptom | Cause | Action |
+|---------|-------|--------|
+| Per-request latency >> actual I/O time | Semaphore wait overhead | Keep `--max-concurrent-allocs 0` (unlimited) |
+| OOM during benchmark | Too many parallel writes in flight | Set `--max-concurrent-allocs 8-16` |
+
+#### Multi-Client Scaling (Bypassing Python GIL)
+
+For maximum I/O parallelism, run **multiple benchmark processes** with separate cache directories. This bypasses Python's Global Interpreter Lock (GIL) and better simulates production deployments (multiple vLLM/TensorRT-LLM instances on the same node).
+
+**Why multi-client?**
+
+| Approach | GIL Contention | Realistic? | Use Case |
+|----------|----------------|------------|----------|
+| Single-client, `--num-users 400` | Yes | Less | Quick validation |
+| 4 clients × `--num-users 100` | No | More | MLPerf submission, stress test |
+
+**⚠️ RAM Requirements for Multi-Client**
+
+Each client process holds KV cache tensors in RAM during I/O operations. With `--max-concurrent-allocs 0` (unlimited), worst-case RAM per client:
+
+```
+RAM per client ≈ num_users × avg_context_tokens × bytes_per_token
+```
+
+| Model | Bytes/Token | 100 users × 4K context | 100 users × 8K context |
+|-------|-------------|------------------------|------------------------|
+| llama3.1-8b | 312 KB | ~122 GB | ~244 GB |
+| llama3.1-70b | 1.28 MB | ~500 GB | ~1 TB |
+
+**To prevent OOM with multi-client setups:**
+
+| System RAM | Max Clients | Users per Client | `--max-concurrent-allocs` |
+|------------|-------------|------------------|---------------------------|
+| 64 GB | 2 | 25 | 8 |
+| 128 GB | 4 | 25 | 8 |
+| 256 GB | 4 | 50 | 16 |
+| 512 GB | 8 | 50 | 16 |
+| 1 TB+ | 8 | 100 | 0 (unlimited) |
+
+**Example: 4-client parallel benchmark (memory-aware)**
 
 ```bash
-python3 kv-cache.py \
-    --model llama3.1-70b-instruct \
-    --num-users 40 \
-    --duration 600 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 4 \
-    --generation-mode realistic \
-    --performance-profile throughput \
-    --seed 42 \
-    --output mlperf_v3_storage_submission_70b.json
+#!/bin/bash
+# run_multi_client.sh - Scale to 4 processes with RAM limits
+
+NUM_CLIENTS=4
+CACHE_BASE="/mnt/nvme/kv_benchmark"
+MODEL="llama3.1-8b"
+DURATION=300
+USERS_PER_CLIENT=50          # Reduced from 100 for RAM safety
+MAX_CONCURRENT=16            # Limit in-flight tensors per client
+
+for i in $(seq 0 $((NUM_CLIENTS-1))); do
+    python -m kv_cache.cli \
+        --cache-dir ${CACHE_BASE}/client_${i} \
+        --model ${MODEL} \
+        --num-users ${USERS_PER_CLIENT} \
+        --max-concurrent-allocs ${MAX_CONCURRENT} \
+        --gpu-mem-gb 0 --cpu-mem-gb 0 \
+        --duration ${DURATION} \
+        --output results_client_${i}.json &
+    echo "Started client $i (PID: $!)"
+done
+
+echo "Waiting for all clients to complete..."
+wait
+echo "All clients finished. Aggregate results from results_client_*.json"
 ```
 
-### Test 7: RAG Workload Simulation
+**Result aggregation:**
 
-**Purpose:** Simulates a Retrieval-Augmented Generation (RAG) workload, which involves a write-heavy ingestion phase followed by bursty, high-throughput reads. This is an excellent stress test for RAG-specific applications.
+```python
+import json
+import glob
 
-```bash
-python3 kv-cache.py \
-    --model llama3.1-8b \
-    --num-users 30 \
-    --duration 300 \
-    --gpu-mem-gb 16 \
-    --cpu-mem-gb 32 \
-    --enable-rag \
-    --generation-mode realistic \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_rag_workload.json
+results = [json.load(open(f)) for f in glob.glob("results_client_*.json")]
+
+total_write_gb = sum(r['storage_stats']['total_write_bytes'] / 1e9 for r in results)
+total_read_gb = sum(r['storage_stats']['total_read_bytes'] / 1e9 for r in results)
+total_duration = max(r['duration_seconds'] for r in results)
+
+print(f"Aggregate Write Bandwidth: {total_write_gb / total_duration:.2f} GB/s")
+print(f"Aggregate Read Bandwidth: {total_read_gb / total_duration:.2f} GB/s")
 ```
 
-### Test 8: Maximum Stress (The "Kitchen Sink")
+**Scaling recommendations (RAM-aware):**
 
-**Purpose:** This is the ultimate stress test. It combines the largest model (70B), the I/O-intensive RAG workload, and the capacity-seeking autoscaler to find the absolute maximum throughput your system can handle when every demanding feature is enabled.
+| System RAM | NVMe Type | Recommended Multi-Client Setup |
+|------------|-----------|-------------------------------|
+| 128 GB | PCIe Gen3 | 2 clients × 50 users × `--max-concurrent-allocs 8` |
+| 256 GB | PCIe Gen4 | 4 clients × 50 users × `--max-concurrent-allocs 16` |
+| 512 GB | PCIe Gen5 | 4 clients × 100 users × `--max-concurrent-allocs 32` |
+| 1 TB+ | PCIe Gen5 | 8 clients × 100 users × `--max-concurrent-allocs 0` |
 
-```bash
-python3 kv-cache.py \
-    --model llama3.1-70b-instruct \
-    --num-users 10 \
-    --duration 300 \
-    --gpu-mem-gb 16 \
-    --cpu-mem-gb 64 \
-    --enable-rag \
-    --enable-autoscaling \
-    --autoscaler-mode capacity \
-    --generation-mode realistic \
-    --cache-dir /mnt/nvme \
-    --seed 42 \
-    --output results_max_stress.json
-```
-
-### Test 9: ShareGPT Workload Replay
-
-**Purpose:** Validates system performance against a trace of real-world human-AI conversations. This is the closest approximation to running a production service. It uses the dedicated replay script [`kv-cache_sharegpt_replay.py`](kv-cache_sharegpt_replay.py ).
-
-```bash
-python3 kv-cache_sharegpt_replay.py \
-    --model llama3.1-70b-instruct \
-    --dataset-path ShareGPT_V3_unfiltered_cleaned_split.json \
-    --max-conversations 1000 \
-    --gpu-mem-gb 0 \
-    --cpu-mem-gb 2 \
-    --cache-dir /mnt/nvme \
-    --num-users 50 \
-    --duration 300 \
-    --generation-mode none \
-    --output results_sharegpt_replay.json
-```
+**Important:** 
+- Each client uses a **separate subdirectory** (`client_0/`, `client_1/`, etc.) to avoid file conflicts
+- Monitor system RAM with `htop` or `free -h` during runs
+- If OOM occurs, reduce `--num-users` or set `--max-concurrent-allocs` lower
 
 ---
 
-# CHANGES-12-05-2025: The "Waterfall" Architecture & Optimization
+## 3. Architecture Deep Dive
 
-**Date:** December 5, 2025
-**Subject:** Major architectural upgrade to `kv-cache-waterfall-lru.py`.
+### 3.1 Request Structure
 
-This update introduces a fundamental shift in how the benchmark manages memory, moving from a simple "Spillover" model to a sophisticated "Waterfall" eviction strategy. It also addresses a critical CPU bottleneck that was masking true storage performance.
+Each inference request simulates a user interaction:
 
-## 1. Architectural Shift: From Spillover to Waterfall
+| Field | Description |
+|-------|-------------|
+| `context_tokens` | Prompt size (determines KV cache write size) |
+| `generate_tokens` | Number of tokens to produce (determines read operations) |
+| `phase` | `PREFILL` (write-only, ≥10K tokens), `DECODE` (read-only), `PREFILL_DECODE` (typical: 1 write + N reads) |
+| `cache_key` | Unique identifier: `{conversation_id}_turn_{n}` or `{user_id}_ctx` |
 
-The original benchmark used a **Spillover** strategy. When the GPU was full, new data was forced directly into the CPU (and then NVMe).
-*   **The Problem:** New data is often the "hottest" (most likely to be read again soon). By forcing it to the slowest tier, we were penalizing active conversations. Meanwhile, old, cold data sat comfortably in the GPU, wasting valuable VRAM.
-*   **The Solution (Waterfall):** The new implementation enforces a strict hierarchy. New data **always** targets the fastest tier (GPU).
-    *   If the GPU is full, the system identifies the **Least Recently Used (LRU)** item in the GPU and moves it to the CPU to make room.
-    *   If the CPU is full, it moves the CPU's LRU item to NVMe.
-    *   **Result:** The hottest data stays fast. Only truly cold data "falls" down the waterfall to storage. This mimics the behavior of production-grade caching systems like Redis or vLLM.
-
-### The Waterfall Flow
-
-```ascii
-      [ New Data ]
-           |
-           v
-    +-------------+      (Full?)      +-------------+      (Full?)      +-------------+
-    |  GPU Tier   |  -------------->  |  CPU Tier   |  -------------->  |  NVMe Tier  |
-    | (Fastest)   |   Evict LRU       | (Medium)    |   Evict LRU       | (Slowest)   |
-    +-------------+                   +-------------+                   +-------------+
-           ^                                 ^                                 ^
-           |                                 |                                 |
-    [ Hot Access ]                    [ Warm Access ]                   [ Cold Access ]
+**Phase Logic:**
+```python
+phase = PREFILL if context_tokens >= 10000 else PREFILL_DECODE
 ```
 
-### Implementation: Recursive Eviction
+Most requests use `PREFILL_DECODE`: one prefill write followed by batched decode reads.
 
-The core logic resides in `_ensure_space_in_tier`. It recursively clears space in lower tiers to make room for demotions from higher tiers.
+---
+
+### 3.2 Telemetry: Four-Layer Latency Hierarchy
+
+Each inference request produces latency measurements at four nested levels. Understanding what each measures is critical for diagnosing bottlenecks.
+
+#### Visual Overview
+
+```
+User submits request
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│ L1: END-TO-END LATENCY                                                  │
+│     Time from request submission to response completion                  │
+│     = Queue Wait + Storage I/O + Token Generation                       │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────────┐ │
+│  │ L2: PER-REQUEST STORAGE LATENCY                                    │ │
+│  │     Total I/O time for ONE request (may include multiple ops)      │ │
+│  │     = 1× Prefill Write + N× Decode Reads                           │ │
+│  │                                                                     │ │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │ │
+│  │  │ L3: PER-TIER TOTAL LATENCY                                   │  │ │
+│  │  │     Time for ONE file I/O operation on ONE storage tier      │  │ │
+│  │  │     = Host (CPU) + Device (Disk)                             │  │ │
+│  │  │                                                               │  │ │
+│  │  │  ┌────────────────────────────────────────────────────────┐  │  │ │
+│  │  │  │ L4: HOST vs DEVICE BREAKDOWN                           │  │  │ │
+│  │  │  │     Write: Host = np.save() | Device = fsync()         │  │  │ │
+│  │  │  │     Read:  Host = fadvise+copy | Device = np.load()    │  │  │ │
+│  │  │  │     (NOT pure NVMe controller latency - includes OS)   │  │  │ │
+│  │  │  └────────────────────────────────────────────────────────┘  │  │ │
+│  │  └──────────────────────────────────────────────────────────────┘  │ │
+│  └────────────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Concrete Example: Llama 3.1 70B Request
+
+A user sends a 4,096-token prompt and requests 128 generated tokens:
+
+```
+Request: "Explain quantum computing..." (4,096 context tokens, 128 gen tokens)
+Model: Llama 3.1 70B (312 KB per token)
+File size: 4,096 × 312 KB = 1.28 GB
+
+Timeline:
+├─ Queue Wait: 500ms (waiting for semaphore slot)
+├─ PREFILL: Write 1.28 GB file to NVMe
+│   ├─ Host (np.save serialization): 800ms
+│   └─ Device (fsync to disk): 200ms
+│   └─ Total: 1,000ms
+├─ DECODE: Read file 4× (⌈128/32⌉ batched reads)
+│   ├─ Read 1: Host 600ms + Device 150ms = 750ms
+│   ├─ Read 2: Host 600ms + Device 150ms = 750ms
+│   ├─ Read 3: Host 600ms + Device 150ms = 750ms
+│   └─ Read 4: Host 600ms + Device 150ms = 750ms
+│   └─ Total: 3,000ms
+└─ Generation: 128 × 30ms = 3,840ms (simulated GPU time)
+
+L1 End-to-End:      500 + 1,000 + 3,000 + 3,840 = 8,340ms
+L2 Storage I/O:     1,000 + 3,000 = 4,000ms
+L3 Write Total:     1,000ms
+L3 Read Total:      750ms (per read)
+L4 Write Host:      800ms | L4 Write Device: 200ms
+L4 Read Host:       600ms | L4 Read Device: 150ms
+```
+
+#### What Each File Represents
+
+| Concept | On Disk | Contents |
+|---------|---------|----------|
+| 1 Request | 1 `.npy` file | KV cache tensor: `(layers, 2, seq_len, kv_heads, head_dim)` |
+| File size | `seq_len × bytes_per_token` | e.g., 4,096 tokens × 312 KB = 1.28 GB |
+| Location | `--cache-dir/uuid.npy` | e.g., `/mnt/nvme/a1b2c3d4.npy` |
+
+#### L4 Breakdown: What Host vs Device Actually Measures
+
+**⚠️ Important:** "Device" latency is NOT pure NVMe controller latency. It includes OS/filesystem overhead.
+
+| Component | Write Operation | Read Operation |
+|-----------|-----------------|----------------|
+| **Host** | `np.save()`: Serialize numpy array + write to page cache | `posix_fadvise()` prep + `np.array()` copy |
+| **Device** | `f.flush()` + `os.fsync()`: Flush page cache → NVMe | `np.load()`: File read + deserialize (includes disk I/O) |
+
+**What's actually measured (backends.py):**
 
 ```python
-def _ensure_space_in_tier(self, tier: str, required_bytes: int, recursion_depth: int = 0) -> bool:
-    # ... (recursion limits and checks omitted) ...
+# WRITE timing (lines 270-285)
+np.save(f, data)                    # ← host_time starts
+post_save = time.perf_counter()     
+f.flush()                           # ← device_time starts  
+os.fsync(f.fileno())                # Block until NVMe ACKs
+post_fsync = time.perf_counter()
+host_time = post_save - start       # np.save() = serialize + buffered write
+device_time = post_fsync - post_save # flush + fsync = page cache → NVMe
 
-    # Find the LRU entry in this tier
-    lru_entries = self._get_lru_entries_in_tier(tier)
+# READ timing (lines 287-315)
+os.posix_fadvise(fd, POSIX_FADV_DONTNEED)  # Drop page cache (prep)
+pre_load = time.perf_counter()
+data = np.load(path)                # ← device_time (disk read + deserialize)
+load_done = time.perf_counter()
+data = np.array(data)               # ← host_time (copy)
+device_time = load_done - pre_load  # np.load() = file I/O + numpy deserialize
+host_time = (pre_load - start) + (copy_done - load_done)
+```
+
+**Why "Device" includes more than NVMe:**
+- Write: `fsync()` waits for page cache flush + NVMe write completion
+- Read: `np.load()` includes syscall overhead + numpy header parsing + deserialization
+
+**To isolate pure NVMe latency:** Use `iostat -x` alongside the benchmark; it reports `r_await`/`w_await` which measure actual device queue time.
+
+#### Diagnostic Guide
+
+| Symptom | Meaning | Cause | Solution |
+|---------|---------|-------|----------|
+| Write host >> write device | `np.save()` dominates over `fsync()` | CPU serialization bottleneck | Faster CPU, smaller tensors |
+| Write device >> write host | `fsync()` dominates over `np.save()` | Storage write bottleneck | Faster NVMe, check write amplification |
+| Read device high | `np.load()` slow (includes disk + deserialize) | Storage read or CPU bottleneck | Check `iostat r_await` to isolate |
+| Per-request latency >> sum of tier latencies | Time between operations exceeds I/O time | Semaphore contention | Use `--max-concurrent-allocs 0` |
+
+**Key Insight:** The L4 breakdown helps identify bottlenecks, but for pure NVMe performance, correlate with `iostat` metrics which measure actual device latency.
+
+---
+
+### 3.3 Decode Batch Size
+
+Decode reads are batched to model realistic KV cache access:
+
+```python
+decode_batch_size = cfg('decode', 'batch_size', default=32)  # config.yaml: decode.batch_size
+num_reads = max(1, (generate_tokens + decode_batch_size - 1) // decode_batch_size)
+```
+
+| `generate_tokens` | Batched Reads |
+|-------------------|---------------|
+| 1-32 | 1 |
+| 33-64 | 2 |
+| 100 | 4 |
+| 500 | 16 |
+
+**Rationale:** Approximates continuous batching/speculative decoding in production LLM systems.
+
+---
+
+### 3.4 Three-Tier Waterfall Architecture
+
+The `MultiTierCache` implements a **Waterfall LRU** strategy where hot data stays in fast tiers:
+
+```
+     ┌─────────────────┐
+     │   GPU VRAM      │ ← Tier 1 (Fastest): New writes target here first
+     │   (Hot Data)    │
+     └────────┬────────┘
+              │ LRU eviction when full
+              ↓
+     ┌─────────────────┐
+     │   CPU RAM       │ ← Tier 2 (Fast): Evicted GPU data lands here
+     │   (Warm Data)   │
+     └────────┬────────┘
+              │ LRU eviction when full
+              ↓
+     ┌─────────────────┐
+     │   NVMe SSD      │ ← Tier 3 (Slow): Capacity-bounded
+     │   (Cold Data)   │    LRU entries deleted when full
+     └─────────────────┘
+```
+
+**Waterfall Logic:**
+
+1. **New allocations target GPU** – Fastest tier receives all fresh data
+2. **GPU full → LRU cascades to CPU** – Least recently used entry "waterfalls" down
+3. **CPU full → LRU cascades to NVMe** – Continue cascade to cold storage
+4. **NVMe full → LRU deleted** – Oldest entries permanently removed
+
+**Why no promotion (NVMe → GPU)?**
+
+This is intentional for a **storage benchmark**:
+- Promotion would *reduce* NVMe I/O by moving hot data back to fast tiers, undermining storage stress testing
+- Streaming workloads are write-once, read-few: each request has unique cache key
+- Data accessed during decode phase, then rarely touched again
+
+**Impact on capacity planning:** Production systems (vLLM, TensorRT-LLM) promote hot entries back to GPU, creating a mixed workload the benchmark does not model. Without promotion, the benchmark (1) overstates NVMe read bandwidth requirements (hot entries would be served from GPU/CPU after promotion), (2) understates GPU/CPU memory pressure (promoted entries compete with new allocations), and (3) cannot predict the steady-state tier distribution that determines end-to-end serving latency. Benchmark results should be interpreted as **storage throughput limits**, not end-to-end capacity under production promotion policies.
+
+**Temperature-Based Placement:**
+
+| Data Temperature | Tier | Access Pattern |
+|------------------|------|----------------|
+| **Hot** (recent) | GPU | Active requests, stays hot until evicted |
+| **Warm** (evicted) | CPU | Recently evicted, accessed from CPU |
+| **Cold** (LRU) | NVMe | Historical, accessed from NVMe |
+
+Data flows **downward only** (waterfall). Once evicted to NVMe, it stays there until deleted.
+
+---
+
+### 3.5 Eviction Mechanism: Recursive Waterfall
+
+The eviction system uses **recursive space reservation** to ensure that demoting data from a full tier succeeds by preparing space in lower tiers first. When the bottom tier (NVMe) is full, entries are **permanently deleted**.
+
+#### Algorithm Overview
+
+```python
+def _ensure_space_in_tier(tier, required_bytes, recursion_depth=0):
+    """
+    Recursively ensures space in a tier by cascading evictions downward.
+    When NVMe (bottom tier) is full, LRU entries are DELETED.
+    """
+    # 1. Check if space is already available
+    if current_usage + required_bytes <= target_usage:
+        # ATOMICALLY RESERVE SPACE inside lock
+        update_tier_usage(tier, required_bytes)
+        return True
+    
+    # 2. Identify LRU (Least Recently Used) entry in this tier
+    lru_entries = get_lru_entries_in_tier(tier)
+    if not lru_entries:
+        return False  # Tier is empty, can't evict
+    
     lru_key, lru_entry = lru_entries[0]
     lru_size = lru_entry['size']
     
-    # Recursively ensure the next tier has space for this entry
-    # This triggers the "Waterfall" effect down the hierarchy
-    if not self._ensure_space_in_tier(next_tier, lru_size, recursion_depth + 1):
-        return False
+    # 3. Check if this is the BOTTOM tier (NVMe)
+    if tier == 'nvme' or next_tier is None:
+        # NO LOWER TIER - DELETE the LRU entry permanently
+        _delete_entry(lru_key)  # unlink .npy file from disk
+        # Loop until enough space is freed
+        return check_space_and_repeat()
     
-    # Demote the LRU entry to the next tier
-    success, _ = self._demote_entry(lru_key, tier, next_tier)
+    # 4. RECURSIVELY ensure next tier has space for the LRU entry
+    #    This is the "waterfall" effect
+    if not _ensure_space_in_tier(next_tier, lru_size, recursion_depth + 1):
+        return False  # Can't cascade further
+    
+    # 5. Demote the LRU entry to next tier
+    success = _demote_entry(lru_key, from_tier=tier, to_tier=next_tier)
+    
+    # 6. Loop until enough space is freed
+    return check_space_and_repeat()
 ```
 
-## 2. Removing the CPU Bottleneck: Static Noise Buffers
+#### Step-by-Step Example
 
-**The Issue:**
-Profiling the original script revealed that `np.random.uniform`—the function used to generate the dummy KV cache data—was consuming massive amounts of CPU time.
-*   **Impact:** The CPU was spending so much time generating random numbers that it couldn't issue storage I/O requests fast enough. The benchmark was measuring the speed of Python's random number generator, not the speed of the NVMe drive.
+**Scenario:** New 10 MB entry needs to be written to GPU, but GPU is full.
 
-**The Fix:**
-We replaced dynamic generation with a **Static Noise Buffer**.
-*   **Mechanism:** At startup, the benchmark pre-allocates a 256MB block of random noise in memory.
-*   **Zero-Copy Slicing:** When a request needs 10MB of data, instead of generating 10MB of new numbers, the system simply takes a "slice" (a view) of the pre-existing buffer.
-*   **Result:** Data generation is now effectively instant (zero CPU cost). This ensures that 100% of the latency measured is due to the storage subsystem, providing a true test of hardware performance.
-
-```python
-class KVCacheGenerator:
-    def __init__(self, model_config: ModelConfig, global_seed: Optional[int] = None):
-        # Pre-allocate a large buffer of random noise (e.g., 256MB)
-        self.buffer_size_elements = 128 * 1024 * 1024 
-        self.precomputed_buffer = rng.uniform(-1.0, 1.0, size=self.buffer_size_elements).astype(self.dtype)
-
-    def generate(self, sequence_length: int, key: Optional[str] = None) -> np.ndarray:
-        # ... (shape calculation omitted) ...
+```
+Step 1: _ensure_space_in_tier('gpu', 10MB, depth=0)
+        ├─ GPU usage: 15.5/16 GB (97% full)
+        ├─ LRU entry in GPU: "conv_42_turn_3" (8 MB)
+        └─ Need to evict to make room
         
-        # Zero-Copy Slicing: Take a view of the pre-existing buffer
-        if total_elements <= self.buffer_size_elements:
-            flat_view = self.precomputed_buffer[start_idx : start_idx + total_elements]
-            return flat_view.reshape(kv_shape)
+Step 2: Recursively ensure CPU has space for 8 MB
+        _ensure_space_in_tier('cpu', 8MB, depth=1)
+        ├─ CPU usage: 30/32 GB (94% full)
+        ├─ LRU entry in CPU: "user_19_ctx" (6 MB)
+        └─ Need to evict to make room
+        
+Step 3: Recursively ensure NVMe has space for 6 MB
+        _ensure_space_in_tier('nvme', 6MB, depth=2)
+        ├─ NVMe usage: 50/100 GB (within capacity)
+        └─ RESERVE 6 MB in NVMe ✓
+        
+Step 4: Cascade back up - demote CPU → NVMe
+        _demote_entry("user_19_ctx", from='cpu', to='nvme')
+        ├─ Read from CPU (fast)
+        ├─ Write to NVMe (slow but necessary)
+        ├─ Delete from CPU
+        └─ CPU now has 8 MB free ✓
+        
+Step 5: Cascade back up - demote GPU → CPU
+        _demote_entry("conv_42_turn_3", from='gpu', to='cpu')
+        ├─ Read from GPU (fastest)
+        ├─ Write to CPU (fast)
+        ├─ Delete from GPU
+        └─ GPU now has 10 MB free ✓
+        
+Step 6: Write new entry to GPU
+        allocate_cache(key, 10MB)
+        └─ Write to GPU ✓
 ```
 
-## 3. Concurrency Hardening
+#### Eviction Configuration (config.yaml)
 
-Implementing the Waterfall strategy introduced complex race conditions, where multiple threads might try to evict the same item or claim the same free space simultaneously.
-*   **Atomic Reservations:** We implemented a "check-and-reserve" logic inside the memory locks. A thread now claims space *before* it starts writing, preventing over-subscription.
-*   **Loop Protection:** We added hard caps to the eviction loops. In a pathological case where the system is thrashing, the eviction logic will now abort rather than spinning infinitely, preventing the benchmark from hanging.
+```yaml
+eviction:
+  max_recursion_depth: 10         # Max cascade depth
+  target_usage_ratio: 0.8         # Keep tier at 80% (20% buffer)
+  large_entry_limit_ratio: 0.95   # Skip to next tier if entry >95% of tier
+  max_evictions_hard_cap: 5000    # Safety limit per cycle
+  max_evictions_min: 1000         # Min evictions before giving up
+```
+
+**Key Parameters:**
+- `target_usage_ratio: 0.8` – Eviction starts when tier reaches 80% capacity, maintaining 20% free space buffer
+- `large_entry_limit_ratio: 0.95` – Entries larger than 95% of tier capacity skip directly to next tier (prevents thrashing)
+- `max_recursion_depth: 10` – Prevents infinite recursion in pathological cases
+
+#### Concurrency & Thread Safety
+
+**Race Condition Protection:**
+1. **Atomic Reservations:** Space is reserved inside the memory lock *before* writing, preventing over-subscription
+2. **Per-Entry Locks:** Each cache key has its own lock to prevent concurrent demotions of the same entry
+3. **Metadata Lock:** Global lock protects `cache_entries` dictionary from concurrent modifications
+
+**Example Race Condition (Prevented):**
+```
+Thread A: Needs 5 MB in GPU
+Thread B: Needs 5 MB in GPU
+GPU has 8 MB free
+
+WITHOUT atomic reservation:
+  ├─ A checks: 8 MB free ✓
+  ├─ B checks: 8 MB free ✓
+  ├─ A writes 5 MB → GPU has 3 MB
+  └─ B writes 5 MB → GPU OVERFLOWS ✗
+
+WITH atomic reservation:
+  ├─ A acquires lock, reserves 5 MB → GPU has 3 MB free
+  ├─ A releases lock
+  ├─ B acquires lock, checks 3 MB free
+  ├─ B triggers eviction, demotes LRU to CPU
+  └─ B reserves 5 MB → GPU has sufficient space ✓
+```
+
+#### Tier Configuration: What Happens When Tiers Are Disabled
+
+The eviction waterfall adapts based on which tiers are enabled via `--gpu-mem-gb` and `--cpu-mem-gb`:
+
+**Configuration 1: `--gpu-mem-gb 0 --cpu-mem-gb 0` (NVMe Only)**
+
+```
+Tier hierarchy: [NVMe only]
+Eviction: LRU DELETION (no lower tier to demote to)
+
+allocate_cache("user_request", 1.28 GB)
+├─ GPU tier: DISABLED (0 GB) → skip
+├─ CPU tier: DISABLED (0 GB) → skip
+└─ NVMe tier: WRITE DIRECTLY
+    └─ np.save("/mnt/nvme/uuid.npy", kv_data)
+```
+
+**How NVMe capacity is determined:**
+
+| `--storage-capacity-gb` | Behavior |
+|-------------------------|----------|
+| `> 0` (explicit) | Uses specified value (e.g., `--storage-capacity-gb 100` → 100 GB) |
+| `0` (default) | Auto-detects via `shutil.disk_usage(cache_dir).free` |
+| Auto-detect fails | `float('inf')` (unlimited, grows until disk full) |
+
+**What happens when NVMe fills up?**
+
+Once NVMe reaches `target_usage_ratio` (default 80%), **LRU entries are permanently deleted** to make room:
+
+```
+NVMe capacity: 100 GB (--storage-capacity-gb 100)
+Target usage: 80 GB (80%)
+Current usage: 82 GB
+New entry: 1.28 GB
+
+Step 1: _ensure_space_in_tier('nvme', 1.28 GB)
+        ├─ Usage 82 GB > target 80 GB
+        ├─ Need to free: 82 + 1.28 - 80 = 3.28 GB
+        └─ Find LRU entries to DELETE
+
+Step 2: Delete LRU entries until space is available
+        ├─ DELETE "user_5_turn_1" (0.9 GB) → unlink file
+        ├─ DELETE "user_12_turn_2" (1.1 GB) → unlink file
+        ├─ DELETE "user_8_turn_1" (0.8 GB) → unlink file
+        ├─ DELETE "user_3_turn_3" (0.6 GB) → unlink file
+        └─ Total freed: 3.4 GB ✓
+
+Step 3: Write new entry
+        └─ np.save("/mnt/nvme/new_entry.npy", kv_data) ✓
+
+Result: 4 old cache entries permanently lost, 1 new entry written
+```
+
+**Key point:** With `--gpu-mem-gb 0 --cpu-mem-gb 0`, the NVMe tier acts as a **fixed-size LRU cache**. Old entries are evicted (deleted) to make room for new ones.
+
+**Use case:** Pure storage benchmark. Measures sustained NVMe performance under cache pressure with realistic eviction churn.
+
+#### Two Separate Eviction Mechanisms
+
+The benchmark has **two independent eviction systems**. Only one of them deletes files from disk:
+
+| Mechanism | Location | Trigger | What Happens |
+|-----------|----------|---------|--------------|
+| **ConversationManager** | `conversation.py` | `len(conversations) >= max_conversations` | Removes conversation **metadata** from memory. Cache files (.npy) **remain on disk**. |
+| **MultiTierCache** | `cache.py` | `tier_usage >= capacity × target_ratio` | Calls `path.unlink()` on .npy files, **permanently deleting them from the filesystem**. |
+
+**ConversationManager eviction (default: 1000 conversations):**
+```python
+# conversation.py line 72-73
+if len(self.conversations) >= self.max_conversations:  # default 1000
+    self._evict_oldest_conversation()  # removes metadata dict entry ONLY
+```
+
+This removes the conversation tracking record (an in-memory dict entry). The **cache .npy files remain on disk** untouched; they are only deleted when MultiTierCache runs out of capacity.
+
+**MultiTierCache eviction (based on storage capacity):**
+```python
+# cache.py - when NVMe is the bottom tier and full
+if nvme_usage >= nvme_capacity * 0.8:
+    for lru_key in lru_entries_to_evict:
+        self.backends['nvme'].delete(lru_key)  # calls path.unlink() -> file permanently deleted
+
+# backends.py - NVMeBackend.delete()
+def delete(self, key):
+    path = self.base_path / f"{key}.npy"
+    path.unlink()          # POSIX unlink: permanently removes the file from the filesystem
+    del self.metadata[key]
+```
+
+**Example timeline:**
+```
+t=0:   Conversation 1 started, cache file written (1.2 GB)
+t=10:  Conversation 1000 started
+t=11:  Conversation 1001 started
+       ├─ ConversationManager evicts conv 1 metadata (dict entry removed)
+       └─ Cache .npy file for conv 1 STILL ON DISK (untouched)
+
+t=100: NVMe reaches 80% capacity
+       ├─ MultiTierCache calls NVMeBackend.delete() on LRU entries
+       └─ Conv 1's .npy file permanently deleted from filesystem via path.unlink()
+```
+
+**Config locations:**
+```yaml
+# config.yaml
+conversation:
+  max_conversations: 1000      # ConversationManager limit
+  max_turns_per_conv: 50
+
+eviction:
+  target_usage_ratio: 0.8      # MultiTierCache limit (80% of capacity)
+```
+
+---
+
+**Configuration 2: `--gpu-mem-gb 0 --cpu-mem-gb 4` (CPU + NVMe)**
+
+```
+Tier hierarchy: [CPU (4 GB)] → [NVMe]
+Eviction: CPU → NVMe (single-hop)
+
+allocate_cache("user_request", 1.28 GB)
+├─ GPU tier: DISABLED (0 GB) → skip
+├─ CPU tier: Check if 1.28 GB fits in 4 GB budget
+│   ├─ If fits: Write to CPU RAM (fast)
+│   └─ If full: Evict LRU from CPU → NVMe, then write to CPU
+└─ If CPU can't fit entry (>4 GB): Write directly to NVMe
+```
+
+**Example eviction flow:**
+```
+CPU usage: 3.5 / 4.0 GB (87.5%)
+New entry: 1.28 GB
+Required free: 1.28 GB
+Available: 0.5 GB
+Deficit: 0.78 GB
+
+Step 1: _ensure_space_in_tier('cpu', 1.28 GB)
+        ├─ Need to evict 0.78 GB from CPU
+        ├─ LRU entry: "old_ctx" (0.9 GB)
+        └─ Demote "old_ctx" CPU → NVMe
+        
+Step 2: _demote_entry("old_ctx", from='cpu', to='nvme')
+        ├─ Read from CPU RAM: 2ms
+        ├─ Write to NVMe: 100ms
+        └─ CPU now has 1.4 GB free ✓
+        
+Step 3: Write new entry to CPU
+        └─ Write 1.28 GB to CPU RAM: 5ms ✓
+```
+
+**Use case:** Hybrid benchmark. Hot data in CPU RAM, cold data spills to NVMe. Measures CPU→NVMe demotion overhead.
+
+---
+
+**Configuration 3: `--gpu-mem-gb 16 --cpu-mem-gb 32` (Full 3-Tier)**
+
+```
+Tier hierarchy: [GPU (16 GB)] → [CPU (32 GB)] → [NVMe]
+Eviction: GPU → CPU → NVMe (multi-hop cascade)
+```
+
+This is the full recursive waterfall described above.
+
+---
+
+#### Summary: Tier Configurations
+
+| Config | Active Tiers | Eviction Pattern | I/O Measured |
+|--------|--------------|------------------|--------------|
+| `--gpu-mem-gb 0 --cpu-mem-gb 0` | NVMe only | None | Pure NVMe read/write |
+| `--gpu-mem-gb 0 --cpu-mem-gb 4` | CPU → NVMe | CPU → NVMe | CPU hits + NVMe spill |
+| `--gpu-mem-gb 16 --cpu-mem-gb 0` | GPU → NVMe | GPU → NVMe | GPU hits + NVMe spill |
+| `--gpu-mem-gb 16 --cpu-mem-gb 32` | GPU → CPU → NVMe | Full cascade | Full tier hierarchy |
+
+**Key behavior when a tier is set to 0:**
+- The tier is **completely bypassed** in allocation decisions
+- Entries skip directly to the next enabled tier
+- No eviction can occur *from* a disabled tier (nothing stored there)
+- The waterfall "shortens" to only include enabled tiers
+
+#### Eviction vs. Spillover
+
+**Old Approach (Spillover):** When GPU full, new data forced to CPU → penalizes hot data
+
+**New Approach (Waterfall):** When GPU full, evict *old cold data* to CPU → new hot data stays fast
+
+| Aspect | Spillover | Waterfall LRU |
+|--------|-----------|---------------|
+| **New data placement** | Forced to slower tier | Always targets fastest tier |
+| **Evicted data** | Random or FIFO | LRU (least recently used) |
+| **Hot data performance** | ❌ Degraded | ✅ Optimal |
+| **Production use** | Rare | vLLM, TensorRT-LLM, LMCache, Redis |
+
+**Production References:**
+
+1. **vLLM** uses LRU eviction for KV cache blocks:
+   > *"When the head block (least recently used block) of the free queue is cached, we have to evict the block... Pop the block from the head of the free queue. This is the LRU block to be evicted."*
+   >; [vLLM Prefix Caching Documentation](https://docs.vllm.ai/en/latest/design/v1/prefix_caching.html)
+
+2. **TensorRT-LLM** uses LRU eviction with optional offloading:
+   > *"When this happens, reusable blocks are evicted based on LRU. System prompts that are frequently used have a better chance of remaining reusable."*
+   >; [TensorRT-LLM KV Cache Reuse](https://nvidia.github.io/TensorRT-LLM/advanced/kv-cache-reuse.html)
+
+3. **LMCache** supports configurable eviction policies including LRU:
+   > *"Currently, LMCache supports 'LRU' (Least Recently Used), 'MRU' (Most Recently Used), 'LFU' (Least Frequently Used) and 'FIFO' (First-In-First-Out) caching policies."*
+   >; [LMCache Caching Policies](https://docs.lmcache.ai/kv_cache/caching_policies.html)
+
+4. **Redis** provides multiple LRU-based eviction policies:
+   > *"Use `allkeys-lru` when you expect that a subset of elements will be accessed far more often than the rest. This is a very common case according to the Pareto principle, so `allkeys-lru` is a good default option."*
+   >; [Redis Eviction Policies](https://redis.io/docs/latest/develop/reference/eviction/)
+
+---
+
+### 3.6 Modular Architecture
+
+The benchmark has been refactored from a monolithic `kv-cache.py` script into a modular Python package (`kv_cache/`) for maintainability, testability, and extensibility.
+
+#### Package Structure
+
+```
+kv_cache/                     # Main package directory
+├── __init__.py               # Public API exports
+├── _compat.py                # Compatibility flags (CUDA/PyTorch/YAML detection)
+├── backends.py               # Storage tier implementations (GPU/CPU/NVMe)
+├── benchmark.py              # IntegratedBenchmark orchestrator
+├── cache.py                  # KVCacheGenerator + MultiTierCache (core engine)
+├── cli.py                    # Command-line interface + XLSX export
+├── config.py                 # YAML configuration loader
+├── conversation.py           # Multi-turn conversation management
+├── models.py                 # Data models (ModelConfig, InferenceRequest, QoS)
+├── monitoring.py             # StorageMonitor, QoSMonitor, WorkloadAutoscaler
+├── prefix_cache.py           # Shared system prompt caching
+├── rag.py                    # RAG workload simulation
+├── workload.py               # UserSimulator, ShareGPT/BurstGPT loaders
+└── test_kv_cache.py          # Pytest unit tests
+```
+
+#### Module Responsibilities
+
+| File | Purpose | Key Classes/Functions |
+|------|---------|----------------------|
+| **`__init__.py`** | Package entry point. Re-exports all public symbols for backward compatibility. | Re-exports: `MultiTierCache`, `IntegratedBenchmark`, `main()`, etc. |
+| **`_compat.py`** | Detects optional dependencies (CuPy, PyTorch, YAML, Pandas) and sets feature flags. | `HAS_CUPY`, `HAS_TORCH`, `HAS_YAML`, `HAS_PANDAS`, `cp` (CuPy alias) |
+| **`backends.py`** | Implements storage tier backends with `IOTiming` breakdowns (host vs device latency). | `StorageBackend` (base), `GPUMemoryBackend`, `CPUMemoryBackend`, `NVMeBackend` |
+| **`benchmark.py`** | High-level orchestrator that coordinates cache, workload generator, monitoring, and telemetry. | `IntegratedBenchmark` |
+| **`cache.py`** | **Core engine:** KV cache generation with static noise buffers + multi-tier cache with waterfall LRU eviction. | `KVCacheGenerator`, `MultiTierCache` |
+| **`cli.py`** | Command-line argument parsing, validation, and Excel export functionality. | `main()`, `export_results_to_xlsx()` |
+| **`config.py`** | Loads and validates `config.yaml`. Provides `cfg()` accessor for nested keys. | `ConfigLoader`, `cfg()`, `get_config()`, `set_config()` |
+| **`conversation.py`** | Tracks multi-turn conversation state, manages turn history, conversation lifecycle. | `ConversationState`, `ConversationManager` |
+| **`models.py`** | **Data models:** Model architectures (layers, heads, dims), inference phases, QoS levels, user profiles, request structures. | `ModelConfig`, `InferencePhase`, `GenerationMode`, `QoSLevel`, `UserProfile`, `InferenceRequest` |
+| **`monitoring.py`** | Real-time telemetry collection, saturation detection, QoS tracking, autoscaling logic. | `StorageMetrics`, `StorageMonitor`, `QoSMonitor`, `WorkloadAutoscaler` |
+| **`prefix_cache.py`** | Detects common system prompts, manages shared prefix cache entries, tracks reuse stats. | `PrefixType`, `PrefixMatcher`, `PrefixCacheManager` |
+| **`rag.py`** | Simulates Retrieval-Augmented Generation: document ingestion, chunking, top-k retrieval. | `RAGChunk`, `RAGDocument`, `RAGDocumentManager` |
+| **`workload.py`** | Generates synthetic requests, loads ShareGPT/BurstGPT traces, validates CLI arguments. | `UserSimulator`, `ShareGPTDatasetLoader`, `RealTraceEntry`, `validate_args()` |
+| **`test_kv_cache.py`** | Pytest unit tests covering tier logic, eviction, QoS, prefix caching, RAG, autoscaling. | 90+ test functions |
+
+---
+
+#### Dependency Graph
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CLI Entry Point                         │
+│                      cli.py: main()                             │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+                         ↓
+┌─────────────────────────────────────────────────────────────────┐
+│                    Benchmark Orchestrator                       │
+│                 benchmark.py: IntegratedBenchmark               │
+└──┬──────────┬───────────┬──────────┬──────────┬──────────┬─────┘
+   │          │           │          │          │          │
+   ↓          ↓           ↓          ↓          ↓          ↓
+┌──────┐ ┌─────────┐ ┌────────┐ ┌──────────┐ ┌───────┐ ┌────────┐
+│cache │ │workload │ │monitoring│ │conversation│ │ rag  │ │prefix │
+│.py   │ │.py      │ │.py      │ │.py        │ │.py   │ │_cache │
+└──┬───┘ └────┬────┘ └────┬─────┘ └─────┬────┘ └───┬──┘ └───┬───┘
+   │          │           │              │          │        │
+   │          │           │              │          │        │
+   └──────────┴───────────┴──────────────┴──────────┴────────┘
+                         │
+                         ↓
+              ┌──────────────────────┐
+              │   Foundation Layers  │
+              │  models.py (data)    │
+              │  backends.py (I/O)   │
+              │  config.py (settings)│
+              │  _compat.py (flags)  │
+              └──────────────────────┘
+```
+
+---
+
+#### Key Design Patterns
+
+**1. Separation of Concerns**
+- **Data Models** (`models.py`) define structure
+- **Business Logic** (`cache.py`, `monitoring.py`) implement behavior
+- **I/O Abstraction** (`backends.py`) isolate storage details
+- **Orchestration** (`benchmark.py`) coordinates components
+
+**2. Dependency Injection**
+- `IntegratedBenchmark` receives `MultiTierCache`, `UserSimulator`, `StorageMonitor` as constructor arguments
+- Enables unit testing with mocks/stubs
+
+**3. Configuration-Driven**
+- All internal parameters in `config.yaml`
+- CLI arguments override config values
+- Enables batch testing without code changes
+
+**4. Thread-Safe Telemetry**
+- All stats updates protected by locks
+- Atomic counters for concurrent operations
+- Safe for multi-threaded workload generation
+
+**5. Backward Compatibility**
+- `kv-cache.py` wrapper preserves old import path
+- `__init__.py` re-exports all public symbols
+- Existing test scripts continue to work
+
+---
+
+#### Extensibility Points
+
+To add new functionality:
+
+| Feature | Files to Modify |
+|---------|----------------|
+| **New storage tier** | `backends.py`: Add new `Backend` class implementing `read()`, `write()`, `delete()` |
+| **New autoscaler mode** | `monitoring.py`: Add mode to `WorkloadAutoscaler._should_scale()` |
+| **New QoS level** | `config.yaml`: Add to `qos_profiles`, `models.py`: Update `QoSLevel` enum |
+| **New model** | `config.yaml`: Add to `model_configs` with layer/head/dim values |
+| **New workload source** | `workload.py`: Add loader class similar to `ShareGPTDatasetLoader` |
+| **New metric** | `cache.py`: Add to `self.stats` dict, `benchmark.py`: Include in output JSON |
+
+---
+
+### 3.7 NVMe Backend Implementation
+
+**File Mapping:** `{cache_dir}/{cache_key}.npy`
+
+**I/O Rigor:** Bypasses Linux page cache using `posix_fadvise(DONTNEED)` to ensure measurements reflect actual disk performance.
+
+**Write Path:**
+```python
+def write(self, key: str, data: np.ndarray) -> IOTiming:
+    start = time.perf_counter()
+    
+    # HOST LATENCY: Serialization (CPU-bound)
+    np.save(f, data, allow_pickle=False)
+    post_save = time.perf_counter()
+    
+    # DEVICE LATENCY: Blocking disk I/O
+    f.flush()
+    os.fsync(f.fileno())  # Blocks until persisted
+    post_fsync = time.perf_counter()
+    
+    return IOTiming(
+        host=post_save - start,
+        device=post_fsync - post_save,
+        total=post_fsync - start
+    )
+```
+
+**Read Path:**
+```python
+def read(self, key: str) -> Tuple[np.ndarray, IOTiming]:
+    # Drop from page cache to force real I/O
+    os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)
+    
+    pre_load = time.perf_counter()
+    # DEVICE LATENCY: Actual disk read
+    data = np.load(path, allow_pickle=False)
+    load_done = time.perf_counter()
+    
+    # HOST LATENCY: Array materialization
+    data = np.array(data)
+    copy_done = time.perf_counter()
+    
+    return data, IOTiming(
+        device=load_done - pre_load,
+        host=(pre_load - start) + (copy_done - load_done),
+        total=copy_done - start
+    )
+```
+
+---
+
+### 3.8 Generation Mode: Simulating GPU Backpressure
+
+Real LLM inference has GPU compute time between I/O operations. Without simulating this, the benchmark would unrealistically flood storage with requests.
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `none` | No sleep | Pure storage benchmark |
+| `realistic` | Sleep proportional to token generation | Production simulation |
+| `aggressive` | Minimal sleep | Stress testing |
+
+**Realistic Mode Calculation:**
+```python
+# Based on NVIDIA A100 inference speed (~50 tok/s)
+sleep_time = generate_tokens * 0.02  # 20ms per token
+time.sleep(sleep_time)
+```
+
+This models natural pacing where the GPU's compute creates gaps between storage requests, preventing artificial saturation.
+
+---
+
+### 3.9 QoS Classes: Prioritizing Users
+
+Three Quality of Service levels model real-world priority:
+
+| QoS Level | Use Case | Target P95 | Target P99 | Priority |
+|-----------|----------|------------|------------|----------|
+| **INTERACTIVE** | Real-time chatbots | 50 ms | 100 ms | 3 (Highest) |
+| **RESPONSIVE** | Near real-time | 100 ms | 200 ms | 2 |
+| **BATCH** | Offline jobs | 1,000 ms | 5,000 ms | 1 (Lowest) |
+
+**Default Distribution:** 60% Interactive, 30% Responsive, 10% Batch
+
+**Priority Queue:** Higher-priority requests processed first:
+```
+[INTERACTIVE] → [INTERACTIVE] → [RESPONSIVE] → [BATCH]
+       ↓
+   Processed First
+```
+
+**Output Example:**
+```json
+"qos_stats": {
+    "interactive": {
+        "latency_p95_ms": 42.3,
+        "sla_met": true
+    },
+    "batch": {
+        "latency_p95_ms": 2847.5,
+        "sla_met": false  // Appropriately deprioritized
+    }
+}
+```
+
+---
+
+### 3.10 Prefix Caching: System Prompt Optimization
+
+Many requests share common system prompts. Instead of redundantly storing identical prefixes, the benchmark implements shared caching:
+
+**Three Common Prompts:**
+```python
+COMMON_SYSTEM_PROMPTS = [
+    "You are a helpful, harmless, and honest AI assistant.",
+    "You are a coding assistant. Provide clear, working code examples.",
+    "You are a creative writing assistant. Be imaginative and engaging.",
+]
+```
+
+**Cache Key:** `kv_system_{md5_hash[:8]}`
+
+**Lifecycle:**
+```
+t=0  User A: "You are helpful..." + "Hello"
+     → Miss → Full prefill → Store as kv_system_a1b2c3d4
+
+t=1  User B: "You are helpful..." + "Hi"
+     → HIT → Read cached prefix → Only prefill "Hi"
+
+t=2  [LRU eviction of kv_system_a1b2c3d4]
+
+t=3  User C: "You are helpful..." + "Hey"
+     → Miss → Full prefill → Re-store
+```
+
+**Metrics:**
+- `system_prompt_reuse` – Detection attempts
+- `system_prompt_hits` – Successful cache reads
+- **Gap = Memory Pressure** – Low hit rate indicates insufficient memory
+
+---
+
+### 3.11 RAG Workflow: Retrieval-Augmented Generation
+
+RAG creates bursty, front-loaded I/O patterns:
+
+```
+Standard Conversation       RAG Workload
+-------------------         ------------
+User: "Hello"               User: "What does contract say..."
+  ↓                           ↓
+[Small Prefill]             [Vector DB Lookup]
+  ↓                           ↓
+[Incremental Decode]        [Load 10-50 Document Chunks] ← BURST
+                              ↓
+                            [Massive Context Prefill]
+                              ↓
+                            [Generate Response]
+```
+
+**Three Phases:**
+1. **Ingestion** (offline) – Split documents → Compute KV cache → Store
+2. **Retrieval** (per query) – Vector similarity search → Return top_k chunks
+3. **Inference** (per query) – Load chunk KV caches → Concatenate → Generate
+
+**Read Amplification:**
+
+| Metric | Standard Chat | RAG Query |
+|--------|---------------|-----------|
+| Context at start | ~1 KB | **500 MB - 2 GB** |
+| Reads before first token | 1 | **10-50** |
+| Storage pressure | Gradual | **Instant burst** |
+
+**Enable with:** `--enable-rag --rag-top-k 10`
+
+---
+
+### 3.12 Autoscaling Modes
+
+#### QoS Mode (Production Sizing)
+**Goal:** Find max users while maintaining latency SLAs
+
+**Logic:**
+```
+Collect KPIs (P95 latency every 5s)
+  ↓
+Calculate Saturation (0.0 - 1.0)
+  ↓
+Compare to Target (default 0.8)
+  ↓
+Adjust Load:
+  - Saturation < 0.7 → Add users (+10-20%)
+  - 0.7 ≤ Saturation ≤ 0.9 → Hold steady
+  - Saturation > 0.9 → Remove users + cooldown (30s)
+```
+
+#### Capacity Mode (Hardware Benchmarking)
+**Goal:** Find absolute peak throughput (ignores latency)
+
+**Logic:**
+```
+Ramp-up Phase: Double users while throughput increases rapidly
+  ↓
+Fine-tune Phase: 1.5× scaling when growth slows
+  ↓
+Terminate: When throughput decreases from previous stage
+```
+
+**Output:**
+```json
+"autoscaling_stats": [
+    {"users": 20, "throughput": 450, "saturation": 0.45, "action": "scale_up"},
+    {"users": 50, "throughput": 890, "saturation": 0.82, "action": "hold"},
+    {"users": 45, "throughput": 865, "saturation": 0.79, "action": "stabilized"}
+]
+```
+
+---
+
+## 4. Memory Requirements & Capacity Planning
+
+### 4.1 User Profile Context Ranges
+
+The benchmark simulates three user personas with context ranges justified by recent production workload studies:
+
+#### Research Citations
+
+**[1] OpenRouter "State of AI: An Empirical 100T Token Study" (arXiv:2601.10088)**
+- Average prompt tokens grew ~4× from ~1,500 to >6,000 (early 2024 → late 2025)
+- Programming workloads routinely exceed 20K input tokens
+- Non-programming categories remain "relatively flat and low-volume"
+- Overall input:output ratio ~15:1
+
+**[2] BurstGPT (arXiv:2401.17644); 10.31M traces from Azure OpenAI GPT**
+- Request lengths follow a Zipf distribution (many short, long tail)
+- ChatGPT response lengths are bimodal with linear request-response correlation
+- Average 621 request tokens, 126 response tokens (after filtering failures)
+
+---
+
+### User Profiles
+
+| Profile | Context Range | Generation Range | Justification |
+|---------|---------------|------------------|---------------|
+| **chatbot** | 512-4096 | 50-200 | General-purpose conversational use. Non-programming categories stay well below platform average of ~6K [1]. Zipf-shaped request distribution means most chatbot prompts are short [2]. |
+| **coding** | 4096-25000 | 100-500 | Programming is the dominant context-length driver, "routinely exceeding 20K input tokens" and averaging 3-4× general-purpose prompts [1]. Claude handles ~60% of coding workloads at >20K avg [1]. Output stays modest relative to input (~15:1 ratio) [1]. |
+| **document** | 4096-16384 | 200-800 | Long-context document analysis (summarization, Q&A). Sits between chatbot and coding; context-heavy but below coding peaks. Overall avg sequence length >5,400 tokens by late 2025 [1]. |
+
+**Think Time Ranges:**
+- **chatbot:** 0.1-0.5 sec (rapid interaction)
+- **coding:** 0.2-1.0 sec (developers pause to review)
+- **document:** 0.3-1.5 sec (users read lengthy outputs)
+
+---
+
+### 4.2 KV Cache Size Formula
+
+**MHA/GQA models:**
+```
+Bytes per Token = num_layers × 2 × kv_heads × head_dim × bytes_per_dtype
+```
+
+**MLA models (DeepSeek-V3):**
+```
+Bytes per Token = num_layers × (kv_lora_rank + qk_rope_head_dim) × bytes_per_dtype
+```
+MLA jointly compresses K and V into a single latent vector (no ×2 factor), plus a shared RoPE key dimension.
+
+**head_dim calculation:** `hidden_dim / num_heads` (for MHA/GQA); not applicable for MLA
+
+| Model | Attention | Layers | kv_heads | head_dim | Bytes/Token | MB/Token | 8K Context |
+|-------|-----------|--------|----------|----------|-------------|----------|------------|
+| `tiny-1b` | GQA | 12 | 4 | 128 | 24,576 | 0.023 | 192 MB |
+| `mistral-7b` | GQA | 32 | 8 | 128 | 131,072 | 0.125 | 1,024 MB |
+| `llama2-7b` | MHA | 32 | 32 | 128 | 524,288 | 0.500 | 4,096 MB |
+| `llama3.1-8b` | GQA | 32 | 8 | 128 | 131,072 | 0.125 | 1,024 MB |
+| `llama3.1-70b-instruct` | GQA | 80 | 8 | 128 | 327,680 | 0.313 | 2,560 MB |
+| `deepseek-v3` | **MLA** | 61 | N/A | N/A | 70,272 | 0.067 | 549 MB |
+| `qwen3-32b` | GQA | 64 | 8 | 80 | 163,840 | 0.153 | 1,248 MB |
+| `gpt-oss-120b` (MoE) | GQA | 36 | 8 | 64 | 73,728 | 0.069 | 563 MB |
+| `gpt-oss-20b` (MoE) | GQA | 24 | 8 | 64 | 49,152 | 0.046 | 376 MB |
+
+**Note:** DeepSeek-V3 uses Multi-head Latent Attention (MLA) which compresses K and V into a single latent of dimension 512 + 64 RoPE = 576, yielding ~25× smaller KV cache than the equivalent MHA configuration. MoE (Mixture of Experts) models like GPT-OSS have smaller KV cache because only a subset of experts is active per request.
+
+### 4.3 System RAM Requirements
+
+**Formula:**
+```
+Minimum RAM = cpu_mem_gb + peak_in_flight_RAM + 4 GB overhead
+Peak In-Flight RAM = max_concurrent_allocs × avg_context_tokens × bytes_per_token
+```
+
+**Peak In-Flight RAM:**
+- **Default (`--max-concurrent-allocs 0`):** `num_users × avg_context × bytes_per_token`; **DANGEROUS for large models**
+- **Bounded (`--max-concurrent-allocs N`):** `N × avg_context × bytes_per_token`; **RECOMMENDED**
+
+---
+
+### 4.4 Peak RAM by Model and Concurrency Limit
+
+The following table shows peak in-flight RAM consumption assuming **8,192 average context tokens** (midpoint of coding user profile). This excludes `cpu_mem_gb` allocation.
+
+| Model | Architecture | MB/Token | Per User | 200 users (unlimited) | 16 allocs | 8 allocs | 4 allocs |
+|-------|--------------|----------|----------|----------------------|-----------|----------|----------|
+| `tiny-1b` | GQA | 0.023 | 0.2 GB | 40 GB | 3.2 GB | 1.6 GB | 0.8 GB |
+| `mistral-7b` | GQA | 0.125 | 1.0 GB | 200 GB | 16 GB | 8 GB | 4 GB |
+| `llama2-7b` | **MHA** | **0.500** | **4.0 GB** | **800 GB** | **64 GB** | **32 GB** | **16 GB** |
+| `llama3.1-8b` | GQA | 0.125 | 1.0 GB | 200 GB | 16 GB | 8 GB | 4 GB |
+| `llama3.1-70b-instruct` | GQA | 0.313 | 2.5 GB | 500 GB | 40 GB | 20 GB | 10 GB |
+| `deepseek-v3` | **MLA** | 0.067 | 0.54 GB | 107 GB | 9 GB | 4.3 GB | 2.1 GB |
+| `qwen3-32b` | GQA | 0.153 | 1.25 GB | 250 GB | 20 GB | 10 GB | 5 GB |
+| `gpt-oss-120b` | MoE | 0.069 | 0.56 GB | 112 GB | 9 GB | 4.5 GB | 2.3 GB |
+| `gpt-oss-20b` | MoE | 0.046 | 0.38 GB | 76 GB | 6 GB | 3 GB | 1.5 GB |
+
+> **Why is `llama2-7b` so large?** It uses Multi-Head Attention (MHA) with 32 KV heads (same as attention heads), while newer models like `llama3.1-8b` use Grouped Query Attention (GQA) with only 8 KV heads. This 4× difference makes `llama2-7b` an excellent stress test model.
+
+---
+
+### 4.5 Recommended Settings by System RAM
+
+| System RAM | `--max-concurrent-allocs` | Safe Models (unlimited concurrency) |
+|------------|---------------------------|-------------------------------------|
+| 32 GB | 4 | `tiny-1b`, `gpt-oss-20b`, `deepseek-v3` |
+| 64 GB | 8 | `mistral-7b`, `llama3.1-8b`, `qwen3-32b`, `gpt-oss-120b`, `deepseek-v3` |
+| 128 GB | 16 | All GQA/MoE/MLA models |
+| 256 GB | 16–32 | All models with bounded concurrency |
+| 512 GB+ | 32–64 | All models including `llama2-7b` (MHA) |
+
+---
+
+### 4.6 Impact of `--max-concurrent-allocs` on Benchmark Results
+
+This parameter controls how many KV cache allocations can be in-flight simultaneously. It has significant effects on benchmark metrics:
+
+| Setting | Throughput Impact | Latency Impact | I/O Queue Depth | Realism |
+|---------|-------------------|----------------|-----------------|---------|
+| **0 (unlimited)** | Maximum | Lowest (no queueing) | Very high | Low; no admission control |
+| **16** | High | Low-moderate | High | Moderate; stress test |
+| **8** | Moderate | Moderate (queueing) | Moderate | High; production-like |
+| **4** | Lower | Higher (significant queueing) | Low | Highest; memory-constrained |
+
+**Why this matters for storage benchmarking:**
+
+1. **Throughput measurement:** Lower concurrency limits reduce I/O parallelism, which can understate the storage device's peak capability. A PCIe Gen5 NVMe can handle 32+ concurrent operations.
+
+2. **Latency measurement:** With unlimited concurrency, latency measurements reflect pure device latency. With bounded concurrency, latency includes queueing time; more realistic for production systems with admission control.
+
+3. **Tail latency (P99):** Lower concurrency values produce more stable P99 latencies because fewer requests compete for I/O resources simultaneously.
+
+4. **Cache hit rate:** Not directly affected; hit rates depend on working set size and cache tier capacities, not concurrency.
+
+**Recommended settings by test objective:**
+
+| Objective | `--max-concurrent-allocs` | Rationale |
+|-----------|---------------------------|-----------|
+| Peak storage throughput | 16–32 | Maximize I/O parallelism to saturate device |
+| Production simulation | 8 | Realistic admission control |
+| Latency-sensitive test | 4–8 | Minimize queueing variability |
+| Memory-constrained system | 4 | Prevent OOM while still achieving measurement |
+
+---
+
+### 4.7 Example Configurations
+
+| Config | Model | Users | `--max-concurrent-allocs` | `--cpu-mem-gb` | Minimum RAM |
+|--------|-------|-------|---------------------------|----------------|-------------|
+| Storage stress | `llama3.1-8b` | 200 | 16 | 0 | 20 GB |
+| Storage stress | `llama2-7b` | 200 | 8 | 0 | 36 GB |
+| Production sim | `llama3.1-8b` | 100 | 8 | 32 | 44 GB |
+| 70B stress | `llama3.1-70b` | 70 | 4 | 0 | 14 GB |
+| Large model | `deepseek-v3` | 50 | 4 | 0 | 6 GB |
+
+**⚠️ Critical Warning:** Running `llama2-7b` with `--max-concurrent-allocs 0` (unlimited) on systems with <1 TB RAM **will cause OOM kills**. The semaphore correctly limits concurrent allocations, but unlimited concurrency allows 200 simultaneous allocations. Note: `deepseek-v3` uses MLA which compresses KV cache ~25× vs MHA, so it requires far less RAM than its parameter count suggests.
+
+---
+
+### 4.8 Disaggregated Inference Modes
+
+Modern inference systems (vLLM, TensorRT-LLM, Mooncake) often separate **prefill** and **decode** into different node pools for efficiency. The benchmark supports testing each workload pattern independently:
+
+| Mode | CLI Flag | I/O Pattern | Simulates |
+|------|----------|-------------|-----------|
+| Standard | *(none)* | Mixed R/W | Colocated prefill+decode |
+| Prefill-only | `--prefill-only` | **Write-heavy** | Disaggregated prefill node |
+| Decode-only | `--decode-only` | **Read-heavy** | Disaggregated decode node |
+
+#### How It Works
+
+```
+Standard Mode (default):
+  Request → PREFILL (write KV) → DECODE (read KV repeatedly) → Response
+
+--prefill-only (write-heavy):
+  Request → PREFILL (write KV) → [DECODE skipped] → Response
+  Use case: SSD endurance testing, prefill node simulation
+
+--decode-only (read-heavy):
+  [Pre-populate cache] → Request → DECODE (read from pre-populated cache) → Response
+  Use case: Read IOPS/latency testing, decode node simulation
+```
+
+**Decode-only initialization:** Before the benchmark starts, the system pre-populates the cache with `num_users × 10` entries (simulating KV caches written by prefill nodes). The benchmark then measures pure read performance against this existing data.
+
+#### Example Commands
+
+```bash
+# Test prefill node (write-heavy) - measures SSD write endurance
+python3 kv-cache.py --model llama3.1-70b-instruct --prefill-only \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 300 --cache-dir /mnt/nvme \
+    --max-concurrent-allocs 8 --generation-mode none
+
+# Test decode node (read-heavy) - measures read IOPS
+python3 kv-cache.py --model llama3.1-70b-instruct --decode-only \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --num-users 100 --duration 300 --cache-dir /mnt/nvme \
+    --max-concurrent-allocs 8 --generation-mode none
+```
+
+**Note:** These flags are mutually exclusive. The benchmark will error if both are specified.
+
+#### Preconditioning vs Prefill-Only vs Decode-Only
+
+| Feature | `--precondition` | `--prefill-only` | `--decode-only` |
+|---------|------------------|------------------|-----------------|
+| **Purpose** | Reach SSD steady-state | Benchmark write performance | Benchmark read performance |
+| **When** | Before benchmark starts | During benchmark | During benchmark |
+| **I/O Pattern** | Sequential writes (fixed 2KB) | Write-heavy (+ prefix/multi-turn reads) | Reads from pre-populated cache |
+| **Data Volume** | 2× NVMe capacity | Depends on duration/users | N/A (reads only) |
+| **Stats Reset** | Yes (writes don't count) | No (writes ARE the metric) | Yes (pre-pop doesn't count) |
+
+**Note on prefill-only reads:** Even in `--prefill-only` mode, reads occur for prefix cache hits, multi-turn history, and RAG chunks. For **pure write testing**, add:
+```bash
+--disable-multi-turn --disable-prefix-caching
+```
+
+**Combined usage:** For rigorous SSD write testing:
+```bash
+python3 kv-cache.py --precondition --prefill-only \
+    --disable-multi-turn --disable-prefix-caching \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --model llama3.1-70b-instruct --num-users 100 --duration 300 --cache-dir /mnt/nvme
+```
+This fills the SSD to steady-state first, then measures sustained write throughput with zero reads.
+
+---
+
+## 5. Validation Results
+
+### Test Environment
+
+| Component | Specification |
+|-----------|---------------|
+| **Server** | Supermicro SYS-621H-TN12R |
+| **CPU** | 2× Intel Xeon Silver 4510 (48T total) |
+| **RAM** | 256 GB DDR5-4800 ECC |
+| **GPU** | NVIDIA H100 NVL (94 GB HBM3) |
+| **NVMe** | 7.0 TB enterprise SSD (~14 GB/s) |
+| **OS** | Ubuntu 22.04, Linux 6.5.0 |
+
+### 5.1 Storage Tier Differentiation
+
+**Configuration:** Mistral-7B, 500 prompts (ShareGPT), 50 concurrent users, 3 trials each
+
+| Tier | Storage Throughput | Speedup vs NVMe |
+|------|-------------------|-----------------|
+| **GPU Only** | 1,691 ± 154 tok/s | **6.4×** |
+| **GPU + CPU** | 1,546 ± 257 tok/s | **5.9×** |
+| **GPU + CPU + NVMe** | 1,175 ± 178 tok/s | **4.4×** |
+| **NVMe Only** | 263 ± 2 tok/s | 1.0× (baseline) |
+
+**Conclusion:** GPU provides 6.4× improvement over NVMe-only storage.
+
+---
+
+### 5.2 Fast vs Slow System Comparison
+
+**Systems:**
+- **Fast:** Bare metal, 7.0 TB NVMe (14 GB/s theoretical)
+- **Slow:** VMware ESXi 8.0.3, VMFS6 volume (3 GB/s theoretical)
+
+**Global Results (220 matched configurations):**
+
+| Metric | Fast | Slow | Ratio |
+|--------|------|------|-------|
+| Storage Throughput | 88.47 tok/s | 41.56 tok/s | **2.13×** |
+| Wall-Clock Throughput | 610.36 tok/s | 290.02 tok/s | **2.10×** |
+| Storage Latency P95 | 36,504 ms | 45,091 ms | **1.24×** |
+
+**Critical Finding:** At `cpu_mem=0GB`, use **Decode Bytes Read** or **Wall-Clock Throughput** for differentiation, NOT Storage Throughput (only 1.12× due to both systems being 100% I/O-bound).
+
+---
+
+### 5.3 iostat Validation
+
+**Maximum Storage Utilization by Memory Tier:**
+
+| `cpu_mem` | Avg Read MB/s | Avg Total MB/s | Util% |
+|-----------|---------------|----------------|-------|
+| **0 GB** | **6,825** | **7,680** | **211%** |
+| 4 GB | 1,714 | 2,741 | 51% |
+| 8 GB | 628 | 1,719 | 38% |
+| 16 GB | 47 | 1,188 | 38% |
+
+**Peak Performance:** `cpu_mem=0GB` with `llama3.1-8b` at 200 users achieved **10.9 GB/s** (78% of 14 GB/s theoretical limit).
+
+---
+
+## 6. MLPerf v3.0 Submission Guidelines
+
+### Recommended Configurations
+
+#### Option 1: Maximum Storage Stress (cpu_mem=0GB)
+
+**Use when:** Measuring I/O volume differentiation and hardware stress.
+
+**Primary Metrics:**
+- `decode_bytes_read_gb` (2.62× differentiation, 100% win rate)
+- `avg_throughput_tokens_per_sec` (2.43× differentiation, 100% win rate)
+- `nvme_read_device_p95_ms`, `nvme_write_device_p95_ms`
+
+⚠️ **Do NOT use** `storage_throughput` at `cpu_mem=0GB` (only 1.12× differentiation).
+
+```bash
+for trial in {1..5}; do
+    python3 kv-cache.py \
+        --config config.yaml \
+        --model llama3.1-8b \
+        --num-users 200 \
+        --duration 300 \
+        --gpu-mem-gb 0 \
+        --cpu-mem-gb 0 \
+        --max-concurrent-allocs 16 \
+        --generation-mode none \
+        --cache-dir /mnt/nvme \
+        --seed 42 \
+        --output mlperf_stress_8b_trial${trial}.json
+done
+```
+
+---
+
+#### Option 2: Storage Throughput Focus (cpu_mem=4GB)
+
+**Use when:** Storage Throughput is the primary metric.
+
+**Primary Metrics:**
+- `storage_throughput_tokens_per_sec` (2.23× differentiation, 97.2% win rate)
+- `decode_bytes_read_gb`
+- `nvme_read_device_p95_ms`, `nvme_write_device_p95_ms`
+
+```bash
+for trial in {1..5}; do
+    python3 kv-cache.py \
+        --config config.yaml \
+        --model llama3.1-8b \
+        --num-users 100 \
+        --duration 300 \
+        --gpu-mem-gb 0 \
+        --cpu-mem-gb 4 \
+        --generation-mode none \
+        --cache-dir /mnt/nvme \
+        --seed 42 \
+        --output mlperf_throughput_8b_trial${trial}.json
+done
+```
+
+---
+
+#### Option 3: Large Model (70B)
+
+**Use when:** Maximum per-request storage stress (70B has ~2.5× larger KV cache/token).
+
+```bash
+for trial in {1..3}; do
+    python3 kv-cache.py \
+        --config config.yaml \
+        --model llama3.1-70b-instruct \
+        --num-users 70 \
+        --duration 300 \
+        --gpu-mem-gb 0 \
+        --cpu-mem-gb 0 \
+        --max-concurrent-allocs 4 \
+        --generation-mode none \
+        --cache-dir /mnt/nvme \
+        --seed 42 \
+        --output mlperf_stress_70b_trial${trial}.json
+done
+```
+
+---
+
+### Critical Parameters
+
+| Parameter | Value | Rationale |
+|-----------|-------|-----------|
+| `--seed 42` | **Required** | Reproducibility |
+| `--gpu-mem-gb 0` | **Required** | Isolates storage |
+| `--generation-mode` | `none` | Pure storage benchmark |
+| `--cpu-mem-gb` | 0 or 4 | 0 for max stress; 4 for throughput metric |
+| `--max-concurrent-allocs` | 0, 4, or 16 | Controls RAM usage |
+| `--duration` | 300-600 | Steady-state requirement |
+
+---
+
+### Trial Requirements
+
+**High variance observed (CV 50-125%)** requires multiple trials:
+
+| User Count | Variance (CV) | Min Trials |
+|------------|---------------|------------|
+| 10 users | ~52% | 3 |
+| 50-100 users | ~115-125% | 3-5 |
+| 200 users | ~110-120% | 3-5 |
+
+**Report median, not mean.**
+
+---
+
+### Submission Checklist
+
+- [ ] `--seed 42` used
+- [ ] `--gpu-mem-gb 0` (storage isolation)
+- [ ] `--generation-mode none` (pure storage)
+- [ ] `--duration ≥ 300` seconds
+- [ ] 3-5 trials per configuration
+- [ ] Median values reported
+- [ ] Correct metrics for `cpu_mem` setting:
+  - `cpu_mem=0GB` → `decode_bytes_read_gb`, `avg_throughput_tokens_per_sec`, device P95
+  - `cpu_mem=4GB` → `storage_throughput_tokens_per_sec`, device P95
+- [ ] Both 8B and 70B results included
+- [ ] System info documented (CPU, RAM, NVMe model)
+
+---
+
+### Example Submission
+
+```
+MLPerf Storage v3.0 Submission
+==============================
+System: Supermicro SYS-621H-TN12R
+Storage: Kingston DC600M 7.0TB NVMe (PCIe Gen5)
+Model: llama3.1-8b
+Config: cpu_mem=0GB, users=200, duration=300s, trials=5
+
+Results (median of 5 trials):
+  Decode Bytes Read:        1,195 GB
+  Wall-Clock Throughput:    557 tok/s
+  Storage Read Device P95:  892 ms
+  Storage Write Device P95: 156 ms
+  Peak I/O Bandwidth:       10.9 GB/s (78% theoretical)
+```
+
+---
+
+## 7. Interpreting Results
+
+### Metric Selection by Use Case
+
+| Use Case | Primary Metric | Configuration |
+|----------|----------------|---------------|
+| **Compare NVMe drives** | `decode_bytes_read_gb`, `nvme_device_p95_ms` | `cpu_mem=0GB`, `gen_mode=none` |
+| **Production planning** | `wall_clock_throughput`, `end_to_end_latency_p95` | `cpu_mem=4GB`, `gen_mode=realistic` |
+| **Storage efficiency** | `storage_throughput` | `cpu_mem=4GB` |
+| **Capacity discovery** | `autoscaling_stats[last].users` | `--enable-autoscaling --autoscaler-mode qos` |
+
+---
+
+### Understanding Throughput Metrics
+
+| Metric | Formula | What It Measures |
+|--------|---------|------------------|
+| **Wall-Clock Throughput** | `tokens / elapsed_time` | System capacity (user-facing) |
+| **Storage Throughput** | `tokens / total_storage_io_time` | Storage efficiency (hardware) |
+
+**Why Storage Throughput fails at `cpu_mem=0GB`:**
+
+Both fast and slow systems are 100% I/O-bound. Fast system reads **more data** but spends **more time doing I/O** → effects cancel out.
+
+| System | Decode Bytes | I/O Time | Storage Throughput |
+|--------|--------------|----------|-------------------|
+| Fast | 1,195 GB | ~8,000 s | 9.53 tok/s |
+| Slow | 447 GB | ~7,100 s | 8.50 tok/s |
+| **Ratio** | **2.62×** | **1.13×** | **1.12×** ❌ |
+
+**Use `decode_bytes_read_gb` or `wall_clock_throughput` instead.**
+
+---
+
+### Latency Interpretation Guide
+
+| Latency Type | What to Check | Diagnosis |
+|--------------|---------------|-----------|
+| **End-to-End High** | Queue Wait component | Overloaded → reduce users or add capacity |
+| **Storage I/O High** | Host vs Device ratio | If Host >> Device → CPU bottleneck, not storage |
+| **Device P95 High** | Compare to drive spec | Storage hardware limitation |
+| **Queue Wait High** | System saturation | Receiving requests faster than processing |
+
+**Example Diagnosis:**
+```
+Storage Read Total P95: 260.90 ms
+  ├─ Device P95: 15.23 ms  (6%)
+  └─ Host P95: 245.67 ms   (94%)
+
+Diagnosis: CPU serialization (np.save/load) is bottleneck, not storage.
+```
+
+---
+
+## 8. Advanced Features
+
+### 8.1 Multi-Turn Conversations
+
+Simulates chat history by linking requests:
 
 ```python
-# Inside _ensure_space_in_tier
-with self.memory_lock:
-    current_usage = self._get_tier_usage(tier)
-    # Check if we have space
-    if current_usage + required_bytes <= target_usage:
-        # ATOMIC RESERVATION: Claim the space immediately inside the lock.
-        # This prevents other threads from seeing this space as free.
-        self._update_tier_usage(tier, required_bytes)
-        return True
+conversation_id = f"conv_{user_id}"
+for turn in range(num_turns):
+    cache_key = f"{conversation_id}_turn_{turn}"
+    # Each turn can access previous turn KV caches
 ```
 
-## 4. Enhanced Metrics: NVMe Token Throughput
+**Benefit:** Models realistic conversational AI workload with growing context.
 
-To align with MLPerf requirements, we added a specific counter for `nvme_tokens_processed`.
-*   **Why:** Previously, we tracked raw bytes. However, MLPerf metrics are often in "Tokens per Second."
-*   **How:** The system now tracks the exact number of tokens associated with every read, write, and demotion operation that touches the NVMe drive. This allows us to report a precise "Storage Throughput (tok/s)" metric that accounts for the massive read amplification inherent in LLM inference.
+---
+
+### 8.2 ShareGPT Dataset Replay
+
+**Source:** The [ShareGPT](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset contains 90K+ real human-ChatGPT conversations extracted from the ShareGPT browser extension.
+
+**Why ShareGPT?**
+- **Real conversation patterns:** Multi-turn dialogues with natural context accumulation
+- **Diverse use cases:** Coding, writing, Q&A, brainstorming
+- **Realistic token distributions:** Mean ~133 input tokens, ~150 output tokens (shorter than synthetic)
+
+**Dataset Structure:**
+```json
+{
+  "id": "conversation_123",
+  "conversations": [
+    {"from": "human", "value": "Explain quantum computing"},
+    {"from": "gpt", "value": "Quantum computing uses..."},
+    {"from": "human", "value": "How does superposition work?"},
+    {"from": "gpt", "value": "Superposition is..."}
+  ]
+}
+```
+
+**How Replay Works:**
+
+1. **Load Phase:** `ShareGPTDatasetLoader` parses the JSON and extracts conversation turns
+2. **Tokenization:** Each turn is tokenized (tiktoken if available, else char estimate)
+3. **Request Generation:** Each conversation turn becomes an `InferenceRequest`:
+   - Context tokens = cumulative conversation history
+   - Generation tokens = assistant response length
+4. **Timing:** Requests are issued with configurable inter-arrival delays
+5. **Cycling:** When dataset exhausts, replay restarts (controlled by `--replay-cycles`)
+
+**Usage:**
+```bash
+kv-cache \
+    --dataset-path /path/to/ShareGPT_V3_filtered.json \
+    --max-conversations 1000 \
+    --replay-cycles 3 \
+    --model llama3.1-8b \
+    --num-users 50 \
+    --duration 300 \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --cache-dir /mnt/nvme
+```
+
+**Config Parameters (`config.yaml`):**
+```yaml
+sharegpt:
+  max_context_tokens: 8192    # Truncate long contexts
+  max_generation_tokens: 2048 # Truncate long responses  
+  chars_per_token_estimate: 4 # Fallback if no tokenizer
+```
+
+**CLI Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--dataset-path` | None | Path to ShareGPT JSON file |
+| `--max-conversations` | 500 | Limit conversations loaded |
+| `--replay-cycles` | 0 | Times to replay dataset (0 = infinite until duration) |
+
+---
+
+### 8.3 BurstGPT Trace Replay
+
+**Source:** Wang et al., "BurstGPT: A Real-world Workload Dataset to Optimize LLM Serving Systems" (arXiv:2401.17644, KDD '25)
+
+The BurstGPT trace provides **10.31M production API calls** from Azure OpenAI over 121 days, capturing:
+
+- **Zipf-distributed request lengths:** Many short requests with long tail (realistic API usage)
+- **Bimodal response patterns:** ChatGPT responses cluster around two modes
+- **Realistic token distributions:** Avg 621 request tokens, 126 response tokens
+- **Temporal patterns:** Real request arrival times with burstiness
+
+**Trace File Format (CSV):**
+```csv
+Timestamp,Model,Request tokens,Response tokens,Total tokens,Log Type
+5,ChatGPT,472,18,490,Conversation log
+45,ChatGPT,1087,230,1317,Conversation log
+118,GPT-4,417,276,693,Conversation log
+```
+
+| Column | Description |
+|--------|-------------|
+| `Timestamp` | Relative time in seconds from trace start |
+| `Model` | Original model (ChatGPT or GPT-4); ignored by benchmark |
+| `Request tokens` | Input/context token count |
+| `Response tokens` | Output/generation token count |
+| `Total tokens` | Sum of request + response |
+| `Log Type` | Always "Conversation log" |
+
+**How Replay Works:**
+
+1. **Load Phase:** CSV files are loaded from the trace directory
+2. **Timestamp Extraction:** Original request timestamps are parsed
+3. **Replay with Timing:**
+   - `--trace-speedup 1.0`: Real-time replay (honors original inter-arrival times)
+   - `--trace-speedup 10.0`: 10× faster (compress 10 minutes into 1 minute)
+   - `--trace-speedup 0`: No delay (saturate storage as fast as possible)
+4. **Request Mapping:** Each trace row becomes an `InferenceRequest`:
+   - Context tokens from `ContextTokens` column
+   - Generation tokens from `GeneratedTokens` column
+5. **Cycling:** When trace exhausts, replay restarts (controlled by `--replay-cycles`)
+
+**Setup:**
+```bash
+git clone https://github.com/HPMLL/BurstGPT.git
+# Trace files are in BurstGPT/data/BurstGPT_*.csv
+```
+
+**Usage:**
+```bash
+kv-cache \
+    --config config.yaml \
+    --model llama3.1-8b \
+    --use-burst-trace \
+    --burst-trace-path BurstGPT/data/ \
+    --trace-speedup 0 \
+    --replay-cycles 5 \
+    --num-users 50 \
+    --duration 300 \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --cache-dir /mnt/nvme \
+    --output results_burst.json
+```
+
+**CLI Parameters:**
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--use-burst-trace` | False | Enable BurstGPT trace replay |
+| `--burst-trace-path` | `BurstGPT/data/BurstGPT_1.csv` | Path to trace file or directory |
+| `--trace-speedup` | 1.0 | Replay speed multiplier (0 = no delay) |
+| `--replay-cycles` | 0 | Times to replay trace (0 = infinite until duration) |
+
+**Speedup Examples:**
+| `--trace-speedup` | Behavior | Use Case |
+|-------------------|----------|----------|
+| `1.0` | Real-time (original timestamps) | Validate temporal patterns |
+| `10.0` | 10× faster | Quick stress test |
+| `0` | No delay (saturate) | **Maximum storage stress** |
+
+**Comparison of Workload Sources:**
+
+| Metric | Synthetic | ShareGPT | BurstGPT |
+|--------|-----------|----------|----------|
+| Source | Random from user templates | Real conversations | Production API traces |
+| Mean Context | ~2,676 tokens | ~133 tokens | ~622 tokens |
+| Mean Response | ~275 tokens | ~150 tokens | ~126 tokens |
+| Distribution | Uniform within ranges | Natural conversation | Zipf (many short, long tail) |
+| Reproducibility | High (fixed seed) | High (fixed dataset) | High (fixed trace) |
+| Realism | Configurable | Conversational | Production workload |
+| Multi-turn | Simulated | Natural | Single-shot API calls |
+| Timing | Configurable | Sequential | Real timestamps |
+
+**Recommendation for MLPerf Submissions:**
+- **Storage stress testing:** Use `--use-burst-trace --trace-speedup 0` (maximum I/O)
+- **Realistic validation:** Use `--use-burst-trace --trace-speedup 1.0` (real timing)
+- **Conversational patterns:** Use `--dataset-path` with ShareGPT
+
+**Benefit:** BurstGPT provides the most realistic workload patterns from actual production systems, making it ideal for validating hardware against real-world API traffic.
+
+---
+
+### 8.4 Static Noise Buffers (Performance Optimization)
+
+**Problem:** `np.random.uniform()` consumed massive CPU time, masking storage performance.
+
+**Solution:** Pre-allocate 256 MB random buffer at startup, use zero-copy slicing:
+
+```python
+# Startup
+buffer = rng.uniform(-1.0, 1.0, size=128*1024*1024).astype(dtype)
+
+# Per-request (zero-cost)
+data = buffer[start:start+size].reshape(kv_shape)
+```
+
+**Impact:** Data generation now effectively instant, ensuring 100% of measured latency reflects storage.
+
+---
+
+## 9. Common Issues & Troubleshooting
+
+### Issue: High Host Latency
+
+**Symptom:** `host_latency_p95 >> device_latency_p95`
+
+**Diagnosis:** CPU serialization (Python/NumPy overhead) is bottleneck, not storage.
+
+**Solution:** This is expected behavior. Real inference engines (C++/GPUDirect Storage) minimize this overhead.
+
+---
+
+### Issue: OOM Kills
+
+**Symptom:** Process terminates with "Out of Memory"
+
+**Diagnosis:** Insufficient RAM for `--max-concurrent-allocs 0` (unlimited).
+
+**Solution:** Set explicit limit: `--max-concurrent-allocs 16` (8B model) or `--max-concurrent-allocs 4` (70B model).
+
+---
+
+### Issue: Low Differentiation Between Drives
+
+**Symptom:** Fast/slow drives show similar throughput
+
+**Diagnosis:** Using wrong metric for `cpu_mem` setting.
+
+**Solution:**
+- At `cpu_mem=0GB` → Use `decode_bytes_read_gb` or `wall_clock_throughput`
+- At `cpu_mem=4GB` → Use `storage_throughput`
+
+---
+
+### Issue: High Variance Across Trials
+
+**Symptom:** CV > 50%
+
+**Diagnosis:** Normal for high concurrency workloads.
+
+**Solution:** Run 3-5 trials, report **median** not mean.
+
+---
+
+## 10. Appendix: Architecture Changes (Dec 2025)
+
+### From Spillover to Waterfall
+
+**Old (Spillover):** New data forced to CPU when GPU full → penalizes hot data.
+
+**New (Waterfall):** New data always targets GPU → LRU cascades down tiers → hot data stays fast.
+
+### Static Noise Buffers
+
+**Old:** `np.random.uniform()` on every request → CPU bottleneck.
+
+**New:** Pre-allocated 256 MB buffer → zero-copy slicing → instant data generation.
+
+### Concurrency Hardening
+
+- Atomic space reservations inside memory locks
+- Loop protection with hard caps on eviction attempts
+- Race condition elimination for concurrent allocations
+
+### Enhanced Metrics
+
+- `nvme_tokens_processed` – Tracks exact token count through NVMe
+- Per-tier device vs host latency breakdowns
+- Autoscaling termination reasons
+
+---
+
+## 11. Future Enhancements: Storage Backend Roadmap
+
+The current `StorageBackend` abstraction in `backends.py` provides a clean interface for adding new storage tiers. This section outlines planned enhancements with feasibility analysis based on the existing codebase.
+
+### 11.1 Current Architecture (Extensibility Assessment)
+
+The existing backend interface is minimal and easy to extend:
+
+```python
+class StorageBackend:
+    def write(self, key: str, data: np.ndarray) -> IOTiming: ...
+    def read(self, key: str) -> Tuple[np.ndarray, IOTiming]: ...
+    def delete(self, key: str): ...
+    def clear(self): ...
+```
+
+**Extensibility:** ✅ **HIGH** – Any storage system that can serialize/deserialize NumPy arrays can implement this interface.
+
+---
+
+### 11.2 NVIDIA GPUDirect Storage (GDS)
+
+**What it is:** Direct DMA path between GPU VRAM and NVMe storage, bypassing CPU bounce buffers entirely.
+
+**Why it matters for KV cache:** In production inference engines (vLLM, TensorRT-LLM, Mooncake), KV cache tensors are computed on the GPU during the attention forward pass; they originate in GPU VRAM, not CPU memory. When GPU VRAM fills up, these tensors must be offloaded to NVMe. Without GDS, this requires a costly CPU round-trip:
+
+```
+Without GDS:  GPU VRAM → cudaMemcpy → CPU RAM → Page Cache → NVMe
+With GDS:     GPU VRAM → cuFile DMA → NVMe (direct)
+```
+
+GDS eliminates three overhead sources on the GPU↔NVMe path:
+- `cudaMemcpyDeviceToHost` / `cudaMemcpyHostToDevice` (GPU↔CPU transfer)
+- Host-side tensor format conversion (e.g., `.numpy()`)
+- Kernel page cache staging (data touches CPU DRAM twice without GDS)
+
+**GPU↔NVMe paths in the benchmark:**
+
+The benchmark's tier eviction logic (`_demote_entry`, `cache.py:256-273`) moves data between tiers using the backend `read`/`write` interface:
+
+| Phase | Current Path | Code Reference |
+|-------|-------------|----------------|
+| **GPU → NVMe eviction** | GPU tensor → `.to('cpu').numpy()` → `np.save()` → `fsync()` → NVMe | `backends.py:165-169` (GPU read), `backends.py:268-285` (NVMe write) |
+| **NVMe read** | `posix_fadvise(DONTNEED)` → `np.load()` → NumPy array in CPU RAM | `backends.py:287-315` |
+
+Note: The benchmark does not promote NVMe data back to GPU on read. Once evicted, data is served directly from NVMe on subsequent accesses.
+
+**Configuration to exercise GPU→NVMe eviction:**
+
+```bash
+kv-cache \
+    --gpu-mem-gb 16 \
+    --cpu-mem-gb 0 \
+    --cache-dir /mnt/nvme \
+    --model llama3.1-8b \
+    --num-users 100 \
+    --duration 300
+```
+
+With `--cpu-mem-gb 0`, the GPU tier overflows directly to NVMe, maximising GPU→NVMe eviction traffic; exactly the path GDS accelerates.
+
+**Current benchmark limitation:** The benchmark generates KV cache tensors as NumPy arrays in CPU RAM (`cache.py:427`), then copies them to the GPU tier via `torch.from_numpy().pin_memory().to(cuda)` (`backends.py:144-150`). This CPU-origin flow means the initial write is a CPU→GPU transfer. GDS only accelerates the subsequent GPU→NVMe eviction path, not this initial allocation. A future `--gpu-native` mode that generates tensors directly on GPU (e.g., `torch.randn(..., device='cuda')`) would make the full write path GPU-origin, enabling GDS for both initial NVMe writes and eviction writes.
+
+**Implementation approach:**
+
+```python
+class GDSBackend(StorageBackend):
+    """GPUDirect Storage backend using cuFile API."""
+
+    def __init__(self, base_path: str, gpu_device: int = 0):
+        import kvikio  # NVIDIA's Python bindings for cuFile
+        self.base_path = Path(base_path)
+        self.gpu_device = gpu_device
+        kvikio.defaults.compat_mode(False)  # Enable GDS mode
+
+    def write(self, key: str, data) -> IOTiming:
+        import cupy as cp
+        # Accept both GPU tensors (direct DMA) and NumPy arrays (copy to GPU first)
+        gpu_data = data if isinstance(data, cp.ndarray) else cp.asarray(data)
+        path = self.base_path / f"{key}.bin"
+
+        start = time.perf_counter()
+        with kvikio.CuFile(path, "w") as f:
+            f.write(gpu_data)
+        total = time.perf_counter() - start
+
+        return IOTiming(total=total, device=total, host=0)
+
+    def read(self, key: str) -> Tuple:
+        import cupy as cp
+        path = self.base_path / f"{key}.bin"
+        nbytes = path.stat().st_size
+        gpu_buf = cp.empty(nbytes // 2, dtype='float16')  # Assumes float16
+
+        start = time.perf_counter()
+        with kvikio.CuFile(path, "r") as f:
+            f.read(gpu_buf)
+        total = time.perf_counter() - start
+
+        # Return NumPy to match StorageBackend interface
+        return cp.asnumpy(gpu_buf), IOTiming(total=total, device=total, host=0)
+```
+
+**Feasibility:** ✅ **HIGH**
+- Requires: NVIDIA driver 515+, CUDA 11.4+, supported NVMe (most data center drives)
+- Python bindings available via `kvikio` package (`pip install kvikio-cu12`)
+- Can coexist with existing `NVMeBackend` (fallback when GDS unavailable)
+
+**References:**
+- [GPUDirect Storage Overview](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html)
+- [KvikIO Python API](https://docs.rapids.ai/api/kvikio/stable/)
+
+---
+
+### 11.3 Amazon S3 / Object Storage Backend
+
+**What it is:** Cloud object storage (S3, Azure Blob, GCS, MinIO) as a cold tier below NVMe.
+
+**Why it matters for KV cache:**
+- Enables virtually unlimited capacity for long-context caching
+- Supports disaggregated architectures where prefill and decode run on different nodes
+- Cost-effective for infrequently accessed conversation history
+
+**Implementation approach:**
+
+```python
+class S3Backend(StorageBackend):
+    """Amazon S3 / S3-compatible object storage backend."""
+    
+    def __init__(self, bucket: str, prefix: str = "kv_cache/", 
+                 endpoint_url: str = None):
+        import boto3
+        self.s3 = boto3.client('s3', endpoint_url=endpoint_url)
+        self.bucket = bucket
+        self.prefix = prefix
+    
+    def write(self, key: str, data: np.ndarray) -> IOTiming:
+        import io
+        start = time.perf_counter()
+        
+        buffer = io.BytesIO()
+        np.save(buffer, data, allow_pickle=False)
+        buffer.seek(0)
+        
+        host_time = time.perf_counter() - start
+        
+        self.s3.upload_fileobj(buffer, self.bucket, f"{self.prefix}{key}.npy")
+        total = time.perf_counter() - start
+        
+        return IOTiming(total=total, device=total - host_time, host=host_time)
+    
+    def read(self, key: str) -> Tuple[np.ndarray, IOTiming]:
+        import io
+        start = time.perf_counter()
+        
+        buffer = io.BytesIO()
+        self.s3.download_fileobj(self.bucket, f"{self.prefix}{key}.npy", buffer)
+        device_time = time.perf_counter() - start
+        
+        buffer.seek(0)
+        data = np.load(buffer, allow_pickle=False)
+        total = time.perf_counter() - start
+        
+        return data, IOTiming(total=total, device=device_time, host=total - device_time)
+```
+
+**Feasibility:** ✅ **HIGH**
+- Requires: `boto3` package, AWS credentials or S3-compatible endpoint
+- Latency: 50-200ms (not suitable for hot tier, ideal for archival)
+- Throughput: 100-500 MB/s per connection (can parallelize with `TransferConfig`)
+
+**Use cases:**
+- `--s3-bucket my-kv-cache --s3-cold-threshold 3600` (move to S3 after 1 hour idle)
+- Cross-region KV cache sharing for global deployments
+- Cost optimization: NVMe for recent conversations, S3 for history
+
+**References:**
+- [Boto3 S3 Transfer](https://boto3.amazonaws.com/v1/documentation/api/latest/guide/s3.html)
+- [S3 Express One Zone](https://aws.amazon.com/s3/storage-classes/express-one-zone/) (single-digit ms latency)
+
+---
+
+### 11.4 NVIDIA NIXL (Distributed KV Transfer)
+
+**What it is:** NVIDIA Inference Xfer Library – high-performance point-to-point transfers between nodes for distributed inference.
+
+**Why it matters for KV cache:**
+- Enables disaggregated prefill/decode across multiple GPUs/nodes
+- Supports RDMA (InfiniBand, RoCE) for sub-millisecond inter-node transfers
+- Native integration with GDS for storage-to-GPU-to-network pipelines
+
+**Implementation approach:**
+
+```python
+class NIXLBackend(StorageBackend):
+    """Distributed KV cache transfer using NVIDIA NIXL."""
+    
+    def __init__(self, local_rank: int, world_size: int, 
+                 backend: str = "ucx"):
+        import nixl
+        self.agent = nixl.Agent(nixl.NIXL_INIT_AGENT)
+        self.local_rank = local_rank
+        self.world_size = world_size
+        self.remote_descriptors = {}  # Cached remote memory descriptors
+    
+    def write_to_remote(self, key: str, data: np.ndarray, 
+                        target_rank: int) -> IOTiming:
+        """Transfer KV cache to a remote node (e.g., prefill → decode)."""
+        import cupy as cp
+        
+        start = time.perf_counter()
+        gpu_data = cp.asarray(data)
+        
+        # Get remote memory descriptor (cached for performance)
+        remote_desc = self._get_remote_descriptor(target_rank, key)
+        
+        # Initiate RDMA transfer
+        handle = self.agent.transfer(
+            gpu_data.data.ptr, remote_desc, 
+            data.nbytes, nixl.NIXL_WRITE
+        )
+        handle.wait()
+        
+        total = time.perf_counter() - start
+        return IOTiming(total=total, device=total, host=0)
+```
+
+**Feasibility:** ⚠️ **MEDIUM**
+- Requires: UCX library, InfiniBand/RoCE network, NVIDIA GPU
+- Complexity: Requires coordination layer (etcd) for metadata exchange
+- Integration: Best combined with existing multi-node frameworks (vLLM, TensorRT-LLM)
+
+**Use cases:**
+- Disaggregated inference: Prefill node writes KV cache → Decode node reads via RDMA
+- Multi-GPU KV cache sharing within a single server
+- Federated KV cache across data center regions
+
+**References:**
+- [NIXL GitHub](https://github.com/ai-dynamo/nixl)
+- [LMCache P2P Sharing](https://docs.lmcache.ai/kv_cache/p2p_sharing.html)
+
+---
+
+### 11.5 Distributed KV Cache with Redis / Valkey
+
+**What it is:** In-memory distributed cache shared across multiple inference servers.
+
+**Why it matters for KV cache:**
+- Enables KV cache sharing across multiple vLLM/TensorRT-LLM instances
+- Supports atomic operations for concurrent access
+- Built-in LRU eviction and TTL-based expiration
+
+**Architecture:**
+
+```
+                    +---------------------------------------+
+                    |           Redis Cluster               |
+                    |  +--------+  +--------+  +--------+   |
+                    |  |Shard 0 |  |Shard 1 |  |Shard 2 |   |
+                    |  |(A-F)   |  |(G-N)   |  |(O-Z)   |   |
+                    |  +---+----+  +---+----+  +---+----+   |
+                    +------+----------+----------+---------+
+                           |          |          |
+         +-----------------+----------+----------+-----------------+
+         |                 |          |          |                 |
+         v                 v          v          v                 v
++------------------+  +------------------+  +------------------+
+|  Server 1        |  |  Server 2        |  |  Server 3        |
+|  +------------+  |  |  +------------+  |  |  +------------+  |
+|  | vLLM       |  |  |  | vLLM       |  |  |  | TensorRT   |  |
+|  | +--------+ |  |  |  | +--------+ |  |  |  | +--------+ |  |
+|  | |GPU A100| |  |  |  | |GPU A100| |  |  |  | |GPU H100| |  |
+|  | |Local KV| |  |  |  | |Local KV| |  |  |  | |Local KV| |  |
+|  | +--------+ |  |  |  | +--------+ |  |  |  | +--------+ |  |
+|  +------+-----+  |  |  +------+-----+  |  |  +------+-----+  |
+|         |        |  |         |        |  |         |        |
+|   RedisBackend   |  |   RedisBackend   |  |   RedisBackend   |
++------------------+  +------------------+  +------------------+
+```
+
+**Data Flow Example:**
+
+```
+1. User "alice" -> Server 1
+   Server 1: Compute KV, SET kv:alice_ctx <tensor>
+
+2. User "alice" returns -> Server 2 (different server!)
+   Server 2: GET kv:alice_ctx -> HIT
+   Result: Skip prefill, 10x faster TTFT
+
+3. System prompt sharing:
+   Server 1: SET kv:system_prompt_hash <tensor>  (compute once)
+   Server 2: GET kv:system_prompt_hash -> HIT    (reuse)
+   Server 3: GET kv:system_prompt_hash -> HIT    (reuse)
+```
+
+**Write-through vs Write-back:**
+
+```
+Write-Through (sync):          Write-Back (async):
+                              
+  Request                        Request
+     |                              |
+     v                              v
+  Compute KV                     Compute KV
+     |                              |
+     +-> GPU (local)                +-> GPU (local)
+     |                              |
+     +-> Redis (blocks)             +-> Queue -> Redis
+           |                              (non-blocking)
+     Wait for ACK                  
+                              
+  +1-10ms latency               ~0ms overhead
+  Strong durability             May lose recent writes
+```
+
+**Implementation approach:**
+
+```python
+class RedisBackend(StorageBackend):
+    """Distributed KV cache using Redis/Valkey."""
+    
+    def __init__(self, host: str = "localhost", port: int = 6379,
+                 prefix: str = "kv:", ttl_seconds: int = 3600):
+        import redis
+        self.client = redis.Redis(host=host, port=port, decode_responses=False)
+        self.prefix = prefix
+        self.ttl = ttl_seconds
+    
+    def write(self, key: str, data: np.ndarray) -> IOTiming:
+        start = time.perf_counter()
+        
+        # Serialize with numpy's efficient binary format
+        buffer = io.BytesIO()
+        np.save(buffer, data, allow_pickle=False)
+        serialized = buffer.getvalue()
+        host_time = time.perf_counter() - start
+        
+        # Write to Redis with TTL
+        self.client.setex(f"{self.prefix}{key}", self.ttl, serialized)
+        total = time.perf_counter() - start
+        
+        return IOTiming(total=total, device=total - host_time, host=host_time)
+    
+    def read(self, key: str) -> Tuple[np.ndarray, IOTiming]:
+        start = time.perf_counter()
+        
+        serialized = self.client.get(f"{self.prefix}{key}")
+        if serialized is None:
+            raise KeyError(f"Key {key} not found in Redis")
+        
+        device_time = time.perf_counter() - start
+        
+        buffer = io.BytesIO(serialized)
+        data = np.load(buffer, allow_pickle=False)
+        total = time.perf_counter() - start
+        
+        return data, IOTiming(total=total, device=device_time, host=total - device_time)
+```
+
+**Feasibility:** ✅ **HIGH**
+- Requires: Redis 6+ or Valkey, `redis-py` package
+- Latency: 0.1-1ms local, 1-10ms cross-rack
+- Memory: Limited by Redis cluster size (can scale horizontally)
+
+**Use cases:**
+- Shared prefix cache across multiple inference servers
+- Session affinity: Route returning users to servers with cached context
+- A/B testing: Share baseline KV cache across experiment groups
+
+**References:**
+- [Redis LRU Eviction](https://redis.io/docs/latest/develop/reference/eviction/)
+- [Valkey (Redis fork)](https://valkey.io/)
+
+---
+
+### 11.6 Native Multi-Client Mode (`--num-clients`)
+
+> **✅ Already Achievable Today:** Multi-client benchmarking works now using separate directories and the bash script in Section 2.1. The native `--num-clients` flag proposed here is a **convenience enhancement** for easier invocation and automatic result aggregation.
+
+**Current Workaround (Available Now):**
+```bash
+# Works today - see Section 2.1 "Multi-Client Scaling"
+for i in 0 1 2 3; do
+    python -m kv_cache.cli --cache-dir /mnt/nvme/client_$i ... &
+done
+wait
+# Manually aggregate results_client_*.json
+```
+
+**Proposed Enhancement:**
+```bash
+# Future: Single command with automatic aggregation
+python -m kv_cache.cli --num-clients 4 --cache-dir /mnt/nvme/kv_benchmark ...
+```
+
+**What Real-World Scenario This Simulates:**
+
+```
+Production Deployment: 8-GPU Server Running Multiple vLLM Instances
++------------------------------------------------------------------+
+|                    Single Physical Server                         |
+|  +------------+  +------------+  +------------+  +------------+   |
+|  | vLLM #0    |  | vLLM #1    |  | vLLM #2    |  | vLLM #3    |   |
+|  | GPU 0-1    |  | GPU 2-3    |  | GPU 4-5    |  | GPU 6-7    |   |
+|  +-----+------+  +-----+------+  +-----+------+  +-----+------+   |
+|        |               |               |               |          |
+|        +-------+-------+-------+-------+-------+-------+          |
+|                |                                                  |
+|                v                                                  |
+|        +----------------+                                         |
+|        |   Shared NVMe  |  <-- All 4 instances write/read here    |
+|        |   (PCIe Gen5)  |                                         |
+|        +----------------+                                         |
++------------------------------------------------------------------+
+
+Each vLLM instance = 1 benchmark client
+4 clients competing for same NVMe = realistic storage contention
+```
+
+| Production Scenario | Today (bash script) | Future (`--num-clients`) |
+|---------------------|---------------------|--------------------------|
+| 4× vLLM on 8-GPU server | 4 terminals or `&` background | `--num-clients 4` |
+| 8× TensorRT-LLM on DGX | 8 terminals or `&` background | `--num-clients 8` |
+| Kubernetes: 4 pods, shared PV | 4 terminals or `&` background | `--num-clients 4` |
+
+**Why This Matters:**
+- Single-process benchmark underestimates contention
+- Real deployments run **multiple inference engines per node**
+- Storage must handle concurrent writes from all instances
+- Tests filesystem locking, queue depth saturation, and I/O scheduler behavior
+
+**Why Native `--num-clients` Would Be Better Than Bash Script:**
+
+| Aspect | Bash Script (Today) | Native `--num-clients` (Future) |
+|--------|---------------------|--------------------------------|
+| Invocation | Multi-line script | Single command |
+| Result aggregation | Manual Python script | Automatic |
+| Latency percentiles | Cannot merge correctly | DDSketch-based merge |
+| Progress display | 4 separate outputs | Unified aggregate view |
+| Error handling | One crash, others continue | Coordinated shutdown |
+
+**Implementation Complexity: HIGH (4-6 weeks)**
+
+This feature requires changes across multiple modules:
+
+#### Required Code Changes
+
+| Module | Change | Complexity |
+|--------|--------|------------|
+| `cli.py` | Add `--num-clients` argument, spawn child processes | LOW |
+| `cli.py` | Signal handling (Ctrl+C propagates to children) | MEDIUM |
+| `benchmark.py` | IPC for real-time progress reporting | HIGH |
+| `monitoring.py` | Cross-process metric aggregation | HIGH |
+| `cache.py` | Shared statistics counters (multiprocessing.Value) | MEDIUM |
+| New: `aggregator.py` | Merge latency histograms, compute aggregate percentiles | HIGH |
+
+#### Challenge 1: Latency Percentile Aggregation
+
+Each client tracks its own latency distribution. Merging P50/P95/P99 across processes is **not trivial**:
+
+```python
+# WRONG: Can't average percentiles
+aggregate_p99 = sum(client_p99) / num_clients  # ❌ Mathematically incorrect
+
+# CORRECT: Must merge raw samples or use t-digest/DDSketch
+from ddsketch import DDSketch
+
+# Each client maintains a sketch
+client_sketches = [DDSketch() for _ in range(num_clients)]
+
+# Parent merges sketches
+merged = DDSketch()
+for sketch in client_sketches:
+    merged.merge(sketch)
+    
+aggregate_p99 = merged.get_quantile_value(0.99)  # ✓ Correct
+```
+
+**Options:**
+1. **Shared file:** Each client appends latencies to `latencies_client_N.bin`, parent reads all after completion
+2. **Streaming IPC:** Clients send samples via `multiprocessing.Queue` (memory overhead)
+3. **Sketch algorithms:** DDSketch or T-Digest for approximate percentiles (requires new dependency)
+
+#### Challenge 2: Real-Time Progress Reporting
+
+Current `monitor_stats()` prints progress every 5 seconds. With multi-client:
+
+```
+# Current (single client)
+Time: 60s, Users: 100, Queue: 5, Write: 3.2 GB/s, Read: 4.1 GB/s
+
+# Multi-client: Need aggregate view
+Time: 60s, Clients: 4, Total Users: 200, Aggregate Write: 12.8 GB/s, Read: 16.4 GB/s
+  └─ Client 0: 3.2 GB/s W, 4.1 GB/s R
+  └─ Client 1: 3.1 GB/s W, 4.0 GB/s R
+  └─ Client 2: 3.3 GB/s W, 4.2 GB/s R
+  └─ Client 3: 3.2 GB/s W, 4.1 GB/s R
+```
+
+**Implementation:** Parent process polls children via `multiprocessing.Queue` or shared memory (`multiprocessing.Array`).
+
+#### Challenge 3: Error Handling
+
+| Scenario | Current Behavior | Required Behavior |
+|----------|------------------|-------------------|
+| One client OOMs | N/A | Parent detects, logs, continues or aborts all |
+| Ctrl+C pressed | Single process exits | Parent sends SIGTERM to all children |
+| One client finishes early | N/A | Wait for slowest, or use first-to-finish time |
+| Disk full mid-run | Single process fails | All clients detect, graceful shutdown |
+
+#### Challenge 4: Output Format
+
+```json
+{
+  "aggregate": {
+    "total_write_bytes": 128000000000,
+    "total_read_bytes": 164000000000,
+    "write_bandwidth_gbps": 12.8,
+    "read_bandwidth_gbps": 16.4,
+    "latency_p50_ms": 2.1,      // Merged from all clients
+    "latency_p99_ms": 8.3,      // Merged from all clients
+    "num_clients": 4
+  },
+  "per_client": [
+    {"client_id": 0, "write_bandwidth_gbps": 3.2, ...},
+    {"client_id": 1, "write_bandwidth_gbps": 3.1, ...},
+    ...
+  ]
+}
+```
+
+#### Implementation Roadmap for `--num-clients`
+
+| Phase | Task | Effort |
+|-------|------|--------|
+| 1 | Basic spawning with separate output files (current bash approach, but in Python) | 1 week |
+| 2 | Post-run JSON aggregation (bandwidth, bytes) | 3 days |
+| 3 | Latency histogram merging (DDSketch or raw samples) | 1 week |
+| 4 | Real-time aggregate progress display | 1 week |
+| 5 | Graceful error handling and signal propagation | 1 week |
+| 6 | XLSX export with per-client and aggregate sheets | 3 days |
+
+**Total: 4-6 weeks**
+
+**Recommendation:** For MLPerf v3.0 submission, use the **bash script approach** documented in Section 2.1. Native `--num-clients` is a post-v3.0 enhancement.
+
+---
+
+### 11.7 Implementation Roadmap
+
+| Phase | Feature | Priority | Effort | Dependencies |
+|-------|---------|----------|--------|--------------|
+| **Phase 1** | S3Backend | HIGH | 2 weeks | boto3 |
+| **Phase 1** | RedisBackend | HIGH | 1 week | redis-py |
+| **Phase 2** | GDSBackend | MEDIUM | 3 weeks | kvikio, CUDA 11.4+ |
+| **Phase 2** | `--num-clients` (basic) | MEDIUM | 2 weeks | multiprocessing |
+| **Phase 3** | `--num-clients` (full) | LOW | 4 weeks | ddsketch |
+| **Phase 3** | NIXLBackend | LOW | 6 weeks | UCX, InfiniBand |
+
+**CLI Integration (proposed):**
+
+```bash
+# S3 as cold tier (auto-migrate after 1 hour idle)
+python -m kv_cache.cli \
+    --model llama3.1-70b-instruct \
+    --cache-dir /mnt/nvme/kv_cache \
+    --s3-bucket my-kv-cache \
+    --s3-cold-threshold 3600
+
+# Redis as shared cache (multi-server deployment)
+python -m kv_cache.cli \
+    --model llama3.1-8b \
+    --redis-host redis.cluster.local \
+    --redis-ttl 7200
+
+# GDS for maximum NVMe performance
+python -m kv_cache.cli \
+    --model llama3.1-70b-instruct \
+    --storage-backend gds \
+    --cache-dir /mnt/nvme/kv_cache
+
+# Native multi-client (future)
+python -m kv_cache.cli \
+    --num-clients 4 \
+    --cache-dir /mnt/nvme/kv_benchmark \
+    --num-users 50 \
+    --model llama3.1-8b
+```
+
+---
+
+### 11.8 Research References
+
+| Technology | Documentation | Key Paper/Blog |
+|------------|---------------|----------------|
+| GPUDirect Storage | [NVIDIA Docs](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html) | [GTC 2020: Magnum IO](https://developer.nvidia.com/blog/gpudirect-storage/) |
+| NIXL | [GitHub](https://github.com/ai-dynamo/nixl) | NVIDIA Dynamo Architecture |
+| LMCache | [Docs](https://docs.lmcache.ai/) | [CacheGen (SIGCOMM 2024)](https://dl.acm.org/doi/10.1145/3651890.3672274) |
+| KV Cache Compression | [KVPress](https://github.com/NVIDIA/kvpress) | [Scissorhands (NeurIPS 2023)](https://arxiv.org/abs/2305.17118) |
+| Disaggregated Inference | [DistServe](https://arxiv.org/abs/2401.09670) | [Splitwise (ISCA 2024)](https://arxiv.org/abs/2311.18677) |
+
+---
+
+## Conclusion
+
+This benchmark provides a comprehensive framework for evaluating multi-tier KV cache storage systems. Key takeaways:
+
+1. **Waterfall LRU** keeps hot data in fast tiers (6.4× speedup GPU vs NVMe)
+2. **Autoscaling** discovers production capacity automatically
+3. **Hardware validation** bypasses OS caching for true device measurement
+4. **Metric selection matters:** Use correct metrics for your `cpu_mem` setting
+5. **Multiple trials required:** Report median to account for variance
+
+For MLPerf submissions, prioritize:
+- `decode_bytes_read_gb` at `cpu_mem=0GB` (2.6× differentiation)
+- `nvme_device_p95_ms` for hardware comparison
+- 3-5 trials with fixed `--seed 42`
+
+---
+
+**Support:** hazem_awadallah@kingston.com  
+**Repository:** [Link to repo]  
+**License:** Apache 2.0
