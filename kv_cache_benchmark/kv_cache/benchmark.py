@@ -77,7 +77,9 @@ class IntegratedBenchmark:
                  replay_cycles: int = 0,
                  prefill_only: bool = False,
                  decode_only: bool = False,
-                 io_trace_log: Optional[str] = None):
+                 io_trace_log: Optional[str] = None,
+                 gpu_bandwidth_gb_s: float = 64.0,
+                 prefetch_depth: int = 8):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -111,6 +113,8 @@ class IntegratedBenchmark:
         self.replay_cycles = replay_cycles
         self.prefill_only = prefill_only
         self.decode_only = decode_only
+        self.gpu_bandwidth_gb_s = gpu_bandwidth_gb_s
+        self.prefetch_depth = prefetch_depth
 
         # Trace mode: IOTracer is created here and closed at the end of run()
         if io_trace_log:
@@ -145,6 +149,8 @@ class IntegratedBenchmark:
             storage_capacity_gb=storage_capacity_gb,
             tensor_parallel=self.tensor_parallel,
             io_tracer=self.io_tracer,
+            gpu_bandwidth_gb_s=self.gpu_bandwidth_gb_s,
+            prefetch_depth=self.prefetch_depth,
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
@@ -798,6 +804,7 @@ class IntegratedBenchmark:
 
         if self.io_tracer is not None:
             self.io_tracer.close()
+        self.cache.shutdown()
 
         return self.results
 
