@@ -254,6 +254,15 @@ def main():
                              'so per-rank I/O object sizes are divided by TP. '
                              'Must be >= 1 and <= --num-gpus. '
                              'Example: --tensor-parallel 8 models TP=8 for Llama 70B on 8×H200.')
+    parser.add_argument('--gpu-bandwidth-gbs', type=float, default=64.0,
+                        help='Simulated GPU host↔device bandwidth in GB/s used to model '
+                             'GPU tier read/write latency. Default 64.0 models PCIe 5.0 x16. '
+                             'Use ~3350 for intra-GPU HBM3 (H100/H200) access patterns.')
+    parser.add_argument('--prefetch-depth', type=int, default=8,
+                        help='Number of 256 MB blocks to pre-generate in the background producer '
+                             'before storage writes begin. 0 disables the producer and '
+                             'generates data inline. Default 8 = 2 GB footprint. '
+                             'Increase if storage is faster than 20 GB/s. Set 0 to disable.')
     parser.add_argument('--cpu-mem-gb', type=float, default=32,
                         help='Total CPU DRAM to allocate for the KV cache spill tier in GB.')
     parser.add_argument('--cache-dir', type=str, default=None,
@@ -406,6 +415,8 @@ def main():
         prefill_only=args.prefill_only,
         decode_only=args.decode_only,
         io_trace_log=args.io_trace_log,
+        gpu_bandwidth_gb_s=args.gpu_bandwidth_gbs,
+        prefetch_depth=args.prefetch_depth,
     )
 
     results = benchmark.run()
