@@ -62,6 +62,10 @@ reporting = [
     "openpyxl>=3.1",
 ]
 
+# Compressed I/O trace output (.zst files via --io-trace-log)
+# Recommended for runs > a few minutes; provides 10-20x size reduction.
+compression = ["zstandard>=0.21"]
+
 # Full installation with all optional dependencies
 full = [
     "pyyaml>=6.0",
@@ -69,6 +73,7 @@ full = [
     "tiktoken>=0.5",
     "pandas>=2.0",
     "openpyxl>=3.1",
+    "zstandard>=0.21",
 ]
 
 # Development dependencies
