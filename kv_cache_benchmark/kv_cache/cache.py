@@ -14,73 +14,125 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE
+from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE, DGEN_AVAILABLE
 from kv_cache.config import cfg
 from kv_cache.models import ModelConfig, InferencePhase
 from kv_cache.backends import (
-    StorageBackend, GPUMemoryBackend, CPUMemoryBackend, NVMeBackend,
+    StorageBackend, SimulatedGPUBackend, GPUMemoryBackend,
+    CPUMemoryBackend, NVMeBackend, NullBackend,
 )
+from kv_cache.tracer import IOTracer
+from kv_cache.data_producer import DataGeneratorPool
 
 logger = logging.getLogger(__name__)
 
 
 class KVCacheGenerator:
-    """Generates realistic-looking KV cache data for testing."""
+    """
+    Generates raw bytes for KV cache entries used in simulation benchmarking.
 
-    def __init__(self, model_config: ModelConfig, global_seed: Optional[int] = None):
+    When dgen-py is available, calls ``dgen_py.generate_buffer(size_bytes)``
+    in-process (GIL released, Rayon-parallel Xoshiro256++, 10–100 GB/s).
+    Returns a ``BytesView`` backed by Rust-heap memory — zero-copy, no
+    conversion, no numpy dtype, no reshape.
+
+    Falls back to a pre-computed random bytes buffer when dgen-py is absent.
+    """
+
+    _FALLBACK_BUFFER_SIZE: int = 256 * 1024 * 1024  # 256 MB
+
+    def __init__(self, model_config: ModelConfig, global_seed: Optional[int] = None,
+                 prefetch_depth: int = 8):
         self.model_config = model_config
-        self.global_seed = 0 if global_seed is None else int(global_seed)
+        self.global_seed  = 0 if global_seed is None else int(global_seed)
 
-        self.buffer_size_elements = 128 * 1024 * 1024  # 128 million elements (~256MB for float16)
-        self.dtype = np.float16 if 'float16' in self.model_config.dtype else np.float32
+        self._producer_pool: Optional[DataGeneratorPool] = None
 
-        logger.info(f"Pre-generating {self.buffer_size_elements * 2 / 1024**2:.0f} MB noise buffer...")
-        rng = np.random.default_rng(self.global_seed)
-        self.precomputed_buffer = rng.uniform(-1.0, 1.0, size=self.buffer_size_elements).astype(self.dtype)
+        if DGEN_AVAILABLE:
+            if prefetch_depth > 0:
+                self._producer_pool = DataGeneratorPool(
+                    buffer_size_mb=256,
+                    prefetch_depth=prefetch_depth,
+                ).start()
+                logger.info(
+                    f"KVCacheGenerator: zero-copy producer pool started "
+                    f"(256 MB buffers, depth={prefetch_depth}, "
+                    f"no data copies). Generation runs ahead of storage writes."
+                )
+            else:
+                logger.info("KVCacheGenerator: using dgen-py in-process (zero-copy BytesView, no prefetch)")
+            self.precomputed_buffer: Optional[bytes] = None
+        else:
+            # Fallback: 256 MB of seeded random bytes — no numpy dtype involved.
+            logger.info(
+                f"KVCacheGenerator: pre-generating "
+                f"{self._FALLBACK_BUFFER_SIZE / 1024**2:.0f} MB random bytes buffer…"
+            )
+            rng = np.random.default_rng(self.global_seed)
+            self.precomputed_buffer = rng.bytes(self._FALLBACK_BUFFER_SIZE)
 
     def _seed_from_key(self, key: str) -> int:
         h = hashlib.sha256(key.encode('utf-8')).digest()
         key_hash64 = int.from_bytes(h[:8], 'little')
         return (key_hash64 ^ self.global_seed) & 0xFFFFFFFFFFFFFFFF
 
-    def generate(self, sequence_length: int, key: Optional[str] = None) -> np.ndarray:
+    def generate(self, sequence_length: int, key: Optional[str] = None):
         """
-        Generates a NumPy array with the correct shape and dtype for a KV cache.
-        Uses a pre-computed buffer to avoid CPU bottlenecks during benchmarking.
+        Return raw bytes for a KV cache entry of ``sequence_length`` tokens.
+
+        dgen-py path (preferred)
+        ~~~~~~~~~~~~~~~~~~~~~~~~
+        Calls ``dgen_py.generate_buffer(total_bytes)`` in-process.  Returns a
+        ``BytesView`` (buffer-protocol object backed by Rust-heap memory).
+        No dtype conversion, no numpy reshape — just bytes of the right size.
+
+        Bytes fallback path
+        ~~~~~~~~~~~~~~~~~~~
+        Slice of the pre-computed 256 MB random bytes buffer.  If the entry is
+        larger than the buffer the bytes are tiled via ``bytes * n`` (one alloc).
         """
-        if self.model_config.attention_type == 'mla':
-            # MLA: compressed latent (kv_lora_rank) + decoupled RoPE key (qk_rope_head_dim)
-            # No separate K and V — jointly compressed into single latent vector per layer
-            kv_shape = (
-                self.model_config.num_layers,
-                int(sequence_length),
-                self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim,
-            )
-        else:
-            kv_shape = (
-                self.model_config.num_layers,
-                2,
-                int(sequence_length),
-                self.model_config.kv_heads,
-                self.model_config.kv_dim_per_head,
-            )
+        # Size is derived entirely from the model config — no numpy involved.
+        total_bytes = self.model_config.kv_cache_size_per_token * int(sequence_length)
 
-        total_elements = int(np.prod(kv_shape))
+        # ── Producer-consumer pool path (preferred) ───────────────────────────
+        # Data was generated AHEAD OF TIME in background threads.
+        # get_view() returns a memoryview pointer (<1 µs) — zero copy, zero
+        # generation lag.  storage timer starts with data already in hand.
+        if self._producer_pool is not None:
+            return self._producer_pool.get_view(total_bytes)
 
-        if total_elements <= self.buffer_size_elements:
+        # ── dgen-py in-process path (no pool) ────────────────────────────────
+        # Falls here when prefetch_depth=0.  Generation happens inline;
+        # storage timer starts AFTER this call returns.
+        if DGEN_AVAILABLE:
+            try:
+                import dgen_py
+                return dgen_py.generate_buffer(total_bytes)  # BytesView — zero-copy
+            except Exception as exc:
+                logger.warning(
+                    f"KVCacheGenerator: dgen-py error ({exc}); "
+                    "falling back to bytes buffer for this entry."
+                )
+
+        # ── Bytes fallback path ───────────────────────────────────────────────
+        buf = self.precomputed_buffer  # bytes, 256 MB
+        if total_bytes <= len(buf):
             if key:
-                seed = self._seed_from_key(key)
-                divisor = self.buffer_size_elements - total_elements
+                seed      = self._seed_from_key(key)
+                divisor   = len(buf) - total_bytes
                 start_idx = int(seed % divisor) if divisor > 0 else 0
             else:
                 start_idx = 0
-
-            flat_view = self.precomputed_buffer[start_idx : start_idx + total_elements]
-            return flat_view.reshape(kv_shape)
+            return buf[start_idx : start_idx + total_bytes]  # zero-copy bytes slice
         else:
-            repeats = int((total_elements + self.buffer_size_elements - 1) // self.buffer_size_elements)
-            large_data = np.tile(self.precomputed_buffer, repeats)[:total_elements]
-            return large_data.reshape(kv_shape)
+            repeats = (total_bytes + len(buf) - 1) // len(buf)
+            return (buf * repeats)[:total_bytes]  # one allocation, correct size
+
+    def shutdown(self) -> None:
+        """Stop the background producer thread (if running)."""
+        if self._producer_pool is not None:
+            self._producer_pool.stop()
+            logger.info("KVCacheGenerator: producer-consumer pool stopped")
 
 
 # ============================================================================
@@ -104,7 +156,11 @@ class MultiTierCache:
                  performance_profile: str = 'latency',
                  seed: Optional[int] = None,
                  max_concurrent_allocs: int = 0,
-                 storage_capacity_gb: float = 0):
+                 storage_capacity_gb: float = 0,
+                 tensor_parallel: int = 1,
+                 io_tracer: Optional['IOTracer'] = None,
+                 gpu_bandwidth_gb_s: float = 64.0,
+                 prefetch_depth: int = 8):
 
         self.model_config = model_config
         self.gpu_memory_limit = gpu_memory_gb * 1024**3
@@ -113,24 +169,37 @@ class MultiTierCache:
         self.performance_profile = performance_profile
         self.seed = seed
         self.max_concurrent_allocs = max_concurrent_allocs
+        self.tensor_parallel = max(1, tensor_parallel)
+        self.io_tracer = io_tracer
+        self.gpu_bandwidth_gb_s = gpu_bandwidth_gb_s
 
         # Initialize storage backends for each tier.
+        # In trace mode all backends are NullBackend — no real hardware I/O.
         self.backends = {}
-        try:
-            if TORCH_AVAILABLE or CUPY_AVAILABLE:
-                self.backends['gpu'] = GPUMemoryBackend(
-                    use_torch=TORCH_AVAILABLE,
-                    on_eviction_callback=self._handle_gpu_eviction
-                )
-        except Exception as e:
-            logger.warning(f"Could not initialize GPU backend: {e}")
+        if self.io_tracer is not None:
+            logger.info("MultiTierCache: trace mode active — using NullBackend for all tiers")
+            self.backends['gpu'] = NullBackend()
+            self.backends['cpu'] = NullBackend()
+            self.backends['nvme'] = NullBackend()
+        else:
+            # SimulatedGPUBackend always succeeds — no hardware required.
+            # It models PCIe host↔GPU transfer latency and tracks byte counts
+            # without allocating any real VRAM or requiring PyTorch/CuPy.
+            self.backends['gpu'] = SimulatedGPUBackend(
+                bandwidth_gb_s=gpu_bandwidth_gb_s,
+                on_eviction_callback=self._handle_gpu_eviction,
+            )
+            logger.info(
+                f"MultiTierCache: GPU tier simulated at {gpu_bandwidth_gb_s:.0f} GB/s "
+                f"(capacity {gpu_memory_gb:.0f} GB)"
+            )
+            self.backends['cpu'] = CPUMemoryBackend()
+            self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
 
-        self.backends['cpu'] = CPUMemoryBackend()
-        self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
+        self.generator = KVCacheGenerator(model_config, global_seed=self.seed,
+                                           prefetch_depth=prefetch_depth)
 
-        self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
-
-        self.cache_entries = {}
+        self.cache_entries: Dict[str, dict] = {}
         self.entry_locks: Dict[str, threading.Lock] = {}
         if storage_capacity_gb > 0:
             self.nvme_memory_limit = storage_capacity_gb * 1024**3
@@ -179,6 +248,10 @@ class MultiTierCache:
 
             'storage_tokens_processed': 0,
         }
+
+    def shutdown(self) -> None:
+        """Release any resources held by this cache instance."""
+        self.generator.shutdown()   # stop background producer thread if running
 
     def _get_entry_lock(self, key: str) -> threading.Lock:
         """Get or create a lock for a specific cache entry."""
@@ -272,6 +345,10 @@ class MultiTierCache:
                 write_timing = self.backends[to_tier].write(key, data)
                 self.backends[from_tier].delete(key)
 
+                if self.io_tracer is not None:
+                    self.io_tracer.log('Read',  size, from_tier, key=key, phase='Evict')
+                    self.io_tracer.log('Write', size, to_tier,   key=key, phase='Evict')
+
                 with self.metadata_lock:
                     if key in self.cache_entries:
                         self.cache_entries[key]['location'] = to_tier
@@ -285,7 +362,8 @@ class MultiTierCache:
                         self.stats['offloads_cpu'] += 1
                     elif to_tier == 'nvme':
                         self.stats['offloads_storage'] += 1
-                        bytes_per_token = self.model_config.kv_cache_size_per_token
+                        bytes_per_token = (self.model_config.kv_cache_size_per_token
+                                           // max(1, self.tensor_parallel))
                         if bytes_per_token > 0:
                             tokens = size // bytes_per_token
                             self.stats['storage_tokens_processed'] += tokens
@@ -423,16 +501,26 @@ class MultiTierCache:
 
     def _allocate_cache_inner(self, key: str, num_tokens: int, phase: InferencePhase) -> Tuple[bool, str, float]:
         """Inner implementation of allocate_cache, called within semaphore."""
-        try:
-            data = self.generator.generate(sequence_length=num_tokens, key=key)
-        except MemoryError:
-            logger.error(f"MemoryError generating cache for key {key} ({num_tokens} tokens)")
-            return False, 'none', 0.0
-        except Exception as exc:
-            logger.error(f"Failed to generate cache for key {key}: {exc}")
-            return False, 'none', 0.0
-
-        size_bytes = data.nbytes
+        if self.io_tracer is not None:
+            # Trace mode: compute size from model config — no data generation needed.
+            # Divide by tensor_parallel: each TP rank stores only its 1/TP shard.
+            size_bytes = (self.model_config.kv_cache_size_per_token * num_tokens
+                          ) // self.tensor_parallel
+            data = None
+        else:
+            try:
+                data = self.generator.generate(sequence_length=num_tokens, key=key)
+            except MemoryError:
+                logger.error(f"MemoryError generating cache for key {key} ({num_tokens} tokens)")
+                return False, 'none', 0.0
+            except Exception as exc:
+                logger.error(f"Failed to generate cache for key {key}: {exc}")
+                return False, 'none', 0.0
+            if self.tensor_parallel > 1:
+                # Each TP rank owns 1/tensor_parallel of the data bytes.
+                tp_bytes = len(data) // self.tensor_parallel
+                data = memoryview(data)[:tp_bytes]
+            size_bytes = len(data)
 
         with self.stats_lock:
             if phase == InferencePhase.PREFILL:
@@ -453,7 +541,12 @@ class MultiTierCache:
             allocated_tier = 'nvme'
 
         try:
-            if allocated_tier == 'gpu':
+            if self.io_tracer is not None:
+                # Trace mode: record the operation with no actual data movement
+                timing = self.backends[allocated_tier].write_size(key, size_bytes)
+                self.io_tracer.log('Write', size_bytes, allocated_tier,
+                                   key=key, phase=phase.value.capitalize())
+            elif allocated_tier == 'gpu':
                 timing = self.backends['gpu'].write(key, data)
             elif allocated_tier == 'cpu':
                 timing = self.backends['cpu'].write(key, data)
@@ -545,6 +638,10 @@ class MultiTierCache:
 
             try:
                 _, timing = self.backends[location].read(key)
+
+                if self.io_tracer is not None:
+                    self.io_tracer.log('Read', entry_size, location,
+                                       key=key, phase=phase.value.capitalize())
 
                 with self.stats_lock:
                     if location == 'gpu':
