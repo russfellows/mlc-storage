@@ -1,12 +1,9 @@
-#!/usr/bin/env python3
 import argparse
 import logging
 import sys
 import os
 import time
 import numpy as np
-from typing import Optional, Tuple
-
 from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
 
 # Add the parent directory to sys.path to import config_loader
@@ -15,66 +12,33 @@ from vdbbench.config_loader import load_config, merge_config_with_args
 from vdbbench.compact_and_watch import monitor_progress
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-
-###############################################################################
-# GT (Ground Truth) helper / reasoning
-###############################################################################
-"""
-Why a separate GT collection?
-- To measure recall@K across approximate indexes (DiskANN/HNSW/AISAQ), you need an
-  "exact" top-K reference. In Milvus, that typically means a FLAT index (exact).
-- GT should be per DATASET (vectors+ids+metric), not per index type. If the dataset
-  is identical, the GT should be shared across DiskANN/HNSW/AISAQ comparisons.
-
-What safeguard do we implement?
-- Deterministic GT naming from dataset signature (default: N, dim, distribution, seed, metric).
-- Reuse GT if it already exists.
-- CRITICAL: If GT exists and is already populated with the expected entity count,
-  we skip inserting into GT again. This prevents the GT from accidentally growing
-  to 2x/3x/…N across repeated runs.
-
-We also validate schema on GT reuse:
-- id must be primary, auto_id=False
-- vector dtype must be FLOAT_VECTOR
-- dim must match
-
-If schema/count mismatch is detected, we fail fast unless --force-gt is used.
-"""
-
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="Load vectors into Milvus database (optionally create GT FLAT)")
-
+    parser = argparse.ArgumentParser(description="Load vectors into Milvus database")
+    
     # Connection parameters
     parser.add_argument("--host", type=str, default="localhost", help="Milvus server host")
     parser.add_argument("--port", type=str, default="19530", help="Milvus server port")
-
+    
     # Collection parameters
-    parser.add_argument("--collection-name", type=str, required=False, help="Name of the collection to create")
-    parser.add_argument("--dimension", type=int, required=False, help="Vector dimension")
+    parser.add_argument("--collection-name", type=str, help="Name of the collection to create")
+    parser.add_argument("--dimension", type=int, help="Vector dimension")
     parser.add_argument("--num-shards", type=int, default=1, help="Number of shards for the collection")
-    parser.add_argument(
-        "--vector-dtype",
-        type=str,
-        default="float",
-        choices=["float"],
-        help="Vector data type (currently only FLOAT_VECTOR supported in this loader)",
-    )
-
-    # Force flags
-    parser.add_argument("--force", action="store_true", help="Force recreate MAIN collection if it exists")
-    parser.add_argument("--force-gt", action="store_true", help="Force recreate GT collection if it exists")
-
+    parser.add_argument("--vector-dtype", type=str, default="float", choices=["FLOAT_VECTOR"],
+                        help="Vector data type. Only FLOAT_VECTOR is supported for now")
+    parser.add_argument("--force", action="store_true", help="Force recreate collection if it exists")
+    
     # Data generation parameters
-    parser.add_argument("--num-vectors", type=int, required=False, help="Number of vectors to generate")
-    parser.add_argument("--distribution", type=str, default="uniform", choices=["uniform", "normal"],
-                        help="Distribution for vector generation")
-    parser.add_argument("--seed", type=int, default=1234, help="RNG seed for reproducible vector generation")
+    parser.add_argument("--num-vectors", type=int, help="Number of vectors to generate")
+    parser.add_argument("--distribution", type=str, default="uniform", 
+                        choices=["uniform", "normal"], help="Distribution for vector generation")
     parser.add_argument("--batch-size", type=int, default=10000, help="Batch size for insertion")
-    parser.add_argument("--chunk-size", type=int, default=1_000_000, help="Vectors to generate per chunk")
+    parser.add_argument("--chunk-size", type=int, default=1000000, help="Number of vectors to generate in each chunk (for memory management)")
 
     # Index parameters
     parser.add_argument("--index-type", type=str, default="DISKANN", help="Index type")
@@ -83,447 +47,332 @@ def parse_args():
     parser.add_argument("--search-list-size", type=int, default=200, help="DiskANN SearchListSize parameter")
     parser.add_argument("--M", type=int, default=16, help="HNSW M parameter")
     parser.add_argument("--ef-construction", type=int, default=200, help="HNSW efConstruction parameter")
-    parser.add_argument("--inline-pq", type=int, default=16, help="AISAQ inline_pq parameter")
-
-    # GT options
-    parser.add_argument("--create-gt", action="store_true",
-                        help="Also create/populate a GT collection with FLAT index (exact)")
-    parser.add_argument("--gt-collection-name", type=str, default=None,
-                        help="Optional override GT collection name. If omitted, auto-generated deterministically.")
-    parser.add_argument("--gt-num-shards", type=int, default=None,
-                        help="GT number of shards (default: same as --num-shards)")
-    parser.add_argument("--gt-metric-type", type=str, default=None,
-                        help="GT metric type (default: same as --metric-type)")
-    parser.add_argument("--gt-key-mode", type=str, default="signature", choices=["signature", "nd"],
-                        help="How to build auto GT name: 'signature' (safe) or 'nd' (coarse)")
-
+    parser.add_argument("--inline-pq", type=int, default=16, help="AISAQ inline_pq parameter, performance(max_degree) vs scale(0) mode")
+    
     # Monitoring parameters
-    parser.add_argument("--monitor-interval", type=int, default=5, help="Seconds between monitoring checks")
+    parser.add_argument("--monitor-interval", type=int, default=5, help="Interval in seconds for monitoring index building")
     parser.add_argument("--compact", action="store_true", help="Perform compaction after loading")
-
+    
     # Configuration file
     parser.add_argument("--config", type=str, help="Path to YAML configuration file")
-
+    
     # What-if option to print args and exit
     parser.add_argument("--what-if", action="store_true", help="Print the arguments after processing and exit")
-
-    # Debug option
+    
+    # Debug option to set logging level to DEBUG
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-
+    
     args = parser.parse_args()
-
+    
+    # Track which arguments were explicitly set vs using defaults
+    args.is_default = {
+        'host': args.host == "localhost",
+        'port': args.port == "19530",
+        'num_shards': args.num_shards == 1,
+        'vector_dtype': args.vector_dtype == "float",
+        'distribution': args.distribution == "uniform",
+        'batch_size': args.batch_size == 10000,
+        'chunk_size': args.chunk_size == 1000000,
+        'index_type': args.index_type == "DISKANN",
+        'metric_type': args.metric_type == "COSINE",
+        'max_degree': args.max_degree == 16,
+        'search_list_size': args.search_list_size == 200,
+        'M': args.M == 16,
+        'ef_construction': args.ef_construction == 200,
+        'inline_pq': args.inline_pq == 16,
+        'monitor_interval': args.monitor_interval == 5,
+        'compact': not args.compact,  # Default is False
+        'force': not args.force,  # Default is False
+        'what_if': not args.what_if,  # Default is False
+        'debug': not args.debug  # Default is False
+    }
+    
+    # Set logging level to DEBUG if --debug is specified
     if args.debug:
         logger.setLevel(logging.DEBUG)
-
+        logger.debug("Debug logging enabled")
+    
+    # Load configuration from YAML if specified
     if args.config:
         config = load_config(args.config)
         args = merge_config_with_args(config, args)
-
+    
+    # If what-if is specified, print the arguments and exit
     if args.what_if:
-        logger.info("What-if mode: printing args and exiting.")
-        for k, v in vars(args).items():
-            print(f"{k}: {v}")
+        logger.info("Running in what-if mode. Printing arguments and exiting.")
+        print("\nConfiguration after processing arguments and config file:")
+        print("=" * 60)
+        for key, value in vars(args).items():
+            if key != 'is_default':  # Skip the is_default dictionary
+                source = "default" if args.is_default.get(key, False) else "specified"
+                print(f"{key}: {value} ({source})")
+        print("=" * 60)
         sys.exit(0)
-
-    required_params = ["collection_name", "dimension", "num_vectors"]
-    missing = [p for p in required_params if getattr(args, p, None) is None]
-    if missing:
-        parser.error(f"Missing required parameters: {', '.join(missing)}")
-
+    
+    # Validate required parameters
+    required_params = ['collection_name', 'dimension', 'num_vectors']
+    missing_params = [param for param in required_params if getattr(args, param.replace('-', '_'), None) is None]
+    
+    if missing_params:
+        parser.error(f"Missing required parameters: {', '.join(missing_params)}. "
+                     f"Specify with command line arguments or in config file.")
+    
     return args
 
 
-def connect_to_milvus(host, port) -> bool:
+def connect_to_milvus(host, port):
+    """Connect to Milvus server"""
     try:
+        logger.debug(f"Connecting to Milvus server at {host}:{port}")
         connections.connect(
-            "default",
-            host=host,
+            "default", 
+            host=host, 
             port=port,
             max_receive_message_length=514_983_574,
-            max_send_message_length=514_983_574,
+            max_send_message_length=514_983_574
         )
-        logger.info(f"Connected to Milvus at {host}:{port}")
+        logger.info(f"Connected to Milvus server at {host}:{port}")
         return True
+
     except Exception as e:
-        logger.error(f"Error connecting to Milvus: {e}")
+        logger.error(f"Error connecting to Milvus server: {str(e)}")
         return False
 
 
-def create_collection(collection_name: str, dim: int, num_shards: int, vector_dtype, force: bool = False) -> Optional[Collection]:
+def create_collection(collection_name, dim, num_shards, vector_dtype, force=False):
+    """Create a new collection with the specified parameters"""
     try:
+        # Check if collection exists
         if utility.has_collection(collection_name):
             if force:
                 Collection(name=collection_name).drop()
                 logger.info(f"Dropped existing collection: {collection_name}")
             else:
-                logger.warning(f"Collection '{collection_name}' already exists. (no force) Reusing it.")
-                return Collection(name=collection_name)
+                logger.warning(f"Collection '{collection_name}' already exists. Use --force to drop and recreate it.")
+                return None
 
+        # Define vector data type
+        vector_type = DataType.FLOAT_VECTOR
+
+        # Define collection schema
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
-            FieldSchema(name="vector", dtype=vector_dtype, dim=dim),
+            FieldSchema(name="vector", dtype=vector_type, dim=dim)
         ]
         schema = CollectionSchema(fields, description="Benchmark Collection")
-        col = Collection(name=collection_name, schema=schema, num_shards=num_shards)
-        logger.info(f"Created collection '{collection_name}' (dim={dim}, shards={num_shards})")
-        return col
+
+        # Create collection
+        collection = Collection(name=collection_name, schema=schema, num_shards=num_shards)
+        logger.info(f"Created collection '{collection_name}' with {dim} dimensions and {num_shards} shards")
+
+        return collection
     except Exception as e:
-        logger.error(f"Failed to create collection '{collection_name}': {e}")
+        logger.error(f"Failed to create collection: {str(e)}")
         return None
 
 
-def create_index(collection: Collection, index_params: dict) -> bool:
-    try:
-        logger.info(f"Creating index on '{collection.name}' with params: {index_params}")
-        collection.create_index("vector", index_params)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to create index on '{collection.name}': {e}")
-        return False
-
-
-def flush_collection(collection: Collection) -> None:
-    # Flush the collection
-    t0 = time.time()
-    collection.flush()
-    logger.info(f"Flush '{collection.name}' completed in {time.time() - t0:.2f}s")
-
-
-def generate_vectors(num_vectors: int, dim: int, distribution: str = "uniform", normalize: bool = False) -> list:
-    """Generate random vectors.
-    
-    Args:
-        num_vectors: Number of vectors to generate
-        dim: Vector dimension
-        distribution: 'uniform' or 'normal' or 'zipfian'
-        normalize: If True, normalize vectors (recommended for COSINE metric)
-    """
-    if distribution == "uniform":
-        vectors = np.random.random((num_vectors, dim)).astype(np.float32)
-    elif distribution == "normal":
-        vectors = np.random.normal(0, 1, (num_vectors, dim)).astype(np.float32)
+def generate_vectors(num_vectors, dim, distribution='uniform'):
+    """Generate random vectors based on the specified distribution"""
+    if distribution == 'uniform':
+        vectors = np.random.random((num_vectors, dim)).astype('float16')
+    elif distribution == 'normal':
+        vectors = np.random.normal(0, 1, (num_vectors, dim)).astype('float16')
     elif distribution == 'zipfian':
         # Simplified zipfian-like distribution
-        base = np.random.random((num_vectors, dim)).astype(np.float32)
-        skew = np.random.zipf(1.5, (num_vectors, 1)).astype(np.float32)
+        base = np.random.random((num_vectors, dim)).astype('float16')
+        skew = np.random.zipf(1.5, (num_vectors, 1)).astype('float16')
         vectors = base * (skew / 10)
     else:
-        vectors = np.random.random((num_vectors, dim)).astype(np.float32)
+        vectors = np.random.random((num_vectors, dim)).astype('float16')
 
-    # Normalize only if requested (typically for COSINE metric)
-    if normalize:
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
-        vectors = vectors / norms
-        
-    return vectors.tolist()
+    # Normalize vectors
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    normalized_vectors = vectors / norms
+
+    return normalized_vectors.tolist()
 
 
-def insert_data(
-    main_col: Collection,
-    vectors: list,
-    batch_size: int,
-    id_offset: int,
-    gt_col: Optional[Collection],
-    gt_should_insert: bool,
-    max_retries: int = 3,
-) -> int:
-    """Insert vectors into collections with retry logic.
-    
-    Args:
-        main_col: Main collection to insert into
-        vectors: List of vectors to insert
-        batch_size: Size of each batch
-        id_offset: Starting ID offset
-        gt_col: Optional GT collection
-        gt_should_insert: Whether to insert into GT
-        max_retries: Maximum retry attempts per batch
-        
-    Returns:
-        Number of vectors successfully inserted
-    """
-    total = len(vectors)
-    num_batches = (total + batch_size - 1) // batch_size
-    inserted = 0
-    failed_batches = 0
-    t0 = time.time()
+def insert_data(collection, vectors, batch_size=10000):
+    """Insert vectors into the collection in batches"""
+    total_vectors = len(vectors)
+    num_batches = (total_vectors + batch_size - 1) // batch_size
+
+    start_time = time.time()
+    total_inserted = 0
 
     for i in range(num_batches):
-        bs = i * batch_size
-        be = min((i + 1) * batch_size, total)
-        ids = list(range(id_offset + bs, id_offset + be))
-        batch_vectors = vectors[bs:be]
+        batch_start = i * batch_size
+        batch_end = min((i + 1) * batch_size, total_vectors)
+        batch_size_actual = batch_end - batch_start
 
-        # Retry logic for main collection
-        success = False
-        for attempt in range(max_retries):
-            try:
-                main_col.insert([ids, batch_vectors])
-                success = True
-                break
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(f"Batch {i+1} insert failed (attempt {attempt+1}/{max_retries}): {e}. Retrying...")
-                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                else:
-                    logger.error(f"Batch {i+1} insert failed after {max_retries} attempts: {e}")
-                    failed_batches += 1
-        
-        if not success:
-            continue
-            
-        # Insert into GT if needed (with retry)
-        if gt_col is not None and gt_should_insert:
-            for attempt in range(max_retries):
-                try:
-                    gt_col.insert([ids, batch_vectors])
-                    break
-                except Exception as e:
-                    if attempt < max_retries - 1:
-                        logger.warning(f"GT batch {i+1} insert failed (attempt {attempt+1}/{max_retries}): {e}. Retrying...")
-                        time.sleep(0.5 * (attempt + 1))
-                    else:
-                        logger.error(f"GT batch {i+1} insert failed after {max_retries} attempts: {e}")
+        # Prepare batch data
+        ids = list(range(batch_start, batch_end))
+        batch_vectors = vectors[batch_start:batch_end]
 
-        inserted += (be - bs)
+        # Insert batch
+        try:
+            collection.insert([ids, batch_vectors])
+            total_inserted += batch_size_actual
 
-        if (i + 1) % 10 == 0 or (i + 1) == num_batches:
-            elapsed = time.time() - t0
-            rate = inserted / elapsed if elapsed > 0 else 0
-            logger.info(f"Inserted {inserted:,}/{total:,} (batch {i+1}/{num_batches}), rate={rate:.1f} vec/s")
-    
-    if failed_batches > 0:
-        logger.error(f"WARNING: {failed_batches} batches failed to insert!")
+            # Log progress
+            progress = total_inserted / total_vectors * 100
+            elapsed = time.time() - start_time
+            rate = total_inserted / elapsed if elapsed > 0 else 0
 
-    return inserted
+            logger.info(f"Inserted batch {i+1}/{num_batches}: {progress:.2f}% complete, "
+                        f"rate: {rate:.2f} vectors/sec")
+
+        except Exception as e:
+            logger.error(f"Error inserting batch {i+1}: {str(e)}")
+
+    return total_inserted, time.time() - start_time
 
 
-def build_gt_name(args) -> str:
-    metric = (args.gt_metric_type or args.metric_type)
-    metric = str(metric).upper()
-    if args.gt_key_mode == "nd":
-        return f"gt_n{args.num_vectors}_dim{args.dimension}_{metric}_flat"
-    return f"gt_n{args.num_vectors}_dim{args.dimension}_{args.distribution}_seed{args.seed}_{metric}_flat"
+def flush_collection(collection):
+    # Flush the collection
+    flush_start = time.time()
+    collection.flush()
+    flush_time = time.time() - flush_start
+    logger.info(f"Flush completed in {flush_time:.2f} seconds")
 
 
-def _validate_gt_schema_or_die(gt: Collection, expected_dim: int) -> None:
-    """
-    Fail fast if GT schema is not compatible with this loader’s expected format.
-    This catches the common case where an old GT was created with auto_id=True,
-    or the vector field is BINARY, etc.
-    """
+def create_index(collection, index_params):
+    """Create an index on the collection"""
     try:
-        fields = {f.name: f for f in gt.schema.fields}
-        if "id" not in fields or "vector" not in fields:
-            raise SystemExit(f"GT '{gt.name}' schema mismatch: expected fields 'id' and 'vector'.")
-
-        idf = fields["id"]
-        vf = fields["vector"]
-
-        if not getattr(idf, "is_primary", False):
-            raise SystemExit(f"GT '{gt.name}' schema mismatch: 'id' is not primary.")
-        if getattr(idf, "auto_id", None) is True:
-            raise SystemExit(f"GT '{gt.name}' schema mismatch: 'id' has auto_id=True; must be auto_id=False.")
-
-        if vf.dtype != DataType.FLOAT_VECTOR:
-            raise SystemExit(f"GT '{gt.name}' schema mismatch: vector dtype is {vf.dtype}, expected FLOAT_VECTOR.")
-        dim = vf.params.get("dim", None)
-        if int(dim) != int(expected_dim):
-            raise SystemExit(f"GT '{gt.name}' schema mismatch: dim={dim}, expected {expected_dim}.")
-    except SystemExit:
-        raise
+        start_time = time.time()
+        logger.info(f"Creating index with parameters: {index_params}")
+        collection.create_index("vector", index_params)
+        index_creation_time = time.time() - start_time
+        logger.info(f"Index creation command completed in {index_creation_time:.2f} seconds")
+        return True
     except Exception as e:
-        raise SystemExit(f"Failed validating GT schema for '{gt.name}': {e}")
-
-
-def ensure_gt_collection(args, vector_dtype) -> Tuple[Optional[Collection], Optional[str], bool]:
-    """
-    Create or reuse GT collection.
-    Returns (gt_collection, gt_name, gt_should_insert).
-
-    gt_should_insert means: during this run, should we insert vectors into GT?
-    """
-    if not args.create_gt:
-        return None, None, False
-
-    gt_name = args.gt_collection_name or build_gt_name(args)
-    args.gt_collection_name = gt_name
-
-    gt_shards = args.gt_num_shards if args.gt_num_shards is not None else args.num_shards
-    gt_metric = args.gt_metric_type if args.gt_metric_type is not None else args.metric_type
-    
-    # Validate GT metric matches main collection metric
-    if str(gt_metric).upper() != str(args.metric_type).upper():
-        logger.warning(
-            f"⚠️  GT metric '{gt_metric}' differs from main collection metric '{args.metric_type}'. "
-            f"This will produce invalid recall measurements! GT should use same metric."
-        )
-
-    # If exists and not force-gt: reuse with safeguards
-    if utility.has_collection(gt_name) and not args.force_gt:
-        gt = Collection(gt_name)
-        gt.load()
-
-        # Validate schema before reusing (prevents accidental "append forever" GTs)
-        _validate_gt_schema_or_die(gt, expected_dim=args.dimension)
-
-        existing = gt.num_entities
-        expected = int(args.num_vectors)
-
-        if existing == expected:
-            logger.info(f"GT '{gt_name}' already populated ({existing:,} entities). Reusing; skipping GT insertion.")
-            return gt, gt_name, False
-        if existing == 0:
-            logger.info(f"GT '{gt_name}' exists but empty. Will populate it now.")
-            return gt, gt_name, True
-
-        # Anything else is suspicious / poisonous
-        raise SystemExit(
-            f"GT '{gt_name}' exists with {existing:,} entities, expected {expected:,}. "
-            f"Refusing to append/mix datasets. Use --force-gt to rebuild GT."
-        )
-
-    # Create/recreate GT
-    gt = create_collection(gt_name, args.dimension, gt_shards, vector_dtype, force=True if args.force_gt else False)
-    if gt is None:
-        return None, None, False
-
-    gt_index = {"index_type": "FLAT", "metric_type": str(gt_metric).upper(), "params": {}}
-    if not create_index(gt, gt_index):
-        return None, None, False
-
-    # New GT needs population
-    return gt, gt_name, True
+        logger.error(f"Failed to create index: {str(e)}")
+        return False
 
 
 def main():
     args = parse_args()
 
+    # Connect to Milvus
     if not connect_to_milvus(args.host, args.port):
+        logger.error("Failed to connect to Milvus.")
         return 1
 
-    # Deterministic generation
-    np.random.seed(args.seed)
+    logger.debug(f'Determining datatype for vector representation.')
+    # Determine vector data type
+    try:
+        # Check if FLOAT16 is available in newer versions of pymilvus
+        if hasattr(DataType, 'FLOAT16'):
+            logger.debug(f'Using FLOAT16 data type for vector representation.")')
+            vector_dtype = DataType.FLOAT16 if args.vector_dtype == 'float16' else DataType.FLOAT_VECTOR
+        else:
+            # Fall back to supported data types
+            logger.warning("FLOAT16 data type not available in this version of pymilvus. Using FLOAT_VECTOR instead.")
+            vector_dtype = DataType.FLOAT_VECTOR
+    except Exception as e:
+        logger.warning(f"Error determining vector data type: {str(e)}. Using FLOAT_VECTOR as default.")
+        vector_dtype = DataType.FLOAT_VECTOR
 
-    vector_dtype = DataType.FLOAT_VECTOR
-
-    # Create / reuse main collection
-    main_col = create_collection(args.collection_name, args.dimension, args.num_shards, vector_dtype, force=args.force)
-    if main_col is None:
-        return 1
-
-    # Create main index
-    index_params = {"index_type": args.index_type, "metric_type": str(args.metric_type).upper(), "params": {}}
-    if args.index_type == "HNSW":
-        index_params["params"] = {"M": args.M, "efConstruction": args.ef_construction}
-    elif args.index_type == "DISKANN":
-        index_params["params"] = {"max_degree": args.max_degree, "search_list_size": args.search_list_size}
-    elif args.index_type == "AISAQ":
-        index_params["params"] = {"inline_pq": args.inline_pq, "max_degree": args.max_degree,
-                                  "search_list_size": args.search_list_size}
-    else:
-        logger.error(f"Unsupported index_type: {args.index_type}")
-        return 1
-
-    if not create_index(main_col, index_params):
-        return 1
-
-    # Create/reuse GT (FLAT) if requested
-    gt_col, gt_name, gt_should_insert = ensure_gt_collection(args, vector_dtype)
-    if args.create_gt and gt_col is None:
-        logger.error("Requested --create-gt but failed to create/reuse GT collection.")
-        return 1
-
-    if gt_col is not None:
-        logger.info(f"Using GT collection: {gt_name} (gt_should_insert={gt_should_insert})")
-
-    # Determine if we should normalize vectors based on metric type
-    normalize_vectors = str(args.metric_type).upper() == "COSINE"
-    if normalize_vectors:
-        logger.info("Vector normalization enabled (COSINE metric)")
-    else:
-        logger.info(f"Vector normalization disabled ({args.metric_type} metric)")
-
-    # Generate + insert in chunks
-    total_vectors = args.num_vectors
-    remaining = total_vectors
-    global_offset = 0
-    chunk_idx = 0
-
-    logger.info(
-        f"Generating+inserting {total_vectors:,} vectors (dim={args.dimension}, dist={args.distribution}, seed={args.seed})"
+    # Create collection
+    collection = create_collection(
+        collection_name=args.collection_name,
+        dim=args.dimension,
+        num_shards=args.num_shards,
+        vector_dtype=vector_dtype,
+        force=args.force
     )
 
-    t_all = time.time()
-    while remaining > 0:
-        chunk_idx += 1
-        chunk_size = min(args.chunk_size, remaining)
-        logger.info(f"Chunk {chunk_idx}: generating {chunk_size:,} vectors")
-        t0 = time.time()
-        vecs = generate_vectors(chunk_size, args.dimension, args.distribution, normalize=normalize_vectors)
-        logger.info(f"Chunk {chunk_idx}: generated in {time.time() - t0:.2f}s")
-
-        logger.info(
-            f"Chunk {chunk_idx}: inserting into '{args.collection_name}'"
-            + (f" and GT '{gt_name}'" if (gt_col is not None and gt_should_insert) else "")
-            + f" (id_offset={global_offset})"
-        )
-        inserted = insert_data(main_col, vecs, args.batch_size, global_offset, gt_col, gt_should_insert)
-        global_offset += inserted
-        remaining -= chunk_size
-
-    logger.info(f"All chunks inserted in {time.time() - t_all:.2f}s")
-
-    flush_collection(main_col)
-    if gt_col is not None and gt_should_insert:
-        flush_collection(gt_col)
-    
-    # Verify collections are loaded and ready
-    logger.info(f"Loading collection '{args.collection_name}' into memory...")
-    try:
-        main_col.load()
-        logger.info(f"Collection '{args.collection_name}' loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load collection '{args.collection_name}': {e}")
+    if collection is None:
         return 1
-    
-    if gt_col is not None:
-        logger.info(f"Loading GT collection '{gt_name}' into memory...")
-        try:
-            gt_col.load()
-            logger.info(f"GT collection '{gt_name}' loaded successfully")
-        except Exception as e:
-            logger.error(f"Failed to load GT collection '{gt_name}': {e}")
-            return 1
 
-    # Monitor index build progress
-    logger.info(f"Monitoring index build for '{args.collection_name}' every {args.monitor_interval}s (this may take a while)")
+    # Create index with updated parameters
+    index_params = {
+        "index_type": args.index_type,
+        "metric_type": args.metric_type,
+        "params": {}
+    }
+
+    # Update only the parameters based on index_type
+    if args.index_type == "HNSW":
+        index_params["params"] = {
+            "M": args.M,
+            "efConstruction": args.ef_construction
+        }
+    elif args.index_type == "DISKANN":
+        index_params["params"] = {
+            "MaxDegree": args.max_degree,
+            "SearchListSize": args.search_list_size
+        }
+    elif args.index_type == "AISAQ":
+        index_params["params"] = {
+            "inline_pq": args.inline_pq,
+            "max_degree": args.max_degree,
+            "search_list_size": args.search_list_size
+        }
+    else:
+        raise ValueError(f"Unsupported index_type: {args.index_type}")
+
+    logger.debug(f'Creating index. This should be immediate on an empty collection')
+    if not create_index(collection, index_params):
+        return 1
+
+    # Generate vectors
+    logger.info(
+        f"Generating {args.num_vectors} vectors with {args.dimension} dimensions using {args.distribution} distribution")
+    start_gen_time = time.time()
+    
+    # Split vector generation into chunks if num_vectors is large
+    if args.num_vectors > args.chunk_size:
+        logger.info(f"Large vector count detected. Generating in chunks of {args.chunk_size:,} vectors")
+        vectors = []
+        remaining = args.num_vectors
+        chunks_processed = 0
+        
+        while remaining > 0:
+            chunk_size = min(args.chunk_size, remaining)
+            logger.info(f"Generating chunk {chunks_processed+1}: {chunk_size:,} vectors")
+            chunk_start = time.time()
+            chunk_vectors = generate_vectors(chunk_size, args.dimension, args.distribution)
+            chunk_time = time.time() - chunk_start
+
+            logger.info(f"Generated chunk {chunks_processed} ({chunk_size:,} vectors) in {chunk_time:.2f} seconds. "
+                        f"Progress: {(args.num_vectors - remaining):,}/{args.num_vectors:,} vectors "
+                        f"({(args.num_vectors - remaining) / args.num_vectors * 100:.1f}%)")
+
+            # Insert data
+            logger.info(f"Inserting {args.num_vectors} vectors into collection '{args.collection_name}'")
+            total_inserted, insert_time = insert_data(collection, chunk_vectors, args.batch_size)
+            logger.info(f"Inserted {total_inserted} vectors in {insert_time:.2f} seconds")
+
+            remaining -= chunk_size
+            chunks_processed += 1
+    else:
+        # For smaller vector counts, generate all at once
+        vectors = generate_vectors(args.num_vectors, args.dimension, args.distribution)
+        # Insert data
+        logger.info(f"Inserting {args.num_vectors} vectors into collection '{args.collection_name}'")
+        total_inserted, insert_time = insert_data(collection, vectors, args.batch_size)
+        logger.info(f"Inserted {total_inserted} vectors in {insert_time:.2f} seconds")
+
+    gen_time = time.time() - start_gen_time
+    logger.info(f"Generated all {args.num_vectors:,} vectors in {gen_time:.2f} seconds")
+
+    flush_collection(collection)
+
+    # Monitor index building
+    logger.info(f"Starting to monitor index building progress (checking every {args.monitor_interval} seconds)")
     monitor_progress(args.collection_name, args.monitor_interval, zero_threshold=10)
-    
-    # Verify final entity count
-    final_count = main_col.num_entities
-    if final_count != args.num_vectors:
-        logger.warning(f"⚠️  Expected {args.num_vectors:,} entities, but collection has {final_count:,}")
 
-    if gt_col is not None:
-        logger.info(f"Monitoring index build for GT '{gt_name}' every {args.monitor_interval}s")
-        monitor_progress(gt_name, args.monitor_interval, zero_threshold=10)
-
-    # Optional compaction
     if args.compact:
-        logger.info(f"Compacting '{args.collection_name}'")
-        main_col.compact()
+        logger.info(f"Compacting collection '{args.collection_name}'")
+        collection.compact()
         monitor_progress(args.collection_name, args.monitor_interval, zero_threshold=30)
+        logger.info(f"Collection '{args.collection_name}' compacted successfully.")
 
-        if gt_col is not None and gt_should_insert:
-            logger.info(f"Compacting GT '{gt_name}'")
-            gt_col.compact()
-            monitor_progress(gt_name, args.monitor_interval, zero_threshold=30)
-
-    logger.info("Load completed successfully.")
-    if gt_col is not None:
-        logger.info(f"GT ready: {gt_name} (reused={not gt_should_insert})")
+    # Summary
+    logger.info("Benchmark completed successfully!")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit(main())
