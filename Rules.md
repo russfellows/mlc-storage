@@ -8,17 +8,27 @@
     - [3.1. Training Sizing Options](#31-training-sizing-options)
     - [3.2. Training Generation Options](#32-training-ganeration-options)
     - [3.3. Training Run Options](#33-training-run-options)
+    - [3.4. Training Access Via POSIX API Options](#34-training-access-via-posix-api-options)
+    - [3.5. Training Access Via Object API Options](#35-training-access-via-object-API-options)
   - [4. Validating the Checkpointing Options](#4-validating-the-checkpointing-options)
-    - [4.1. Checkpointing Run Options](#41-checkpointing-run-options)
-    - [4.2. Storage System Must Be Simultaneously R/W or Remappable](#42-storage-system-must-be-simultaneously-rw-or-remappable)
+    - [4.1. Checkpointing Sizing Options](#41-checkpointing-sizing-options)
+    - [4.2. Checkpointing Generation Options](#42-checkpointing-generation-options)
+    - [4.3. Checkpointing Run Options](#43-checkpointing-run-options)
+    - [4.4. Checkpointing Access Via POSIX API Options](#44-checkpointing-access-via-posix-api-options)
+    - [4.5. Checkpointing Access Via Object API Options](#45-checkpointing-access-via-object-API-options)
+    - [4.6. Storage System Must Be Simultaneously R/W or Remappable](#46-storage-system-must-be-simultaneously-rw-or-remappable)
   - [5. Validating the Vector Database Options](#5-validating-the-vector-database-options)
     - [5.1. Vector Database Sizing Options](#51-vector-database-sizing-options)
     - [5.2. Vector Database Dataset Generation Options](#52-vector-database-generation-options)
     - [5.3. Vector Database Run Options](#53-vector-database-run-options)
+    - [5.4. Vector Database Access Via POSIX API Options](#54-vector-database-access-via-posix-api-options)
+    - [5.5. Vector Database Via Object API Options](#55-vector-database-access-via-object-API-options)
   - [6. Validating the KVCache Options](#6-validating-the-kvcache-options)
     - [6.1. KVCache Sizing Options](#61-kvcache-sizing-options)
     - [6.2. KVCache Generation Options](#62-kvcache-generation-options)
     - [6.3. KVCache Run Options](#63-kvcache-run-options)
+    - [6.4. KVCache Access Via POSIX API Options](#64-kvcache-access-via-posix-api-options)
+    - [6.5. KVCache Access Via Object API Options](#65-kvcache-access-via-object-API-options)
 
 # 1.  Introduction
 
@@ -344,21 +354,29 @@ root_folder (or any name you prefer)
 
 3.3.12. **mlpstorageFilesystemCheck** --  The `mlpstorage` command should do a "df" command on the directory pathname where the dataset is stored and another one on the directory pathname where the output logfiles are stored and record those values in the logfile.  The *submission validator* should find those entries in the run's logfile and verify that they are different filesystems.  We don't want the submitter to, by acccident, place the logfiles onto the storage system under test since that would skew the results.
 
+## 3.4.  Training Access Via POSIX API Options
+
+## 3.5.  Training Access Via Object API Options
+
 # 4.  Validating the Checkpointing Workloads
 
-## 4.1.  Checkpoint Run Options
+## 4.1.  Checkpointing Sizing Options
 
-4.1.1. **checkpointDataSizeRatio** -- The checkpoint data written per client node must be more than 3x the client node's memory capacity, otherwise the filesystem cache needs to be cleared between the write and read phases.
+## 4.2.  Checkpointing Generation Options
 
-4.1.2. **fsyncVerification** -- We must verify that all the benchmark workload configuration files have been set to do an fsync call at the end of each of the 10 checkpoint writes.
+## 4.3.  Checkpointing Run Options
 
-4.1.3. **modelConfigurationReq** -- The benchmark must be run with one of the four model configuration detailed below.
+4.3.1. **checkpointDataSizeRatio** -- The checkpoint data written per client node must be more than 3x the client node's memory capacity, otherwise the filesystem cache needs to be cleared between the write and read phases.
 
-4.1.4. **closedMpiProcesses** -- For CLOSED submissions, the number of MPI processes must be set to 8, 64, 512, and 1024 for the respective models.  (see table 2)
+4.3.2. **fsyncVerification** -- We must verify that all the benchmark workload configuration files have been set to do an fsync call at the end of each of the 10 checkpoint writes.
 
-4.1.5. **closedAcceleratorsPerHost** -- For CLOSED submissions, submitters may adjust the number of simulated accelerators **per host**, as long as each host uses more than 4 simulated accelerators and the total number of simulated accelerators (the total number of processes) matches the requirement.  (see table 2)
+4.3.3. **modelConfigurationReq** -- The benchmark must be run with one of the four model configuration detailed below.
 
-4.1.6. **aggregateAcceleratorMemory** -- The aggregate simulated accelerator memory across all nodes must be sufficient to accommodate the model’s checkpoint size.  That is, the GB of memory associated with the chosen accelerator (eg: H100) times the accelerator count must be equal to or greater than the total checkpoint size for that scale of checkpoint.  (see table 2)
+4.3.4. **closedMpiProcesses** -- For CLOSED submissions, the number of MPI processes must be set to 8, 64, 512, and 1024 for the respective models.  (see table 2)
+
+4.3.5. **closedAcceleratorsPerHost** -- For CLOSED submissions, submitters may adjust the number of simulated accelerators **per host**, as long as each host uses more than 4 simulated accelerators and the total number of simulated accelerators (the total number of processes) matches the requirement.  (see table 2)
+
+4.3.6. **aggregateAcceleratorMemory** -- The aggregate simulated accelerator memory across all nodes must be sufficient to accommodate the model’s checkpoint size.  That is, the GB of memory associated with the chosen accelerator (eg: H100) times the accelerator count must be equal to or greater than the total checkpoint size for that scale of checkpoint.  (see table 2)
 
 **Table 2 LLM models**
 
@@ -375,7 +393,7 @@ root_folder (or any name you prefer)
 | Checkpoint size        | 105 GB | 912 GB | 5.29 TB | 18 TB  |
 | Subset: 8-Process Size | 105 GB | 114 GB | 94 GB   | 161 GB |
 
-4.1.7. **closedCheckpointParameters** -- For CLOSED submissions of this benchmark, only a small number of parameters can be modified, and those parameters are listed in the table below.  Any other parameters being modified must generate a message and fail the validation.
+4.3.7. **closedCheckpointParameters** -- For CLOSED submissions of this benchmark, only a small number of parameters can be modified, and those parameters are listed in the table below.  Any other parameters being modified must generate a message and fail the validation.
 
 **Table: Checkpoint Workload Tunable Parameters for CLOSED**
 
@@ -383,7 +401,7 @@ root_folder (or any name you prefer)
 |----------------------------------|-------------------------------------------------------------|-----------------------|
 | checkpoint.checkpoint_folder     | The storage directory for writing and reading checkpoints   | ./checkpoints/<model> |
 
-4.1.8. **openSubmissionScaling** -- For OPEN submissions of this benchmark, the total number of processes may be increased in multiples of (TP×PP) to showcase the scalability of the storage solution.
+4.3.8. **openSubmissionScaling** -- For OPEN submissions of this benchmark, the total number of processes may be increased in multiples of (TP×PP) to showcase the scalability of the storage solution.
 
 **Table 3: Configuration parameters and their mutability in CLOSED and OPEN divisions**
 
@@ -397,21 +415,25 @@ root_folder (or any name you prefer)
 
 **NOTE: In the ``--ppn`` syntax above, the ``slotcount`` value means the number of processes per node to run.**
 
-4.1.9. **checkpointPathArgs** --  The arguments to `mlpstorage` that set the directory pathname where the checkpoints are written and read and the directory where the output logfiles are stored must both be set and must be set to different values.
+4.3.9. **checkpointPathArgs** --  The arguments to `mlpstorage` that set the directory pathname where the checkpoints are written and read and the directory where the output logfiles are stored must both be set and must be set to different values.
 
-4.1.10. **checkpointFilesystemCheck** --  The `mlpstorage` command should do a "df" command on the directory pathname where the checkpoints are written and read and another one on the directory pathname where the output logfiles are stored and record those values in the logfile.  The *submission validator* should find those entries in the run's logfile and verify that they are different filesystems.  We don't want the submitter to, by acccident, place the logfiles onto the storage system under test since that would skew the results.
+4.3.10. **checkpointFilesystemCheck** --  The `mlpstorage` command should do a "df" command on the directory pathname where the checkpoints are written and read and another one on the directory pathname where the output logfiles are stored and record those values in the logfile.  The *submission validator* should find those entries in the run's logfile and verify that they are different filesystems.  We don't want the submitter to, by acccident, place the logfiles onto the storage system under test since that would skew the results.
 
-4.1.11. **subsetRunValidation** --  The `mlpstorage` command must accept a parameter telling it that this is a *subset* run and add that info to the output log file. The *submission validator* must flag an error if the `subset` argument is given but the total number of accelerators is not exactly 8, or the model is "8B".
+4.3.11. **subsetRunValidation** --  The `mlpstorage` command must accept a parameter telling it that this is a *subset* run and add that info to the output log file. The *submission validator* must flag an error if the `subset` argument is given but the total number of accelerators is not exactly 8, or the model is "8B".
 
-## 4.2.  Storage System Must Be Simultaneously R/W or _Remappable_
+## 4.4. Checkpointing Access Via POSIX API Options
 
-4.2.1. **cacheFlushValidation** -- If a submitter needs to issue a cache flush operation between the write phase and the read phase of a checkpoint benchmark run, then the validator must check that ``--num-checkpoints-read=0`` was set during the write phase, that there was a short pause of up to 30 seconds maximum, then the write phase was started with ``--num-checkpoints-write=0`` set.
+## 4.5. Checkpointing Access Via Object API Options
 
-4.2.2. **totalTestDuration** -- The validator must verify that the total test duration starts from the timestamp of the first checkpoint written and ends at the ending timestamp of the last checkpoint read, notably including the "remapping" time.
+## 4.6.  Storage System Must Be Simultaneously R/W or _Remappable_
 
-4.2.3. **remappingTimeReporting** -- For a _remapping_ solution, the time duration between the checkpoint being completed and the earliest time that that checkpoint could be read by a different host node must be reported in the `SystemDescription.yaml` file.
+4.6.1. **cacheFlushValidation** -- If a submitter needs to issue a cache flush operation between the write phase and the read phase of a checkpoint benchmark run, then the validator must check that ``--num-checkpoints-read=0`` was set during the write phase, that there was a short pause of up to 30 seconds maximum, then the write phase was started with ``--num-checkpoints-write=0`` set.
 
-4.2.4. **simultaneousRwSupport** -- The system_configuration.yaml document must list whether the solution support simultaneous reads and/or writes as such:
+4.6.2. **totalTestDuration** -- The validator must verify that the total test duration starts from the timestamp of the first checkpoint written and ends at the ending timestamp of the last checkpoint read, notably including the "remapping" time.
+
+4.6.3. **remappingTimeReporting** -- For a _remapping_ solution, the time duration between the checkpoint being completed and the earliest time that that checkpoint could be read by a different host node must be reported in the `SystemDescription.yaml` file.
+
+4.6.4. **simultaneousRwSupport** -- The system_configuration.yaml document must list whether the solution support simultaneous reads and/or writes as such:
 ```
 System:
   shared_capabilities:
@@ -420,27 +442,26 @@ System:
     simultaneous_read__support: True    # Are simultaneous reads by multiple hosts supported in the submitted configuration
 ```
 
-  - [5. Validating the Vector Database Options](#5-validating-the-vector-database-options)
-    - [5.1. Vector Database Sizing Options](#51-vector-database-sizing-options)
-    - [5.2. Vector Database Dataset Generation Options](#52-vector-database-generation-options)
-    - [5.3. Vector Database Run Options](#53-vector-database-run-options)
-  - [6. Validating the KVCache Options](#6-kvcache-the-checkpointing-options)
-    - [6.1. KVCache Dataset Generation Options](#51-kvcache-dataset-generation-options)
-    - [6.2. KVCache Run Options](#61-kvcache-run-options)
+# 5.  Validating the Vector Database Options
 
+## 5.1.  Vector Database Sizing Options
 
-# 5. Validating the Vector Database Options
+## 5.2.  Vector Database Generation Options
 
-## 5.1. Vector Database Sizing Options
+## 5.3.  Vector Database Run Options
 
-## 5.2. Vector Database Generation Options
+## 5.4.  Vector Database Access Via POSIX API Options
 
-## 5.3. Vector Database Run Options
+## 5.5.  Vector Database Access Via Object API Options
 
-# 6. Validating the KVCache Options
+# 6.  Validating the KVCache Options
 
-## 6.1. KVCache Sizing Options
+## 6.1.  KVCache Sizing Options
 
-## 6.2. KVCache Generation Options
+## 6.2.  KVCache Generation Options
 
-## 6.3. KVCache Run Options
+## 6.3.  KVCache Run Options
+
+## 6.4.  KVCache Access Via POSIX API Options
+
+## 6.5.  KVCache Access Via Object API Options
