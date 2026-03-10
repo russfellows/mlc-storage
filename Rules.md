@@ -384,11 +384,7 @@ root_folder (or any name you prefer)
 
 4.3.3. **checkpointModelConfigurationReq** -- The benchmark must be run with one of the four model configuration detailed below.
 
-4.3.4. **checkpointClosedMpiProcesses** -- For CLOSED submissions, the number of MPI processes must be set to 8, 64, 512, and 1024 for the respective models.  (see table 2)
-
-4.3.5. **checkpointClosedAcceleratorsPerHost** -- For CLOSED submissions, submitters may adjust the number of simulated accelerators **per host**, as long as each host uses more than 4 simulated accelerators and the total number of simulated accelerators (the total number of processes) matches the requirement.  (see table 2)
-
-4.3.6. **checkpointAggregateAcceleratorMemory** -- The aggregate simulated accelerator memory across all nodes must be sufficient to accommodate the model’s checkpoint size.  That is, the GB of memory associated with the chosen accelerator (eg: H100) times the accelerator count must be equal to or greater than the total checkpoint size for that scale of checkpoint.  (see table 2)
+4.3.4. **checkpointAggregateAcceleratorMemory** -- The aggregate simulated accelerator memory across all nodes must be sufficient to accommodate the model’s checkpoint size.  That is, the GB of memory associated with the chosen accelerator (eg: H100) times the accelerator count must be equal to or greater than the total checkpoint size for that scale of checkpoint.  (see table 2)
 
 **Table 2 LLM models**
 
@@ -405,7 +401,23 @@ root_folder (or any name you prefer)
 | Checkpoint size        | 105 GB | 912 GB | 5.29 TB | 18 TB  |
 | Subset: 8-Process Size | 105 GB | 114 GB | 94 GB   | 161 GB |
 
-4.3.7. **checkpointClosedCheckpointParameters** -- For CLOSED submissions of this benchmark, only a small number of parameters can be modified, and those parameters are listed in the table below.  Any other parameters being modified must generate a message and fail the validation.
+4.3.5. **checkpointSubsetRunValidation** --  The `mlpstorage` command must accept a parameter telling it that this is a *subset* run and add that info to the output log file. The *submission validator* must flag an error if the `subset` argument is given but the total number of accelerators is not exactly 8, or the model is "8B".
+
+## 4.4. Checkpointing Access Via POSIX API Options
+
+4.4.1. **checkpointPathArgs** --  The arguments to `mlpstorage` that set the directory pathname where the checkpoints are written and read and the directory where the output logfiles are stored must both be set and must be set to different values.
+
+4.4.2. **checkpointFilesystemCheck** --  The `mlpstorage` command should do a "df" command on the directory pathname where the checkpoints are written and read and another one on the directory pathname where the output logfiles are stored and record those values in the logfile.  The *submission validator* should find those entries in the run's logfile and verify that they are different filesystems.  We don't want the submitter to, by acccident, place the logfiles onto the storage system under test since that would skew the results.
+
+## 4.5. Checkpointing Access Via Object API Options
+
+## 4.6.  Checkpointing OPEN versus CLOSED Options
+
+4.6.1. **checkpointClosedMpiProcesses** -- For CLOSED submissions, the number of MPI processes must be set to 8, 64, 512, and 1024 for the respective models.  (see table 2)
+
+4.6.2. **checkpointClosedAcceleratorsPerHost** -- For CLOSED submissions, submitters may adjust the number of simulated accelerators **per host**, as long as each host uses more than 4 simulated accelerators and the total number of simulated accelerators (the total number of processes) matches the requirement.  (see table 2)
+
+4.6.3. **checkpointClosedCheckpointParameters** -- For CLOSED submissions of this benchmark, only a small number of parameters can be modified, and those parameters are listed in the table below.  Any other parameters being modified must generate a message and fail the validation.
 
 **Table: Checkpoint Workload Tunable Parameters for CLOSED**
 
@@ -413,7 +425,7 @@ root_folder (or any name you prefer)
 |----------------------------------|-------------------------------------------------------------|-----------------------|
 | checkpoint.checkpoint_folder     | The storage directory for writing and reading checkpoints   | ./checkpoints/<model> |
 
-4.3.8. **checkpointOpenSubmissionScaling** -- For OPEN submissions of this benchmark, the total number of processes may be increased in multiples of (TP×PP) to showcase the scalability of the storage solution.
+4.6.4. **checkpointOpenSubmissionScaling** -- For OPEN submissions of this benchmark, the total number of processes may be increased in multiples of (TP×PP) to showcase the scalability of the storage solution.
 
 **Table 3: Configuration parameters and their mutability in CLOSED and OPEN divisions**
 
@@ -426,18 +438,6 @@ root_folder (or any name you prefer)
 | --num-checkpoints-read             | Number of write checkpoints                  | 10 or 0**                                     | NO                   | NO                 |
 
 **NOTE: In the ``--ppn`` syntax above, the ``slotcount`` value means the number of processes per node to run.**
-
-4.3.11. **checkpointSubsetRunValidation** --  The `mlpstorage` command must accept a parameter telling it that this is a *subset* run and add that info to the output log file. The *submission validator* must flag an error if the `subset` argument is given but the total number of accelerators is not exactly 8, or the model is "8B".
-
-## 4.4. Checkpointing Access Via POSIX API Options
-
-4.4.1. **checkpointPathArgs** --  The arguments to `mlpstorage` that set the directory pathname where the checkpoints are written and read and the directory where the output logfiles are stored must both be set and must be set to different values.
-
-4.4.2. **checkpointFilesystemCheck** --  The `mlpstorage` command should do a "df" command on the directory pathname where the checkpoints are written and read and another one on the directory pathname where the output logfiles are stored and record those values in the logfile.  The *submission validator* should find those entries in the run's logfile and verify that they are different filesystems.  We don't want the submitter to, by acccident, place the logfiles onto the storage system under test since that would skew the results.
-
-## 4.5. Checkpointing Access Via Object API Options
-
-## 4.6.  Checkpointing OPEN versus CLOSED Options
 
 ## 4.7.  Storage System Must Be Simultaneously R/W or _Remappable_
 
