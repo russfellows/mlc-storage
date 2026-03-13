@@ -6,14 +6,14 @@ This tool benchmarks and compares vector database performance, with current supp
 
 ### Using Docker (recommended)
 ```bash
-git clone -b TF_VDBBench https://github.com/mlcommons/storage.git
+git clone https://github.com/mlcommons/storage.git
 cd storage/vdb_benchmark
 docker compose up -d   # docker-compose v2; use docker-compose up for v1
 ```
 
 ### Manual Installation
 ```bash
-git clone -b TF_VDBBench https://github.com/mlcommons/storage.git
+git clone https://github.com/mlcommons/storage.git
 cd storage/vdb_benchmark
 pip3 install ./
 ```
