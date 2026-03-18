@@ -37,3 +37,8 @@ Thumbs.db
 .vscode/
 CLAUDE.md
 .roomodes
+LOCAL_BRANCH_NOTES.md
+
+# Credential / environment files — NEVER commit these
+.env
+env-fast
