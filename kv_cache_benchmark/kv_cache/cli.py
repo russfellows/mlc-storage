@@ -64,10 +64,7 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
         'Model': args.model,
         'Num Users': args.num_users,
         'Duration (s)': args.duration,
-        'GPU Memory per Card (GB)': args.gpu_mem_gb,
-        'Num GPUs': args.num_gpus,
-        'Tensor Parallel': args.tensor_parallel,
-        'Total GPU Memory (GB)': args.gpu_mem_gb * args.num_gpus,
+        'GPU Memory (GB)': args.gpu_mem_gb,
         'CPU Memory (GB)': args.cpu_mem_gb,
         'Generation Mode': args.generation_mode,
         'Performance Profile': args.performance_profile,
@@ -242,29 +239,9 @@ def main():
     parser.add_argument('--duration', type=int, default=60,
                         help='The duration of the benchmark in seconds.')
     parser.add_argument('--gpu-mem-gb', type=float, default=16,
-                        help='Per-GPU VRAM to allocate for the KV cache tier in GB. '
-                             'When --num-gpus > 1 the effective GPU pool = num_gpus × gpu-mem-gb.')
-    parser.add_argument('--num-gpus', type=int, default=1,
-                        help='Number of GPUs in the tensor-parallel group. '
-                             'Sets total GPU tier = num_gpus × gpu-mem-gb. '
-                             'Example: --num-gpus 8 --gpu-mem-gb 141 models 8×H200.')
-    parser.add_argument('--tensor-parallel', type=int, default=1,
-                        help='Tensor-parallel degree (TP). '
-                             'Each GPU rank stores 1/TP of each KV cache entry, '
-                             'so per-rank I/O object sizes are divided by TP. '
-                             'Must be >= 1 and <= --num-gpus. '
-                             'Example: --tensor-parallel 8 models TP=8 for Llama 70B on 8×H200.')
-    parser.add_argument('--gpu-bandwidth-gbs', type=float, default=64.0,
-                        help='Simulated GPU host↔device bandwidth in GB/s used to model '
-                             'GPU tier read/write latency. Default 64.0 models PCIe 5.0 x16. '
-                             'Use ~3350 for intra-GPU HBM3 (H100/H200) access patterns.')
-    parser.add_argument('--prefetch-depth', type=int, default=8,
-                        help='Number of 256 MB blocks to pre-generate in the background producer '
-                             'before storage writes begin. 0 disables the producer and '
-                             'generates data inline. Default 8 = 2 GB footprint. '
-                             'Increase if storage is faster than 20 GB/s. Set 0 to disable.')
+                        help='The amount of GPU memory (VRAM) to allocate for the cache in GB.')
     parser.add_argument('--cpu-mem-gb', type=float, default=32,
-                        help='Total CPU DRAM to allocate for the KV cache spill tier in GB.')
+                        help='The amount of CPU memory (RAM) to allocate for the cache in GB.')
     parser.add_argument('--cache-dir', type=str, default=None,
                         help='The directory to use for the NVMe cache tier.')
     parser.add_argument('--generation-mode', type=str, default='realistic', choices=[g.value for g in GenerationMode],
@@ -322,14 +299,6 @@ def main():
                         help='Simulate disaggregated prefill node (write-heavy, no decode reads).')
     parser.add_argument('--decode-only', action='store_true',
                         help='Simulate disaggregated decode node (read-heavy, assumes KV cache exists).')
-    parser.add_argument('--io-trace-log', type=str, default=None,
-                        help=(
-                            'Path for the I/O trace CSV output file. '
-                            'When set, activates trace mode: no real GPU/CPU/NVMe I/O is performed. '
-                            'Instead every KV cache operation is logged as a row: '
-                            'Timestamp,Operation,Object_Size_Bytes,Tier (Tier-0=GPU, Tier-1=CPU, Tier-2=NVMe). '
-                            'The resulting trace can be replayed by an external storage benchmark tool.'
-                        ))
 
     args = parser.parse_args()
 
@@ -344,9 +313,6 @@ def main():
     )
 
     args = validate_args(args)
-
-    if args.io_trace_log:
-        logger.info(f"Trace mode active: I/O operations will be logged to {args.io_trace_log} (no real hardware I/O)")
 
     if args.config:
         config = ConfigLoader(args.config)
@@ -383,8 +349,6 @@ def main():
         model_config=model_config,
         num_users=args.num_users,
         gpu_memory_gb=args.gpu_mem_gb,
-        num_gpus=args.num_gpus,
-        tensor_parallel=args.tensor_parallel,
         cpu_memory_gb=args.cpu_mem_gb,
         duration_seconds=args.duration,
         cache_dir=args.cache_dir,
@@ -413,10 +377,7 @@ def main():
         trace_speedup=args.trace_speedup,
         replay_cycles=args.replay_cycles,
         prefill_only=args.prefill_only,
-        decode_only=args.decode_only,
-        io_trace_log=args.io_trace_log,
-        gpu_bandwidth_gb_s=args.gpu_bandwidth_gbs,
-        prefetch_depth=args.prefetch_depth,
+        decode_only=args.decode_only
     )
 
     results = benchmark.run()

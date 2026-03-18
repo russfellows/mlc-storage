@@ -1131,14 +1131,14 @@ Real LLM inference has GPU compute time between I/O operations. Without simulati
 
 | Mode | Behavior | Use Case |
 |------|----------|----------|
-| `none` | No sleep | Pure storage benchmark |
-| `realistic` | Sleep proportional to token generation | Production simulation |
-| `aggressive` | Minimal sleep | Stress testing |
+| `none` | No sleep (0 ms/token) | Pure storage benchmark |
+| `fast` | Minimal sleep (2 ms/token) | Stress testing with light backpressure |
+| `realistic` | Sleep proportional to token generation (30 ms/token) | Production simulation |
 
 **Realistic Mode Calculation:**
 ```python
-# Based on NVIDIA A100 inference speed (~50 tok/s)
-sleep_time = generate_tokens * 0.02  # 20ms per token
+# Based on NVIDIA A100 inference speed (~33 tok/s)
+sleep_time = generate_tokens * 0.030  # 30ms per token
 time.sleep(sleep_time)
 ```
 
@@ -1156,7 +1156,7 @@ Three Quality of Service levels model real-world priority:
 | **RESPONSIVE** | Near real-time | 100 ms | 200 ms | 2 |
 | **BATCH** | Offline jobs | 1,000 ms | 5,000 ms | 1 (Lowest) |
 
-**Default Distribution:** 60% Interactive, 30% Responsive, 10% Batch
+**Default Distribution:** 15% Interactive, 35% Responsive, 50% Batch
 
 **Priority Queue:** Higher-priority requests processed first:
 ```
@@ -1188,13 +1188,13 @@ Many requests share common system prompts. Instead of redundantly storing identi
 **Three Common Prompts:**
 ```python
 COMMON_SYSTEM_PROMPTS = [
-    "You are a helpful, harmless, and honest AI assistant.",
-    "You are a coding assistant. Provide clear, working code examples.",
-    "You are a creative writing assistant. Be imaginative and engaging.",
+    "You are a helpful assistant.",
+    "You are an AI assistant helping with coding tasks.",
+    "You are a professional writing assistant.",
 ]
 ```
 
-**Cache Key:** `kv_system_{md5_hash[:8]}`
+**Cache Key:** `kv_system_{sha256_hash[:16]}`
 
 **Lifecycle:**
 ```

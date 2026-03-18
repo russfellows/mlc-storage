@@ -1,77 +1,39 @@
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-build/
-develop-eggs/
+
+# Distribution / packaging
 dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+build/
 *.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# Virtual Environments
-.venv/
+# Virtual environments
 venv/
-ENV/
+.venv/
 env/
-.env
-env-*
 
-# uv
-.uv/
-uv.lock
-
-# IDEs
-.vscode/
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-*~
 
-# Testing
+# Test artifacts
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
+*.html
 
-# DLIO outputs
-hydra_out/
-results/
-*.log
-*.history
-
-# MLPerf Storage outputs
-results_dir/
-mlperf.history
-
-# Temporary files
-*.tmp
-.tmp/
-*.bak
-*.backup
-*.OLD_*/
-
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Test artifacts
-hydra_log/
-minio_test/
-Test-Backup/
 
-# Dependencies (installed via pip)
-dlio_benchmark/
+# Coding Agents
+.agent/
+.roo/
+.vscode/
+CLAUDE.md
+.roomodes
