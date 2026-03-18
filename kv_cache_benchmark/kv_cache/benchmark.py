@@ -34,7 +34,6 @@ from kv_cache.monitoring import StorageMonitor, WorkloadAutoscaler, QoSMonitor
 from kv_cache.workload import (
     ValidationEngine, UserSimulator, ShareGPTDatasetLoader,
 )
-from kv_cache.tracer import IOTracer
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,6 @@ class IntegratedBenchmark:
                  gpu_memory_gb: float,
                  cpu_memory_gb: float,
                  duration_seconds: int,
-                 num_gpus: int = 1,
-                 tensor_parallel: int = 1,
                  cache_dir: str = None,
                  enable_autoscaling: bool = False,
                  autoscaler_mode: str = 'qos',
@@ -76,19 +73,12 @@ class IntegratedBenchmark:
                  trace_speedup: float = 1.0,
                  replay_cycles: int = 0,
                  prefill_only: bool = False,
-                 decode_only: bool = False,
-                 io_trace_log: Optional[str] = None,
-                 gpu_bandwidth_gb_s: float = 64.0,
-                 prefetch_depth: int = 8):
+                 decode_only: bool = False):
 
         self.model_config = model_config
         self.num_users = num_users
         self.initial_users = num_users
         self.duration = duration_seconds
-        self.num_gpus = max(1, num_gpus)
-        self.tensor_parallel = max(1, tensor_parallel)
-        self.gpu_memory_gb_per_card = gpu_memory_gb
-        self.total_gpu_memory_gb = gpu_memory_gb * self.num_gpus
         self.enable_autoscaling = enable_autoscaling
         self.enable_multi_turn = enable_multi_turn
         self.generation_mode = generation_mode
@@ -113,14 +103,6 @@ class IntegratedBenchmark:
         self.replay_cycles = replay_cycles
         self.prefill_only = prefill_only
         self.decode_only = decode_only
-        self.gpu_bandwidth_gb_s = gpu_bandwidth_gb_s
-        self.prefetch_depth = prefetch_depth
-
-        # Trace mode: IOTracer is created here and closed at the end of run()
-        if io_trace_log:
-            self.io_tracer: Optional[IOTracer] = IOTracer(io_trace_log)
-        else:
-            self.io_tracer = None
         self.burst_trace_files: List[str] = []
         self.sharegpt_loader: Optional[ShareGPTDatasetLoader] = None
 
@@ -140,17 +122,13 @@ class IntegratedBenchmark:
         # Initialize components
         self.cache = MultiTierCache(
             model_config=model_config,
-            gpu_memory_gb=self.total_gpu_memory_gb,
+            gpu_memory_gb=gpu_memory_gb,
             cpu_memory_gb=cpu_memory_gb,
             cache_dir=cache_dir,
             performance_profile=performance_profile,
             seed=seed,
             max_concurrent_allocs=max_concurrent_allocs,
-            storage_capacity_gb=storage_capacity_gb,
-            tensor_parallel=self.tensor_parallel,
-            io_tracer=self.io_tracer,
-            gpu_bandwidth_gb_s=self.gpu_bandwidth_gb_s,
-            prefetch_depth=self.prefetch_depth,
+            storage_capacity_gb=storage_capacity_gb
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
@@ -694,11 +672,6 @@ class IntegratedBenchmark:
         """The main entry point to start the benchmark execution."""
         print(f"\nIntegrated Multi-User KV Cache Benchmark - MLPerf Edition")
         print(f"Model: {self.model_config.name}")
-        if self.num_gpus > 1 or self.tensor_parallel > 1:
-            print(f"System: {self.num_gpus}× {self.gpu_memory_gb_per_card:.0f} GB GPU  "
-                  f"(total {self.total_gpu_memory_gb:.0f} GB HBM)  │  TP={self.tensor_parallel}")
-        else:
-            print(f"GPU Memory: {self.total_gpu_memory_gb:.0f} GB")
         print(f"Users: {self.num_users}")
         print(f"Duration: {self.duration}s")
         if self.seed is not None:
@@ -714,9 +687,6 @@ class IntegratedBenchmark:
             print(f"    - Mode: {self.autoscaler.mode}")
         print(f"  - QoS Support: Enabled (Interactive/Responsive/Batch)")
         print(f"  - Trace-Driven (BurstGPT): {'Enabled' if self.use_burst_trace else 'Disabled'}")
-        if self.io_tracer is not None:
-            print(f"  - I/O TRACE MODE: ACTIVE — writing trace to {self.io_tracer.path}")
-            print(f"    (No real GPU/CPU/NVMe I/O will be performed)")
         if self.use_burst_trace:
             print(f"    Trace files: {len(self.burst_trace_files)}")
             print(f"    Trace speedup: {self.trace_speedup}x ({'no delay' if self.trace_speedup == 0 else 'real-time' if self.trace_speedup == 1.0 else f'{self.trace_speedup}x faster'})")
@@ -730,14 +700,10 @@ class IntegratedBenchmark:
         if not self.use_burst_trace and not self.use_dataset:
             users = UserSimulator.generate_mixed_users(self.num_users)
             context_lengths = [u.context_length for u in users]
-            bytes_per_token_per_rank = self.model_config.kv_cache_size_per_token / self.tensor_parallel
-            tp_note = f" per TP rank (full={bytes_per_token_per_rank * self.tensor_parallel / 1024**2 * min(context_lengths):.2f} MB)" if self.tensor_parallel > 1 else ""
             print(f"\nUser Context Length Distribution:")
-            print(f"  Min: {min(context_lengths)} tokens ({min(context_lengths) * bytes_per_token_per_rank / 1024**2:.2f} MB{tp_note})")
-            print(f"  Max: {max(context_lengths)} tokens ({max(context_lengths) * bytes_per_token_per_rank / 1024**2:.2f} MB)")
-            print(f"  Mean: {np.mean(context_lengths):.0f} tokens ({np.mean(context_lengths) * bytes_per_token_per_rank / 1024**2:.2f} MB)")
-            if self.tensor_parallel > 1:
-                print(f"  (sizes shown are per-rank 1/{self.tensor_parallel} shard; TP={self.tensor_parallel})")
+            print(f"  Min: {min(context_lengths)} tokens ({min(context_lengths) * self.model_config.kv_cache_size_per_token / 1024**2:.2f} MB)")
+            print(f"  Max: {max(context_lengths)} tokens ({max(context_lengths) * self.model_config.kv_cache_size_per_token / 1024**2:.2f} MB)")
+            print(f"  Mean: {np.mean(context_lengths):.0f} tokens ({np.mean(context_lengths) * self.model_config.kv_cache_size_per_token / 1024**2:.2f} MB)")
 
             qos_dist = {level: sum(1 for u in users if u.qos_level == level) for level in QoSLevel}
             print(f"\nQoS Distribution:")
@@ -802,10 +768,6 @@ class IntegratedBenchmark:
         if self.validator:
             self.results['validation'] = self.validator.validate_benchmark(self.results)
 
-        if self.io_tracer is not None:
-            self.io_tracer.close()
-        self.cache.shutdown()
-
         return self.results
 
     def _run_preconditioning(self):
@@ -830,6 +792,7 @@ class IntegratedBenchmark:
         state = {'written_bytes': 0, 'seq': 0, 'last_report': 0}
 
         def worker():
+            consecutive_failures = 0
             while True:
                 with lock:
                     if state['written_bytes'] >= target_bytes:
@@ -841,6 +804,7 @@ class IntegratedBenchmark:
                 success, tier, latency = self.cache.allocate_cache(key, tokens_per_entry)
 
                 if success:
+                    consecutive_failures = 0
                     entry = self.cache.cache_entries.get(key)
                     if entry:
                         with lock:
@@ -849,6 +813,13 @@ class IntegratedBenchmark:
                             if gb_written - state['last_report'] >= 10:
                                 print(f"  Preconditioning progress: {gb_written:.1f} / {target_gb:.1f} GB")
                                 state['last_report'] = gb_written
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures > 50:
+                        with lock:
+                            print(f"  WARNING: Preconditioning stalled at {state['written_bytes']/1024**3:.1f} GB — filesystem full. Continuing.")
+                        return
+                    time.sleep(0.1)
 
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = [executor.submit(worker) for _ in range(num_threads)]
@@ -998,6 +969,38 @@ class IntegratedBenchmark:
         print("BENCHMARK RESULTS - MLPerf KV Cache Storage Benchmark")
         print(f"Generation Mode: {self.generation_mode.value} ({self.ms_per_token:.1f}ms/token)")
         print("=" * 80)
+
+        # ── KV Block Size Context ──────────────────────────────────────
+        # Raised on 2026-03-10 KV Cache TF call: latencies are per entire
+        # KV cache block, not per token or per 4 KB page.  Block sizes
+        # depend on model architecture and sequence length; they can range
+        # from tens of MB to multiple GB.
+        bpt = self.model_config.kv_cache_size_per_token
+        print(f"\nIMPORTANT: All storage latencies below are measured per KV cache BLOCK,")
+        print(f"not per token or per disk page.  Each block holds the full KV state for")
+        print(f"one request (all layers, all heads, full sequence length).")
+        print(f"  Model KV bytes/token: {bpt:,} bytes ({bpt/1024:.1f} KB)")
+
+        # Compute entry size distribution from live cache entries
+        with self.cache.metadata_lock:
+            entry_sizes = [e['size'] for e in self.cache.cache_entries.values()]
+        if entry_sizes:
+            sizes = np.array(entry_sizes)
+            print(f"  Entries in cache: {len(sizes)}")
+            print(f"  Block size min:   {np.min(sizes)/1024**2:.1f} MB")
+            print(f"  Block size mean:  {np.mean(sizes)/1024**2:.1f} MB")
+            print(f"  Block size P95:   {np.percentile(sizes, 95)/1024**2:.1f} MB")
+            print(f"  Block size max:   {np.max(sizes)/1024**2:.1f} MB")
+        else:
+            # Fall back to average from aggregate stats
+            total_write_bytes = summary.get('cache_stats', {}).get('total_write_bytes', 0)
+            write_ops = summary.get('cache_stats', {}).get('write_iops', 0)
+            if write_ops > 0:
+                avg_mb = (total_write_bytes / write_ops) / 1024**2
+                print(f"  Avg block size:   {avg_mb:.1f} MB (from {write_ops} writes)")
+
+        print(f"  A 200 MB block at 1 GB/s NVMe read = ~200 ms device latency.")
+        print(f"  Compare latencies against block sizes, not against 4 KB page I/O.\n")
 
         PASS_SYMBOL = "[OK]"
         FAIL_SYMBOL = "[X]"
