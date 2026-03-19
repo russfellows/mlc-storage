@@ -2,7 +2,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 # Load .env — env vars already in the shell take precedence
@@ -83,6 +83,8 @@ timeout 300 mlpstorage training run \
   --num-accelerators=1 \
   --accelerator-type=a100 \
   --client-host-memory-in-gb=4 \
+  --data-dir "${DATA_DIR}/unet3d" \
+  --skip-validation \
   --params train.epochs=5 \
     dataset.num_files_train=${NUM_FILES} \
     dataset.data_folder="${DATA_DIR}/unet3d" \

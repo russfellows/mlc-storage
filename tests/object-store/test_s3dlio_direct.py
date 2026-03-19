@@ -107,8 +107,12 @@ def run_tests(bucket: str):
         sys.exit(1)
 
     # ── Test 2: MultipartUploadWriter ───────────────────────────────────────
+    # NOTE: this test exercises the MultipartUploadWriter API directly to verify
+    # the three-phase multipart protocol works.  In real workloads, objects below
+    # 32 MiB should use s3dlio.put_bytes() (single PUT) — not MultipartUploadWriter
+    # — to avoid the unnecessary create/upload/complete round-trip overhead.
     print("=" * 70)
-    print("TEST 2: MultipartUploadWriter (write + close)")
+    print("TEST 2: MultipartUploadWriter (write + close) — explicit API test")
     print("=" * 70)
 
     uri2 = f"s3://{bucket}/multipart_test_16mb.dat"

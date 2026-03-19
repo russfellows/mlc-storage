@@ -134,36 +134,74 @@ def pause(seconds: int, reason: str):
     time.sleep(seconds)
 
 
-def clean_prefix(bucket: str, prefix: str, env: dict):
-    """Delete all objects under s3://bucket/prefix/ via s3-cli."""
-    uri = f's3://{bucket}/{prefix}/'
-    result = subprocess.run(
-        ['s3-cli', 'delete', '-r', uri],
-        env=env, capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        print(f'    Cleaned s3://{bucket}/{prefix}/')
-    else:
-        print(f'    (nothing to clean at s3://{bucket}/{prefix}/)')
+import contextlib
+
+@contextlib.contextmanager
+def _s3_env(config: dict):
+    """Temporarily apply S3 credentials to os.environ for in-process s3dlio calls."""
+    keys = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+            'AWS_ENDPOINT_URL', 'AWS_ENDPOINT_URL_S3', 'AWS_REGION']
+    old = {k: os.environ.get(k) for k in keys}
+    if config.get('AWS_ACCESS_KEY_ID'):
+        os.environ['AWS_ACCESS_KEY_ID'] = config['AWS_ACCESS_KEY_ID']
+    if config.get('AWS_SECRET_ACCESS_KEY'):
+        os.environ['AWS_SECRET_ACCESS_KEY'] = config['AWS_SECRET_ACCESS_KEY']
+    endpoint = config.get('AWS_ENDPOINT_URL')
+    if endpoint:
+        os.environ['AWS_ENDPOINT_URL']    = endpoint
+        os.environ['AWS_ENDPOINT_URL_S3'] = endpoint
+    if config.get('AWS_REGION'):
+        os.environ['AWS_REGION'] = config['AWS_REGION']
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
-def list_prefix(bucket: str, prefix: str, env: dict, label: str = ''):
-    """List objects under s3://bucket/prefix/ via s3-cli for verification."""
-    uri = f's3://{bucket}/{prefix}/'
-    result = subprocess.run(
-        ['s3-cli', 'list', uri],
-        env=env, capture_output=True, text=True,
-    )
-    lines = [l for l in result.stdout.strip().splitlines() if l.strip()]
+def clean_prefix(bucket: str, prefix: str, config: dict):
+    """Delete all objects under s3://bucket/prefix/ using s3dlio Python API."""
+    import s3dlio
+    uri = f's3://{bucket}/{prefix}/'.rstrip('/') + '/'
+    with _s3_env(config):
+        try:
+            full_uris = s3dlio.list(uri, recursive=True)
+            if not full_uris:
+                print(f'    (nothing to clean at {uri})')
+                return
+            for obj_uri in full_uris:
+                s3dlio.delete(obj_uri)
+            print(f'    Cleaned {len(full_uris)} object(s) at {uri}')
+        except Exception as e:
+            print(f'    (nothing to clean at {uri}: {e})')
+
+
+def list_prefix(bucket: str, prefix: str, config: dict, label: str = '') -> int:
+    """List & count objects under s3://bucket/prefix/ using s3dlio Python API.
+    Returns the number of objects found."""
+    import s3dlio
+    uri = f's3://{bucket}/{prefix}/'.rstrip('/') + '/'
     tag = f' [{label}]' if label else ''
-    if lines:
-        print(f'    s3-cli list {uri}{tag}: {len(lines)} object(s)')
-        for l in lines[:5]:
-            print(f'      {l}')
-        if len(lines) > 5:
-            print(f'      ... ({len(lines) - 5} more)')
-    else:
-        print(f'    s3-cli list {uri}{tag}: (empty)')
+    with _s3_env(config):
+        try:
+            full_uris = s3dlio.list(uri, recursive=True)
+            count = len(full_uris)
+            if count:
+                print(f'    s3dlio list {uri}{tag}: {count} object(s)')
+                # Show up to 5 keys (strip the URI prefix for readability)
+                for obj_uri in full_uris[:5]:
+                    print(f'      {obj_uri}')
+                if count > 5:
+                    print(f'      ... ({count - 5} more)')
+            else:
+                print(f'    s3dlio list {uri}{tag}: (empty)')
+            return count
+        except Exception as e:
+            print(f'    s3dlio list {uri}{tag}: error: {e}')
+            return 0
 
 
 def run_phase(label: str, cmd: list, env: dict, timeout_s: int = 3600) -> tuple:
@@ -216,12 +254,13 @@ def run_training(library: str, config: dict) -> dict:
 
     # Phase 0: cleanup
     print('\n  Phase 0: Cleanup')
-    clean_prefix(bucket, TRAIN_PREFIX, env)
+    clean_prefix(bucket, TRAIN_PREFIX, config)
 
     # Shared storage params (passed to both datagen and run)
     storage_params = [
         f'storage.storage_type=s3',
         f'storage.storage_root={bucket}',
+        f'storage.storage_library={library}',
         f'storage.storage_options.endpoint_url={config["AWS_ENDPOINT_URL"]}',
         f'storage.storage_options.access_key_id={config["AWS_ACCESS_KEY_ID"]}',
         f'storage.storage_options.secret_access_key={config["AWS_SECRET_ACCESS_KEY"]}',
@@ -267,28 +306,36 @@ def run_training(library: str, config: dict) -> dict:
         gen_gbps = total_gb / t_gen if rc_gen == 0 and t_gen > 0 else None
 
         if rc_gen == 0:
-            list_prefix(bucket, TRAIN_PREFIX, env, 'after datagen')
-            pause(PAUSE_SECONDS, 'S3 eventual consistency — new objects must be visible before reads')
+            obj_count = list_prefix(bucket, TRAIN_PREFIX, config, 'after datagen')
+            if obj_count < TRAIN_NUM_FILES:
+                print(f'  ❌ datagen validation FAILED: bucket shows {obj_count} objects, '
+                      f'expected {TRAIN_NUM_FILES}')
+                rc_gen = 1
+            else:
+                pause(PAUSE_SECONDS, 'S3 eventual consistency — new objects must be visible before reads')
 
         # Phase 2: training run (read × epochs)
         print(f'\n  Phase 2: train — read {TRAIN_EPOCHS} epochs '
               f'({total_gb * TRAIN_EPOCHS:.2f} GiB total reads)')
-        rc_run, t_run, _ = run_phase(
-            'training run',
-            ['mlpstorage', 'training', 'run'] + run_flags + ['--params'] + storage_params + [
-                f'train.epochs={TRAIN_EPOCHS}',
-                f'train.batch_size=1',
-                f'reader.batch_size=1',
-                f'reader.read_threads=8',
-                f'reader.prefetch_size=4',
-            ],
-            env,
-        )
+        if rc_gen != 0:
+            print('  ⚠ Skipping training run — datagen did not produce expected objects')
+        else:
+            rc_run, t_run, _ = run_phase(
+                'training run',
+                ['mlpstorage', 'training', 'run'] + run_flags + ['--params'] + storage_params + [
+                    f'train.epochs={TRAIN_EPOCHS}',
+                    f'train.batch_size=1',
+                    f'reader.batch_size=1',
+                    f'reader.read_threads=8',
+                    f'reader.prefetch_size=4',
+                ],
+                env,
+            )
     finally:
         # Always clean up — prevent filling storage between runs
         print(f'\n  Phase 3: Cleanup (post-run)')
-        clean_prefix(bucket, TRAIN_PREFIX, env)
-        list_prefix(bucket, TRAIN_PREFIX, env, 'after cleanup')
+        clean_prefix(bucket, TRAIN_PREFIX, config)
+        list_prefix(bucket, TRAIN_PREFIX, config, 'after cleanup')
 
     read_total_gb = total_gb * TRAIN_EPOCHS
     gen_gbps  = total_gb     / t_gen if rc_gen == 0 and t_gen > 0 else None
@@ -349,8 +396,8 @@ def run_checkpoint(library: str, config: dict, network_gbps: float = None) -> di
     try:
         # Phase 0: cleanup
         print('\n  Phase 0: Cleanup')
-        clean_prefix(bucket, CKPT_PREFIX, env)
-        list_prefix(bucket, CKPT_PREFIX, env, 'before save')
+        clean_prefix(bucket, CKPT_PREFIX, config)
+        list_prefix(bucket, CKPT_PREFIX, config, 'before save')
         pause(PAUSE_SECONDS, 'storage settling after cleanup')
 
         # Phase 1: streaming save
@@ -381,7 +428,7 @@ def run_checkpoint(library: str, config: dict, network_gbps: float = None) -> di
               f'|  bottleneck: {bottleneck})')
         ok_write = True
 
-        list_prefix(bucket, CKPT_PREFIX, env, 'after save')
+        list_prefix(bucket, CKPT_PREFIX, config, 'after save')
         pause(PAUSE_SECONDS, 'S3 eventual consistency before read')
 
         # Phase 2: streaming load (read back)
@@ -406,8 +453,8 @@ def run_checkpoint(library: str, config: dict, network_gbps: float = None) -> di
     finally:
         # Cleanup runs after both write and read are done (or on error)
         print(f'\n  Phase 3: Cleanup (post-run)')
-        clean_prefix(bucket, CKPT_PREFIX, env)
-        list_prefix(bucket, CKPT_PREFIX, env, 'after cleanup')
+        clean_prefix(bucket, CKPT_PREFIX, config)
+        list_prefix(bucket, CKPT_PREFIX, config, 'after cleanup')
         # Restore original env
         for k, v in saved_env.items():
             if v is None:
