@@ -11,6 +11,7 @@ Multi-Endpoint Support:
 
 import os
 import re
+import time
 from io import BytesIO
 from typing import Optional, Dict, Any, List
 
@@ -230,46 +231,80 @@ class MinIOStorageWriter(StorageWriter):
         )
         
         # Multipart state
-        self.parts: List = []  # List of Part objects
         self.current_part_number = 1
         self.part_buffer = BytesIO()
         self.part_buffer_size = 0
         self.total_bytes = 0
-        
-        print(f"[MinIOWriter] Using minio library (streaming multipart)")
-        print(f"[MinIOWriter]   endpoint={endpoint}, secure={secure}")
-        print(f"[MinIOWriter]   part_size={part_size / (1024**2):.0f} MB")
-        print(f"[MinIOWriter]   upload_id={self.upload_id[:16]}...")
+        self._flushed_bytes = 0
+        self._start_time = time.monotonic()
+
+        # Parallel upload state
+        from concurrent.futures import ThreadPoolExecutor
+        self._max_in_flight = num_parallel_uploads
+        self._executor = ThreadPoolExecutor(
+            max_workers=num_parallel_uploads,
+            thread_name_prefix='minio-part'
+        )
+        self._futures: dict = {}          # part_number -> Future
+        self._inflight_parts: list = []  # (part_number, Part) collected from completed futures
+
+        print(f"[Writer] Using minio library (streaming multipart, {num_parallel_uploads} parallel parts, {part_size//(1024**2)} MB/part)")
     
     
-    def _flush_part(self) -> None:
-        """Upload current part buffer using MinIO's multipart API."""
-        if self.part_buffer_size == 0:
-            return
-        
-        # Get buffered data
-        part_data = self.part_buffer.getvalue()
-        
-        # Upload part using MinIO's _upload_part API
+    def _upload_part_sync(self, part_data: bytes, part_number: int):
+        """Upload a single multipart part — runs inside ThreadPoolExecutor."""
         etag = self.client._upload_part(
             bucket_name=self.bucket_name,
             object_name=self.object_name,
             data=part_data,
             headers=None,
             upload_id=self.upload_id,
-            part_number=self.current_part_number
+            part_number=part_number,
         )
-        
-        # Create Part object and store it
         from minio.datatypes import Part
-        part = Part(self.current_part_number, etag)
-        self.parts.append(part)
-        
-        # Reset buffer for next part
+        return Part(part_number, etag)
+
+    def _throttle(self) -> None:
+        """Block until fewer than _max_in_flight parts are uploading."""
+        from concurrent.futures import FIRST_COMPLETED, wait as futures_wait
+        while len(self._futures) >= self._max_in_flight:
+            done_set, _ = futures_wait(
+                list(self._futures.values()), return_when=FIRST_COMPLETED
+            )
+            to_remove = [pn for pn, f in self._futures.items() if f in done_set]
+            for pn in to_remove:
+                part = self._futures.pop(pn).result()  # raises on upload error
+                self._inflight_parts.append((pn, part))
+
+    def _flush_part(self) -> None:
+        """Submit current part buffer to the thread pool (non-blocking)."""
+        if self.part_buffer_size == 0:
+            return
+
+        part_data = self.part_buffer.getvalue()   # bytes copy
+        part_number = self.current_part_number
+
+        # Throttle: wait if too many parts already in flight
+        self._throttle()
+
+        # Reset buffer immediately so the producer can fill the next chunk
+        # while uploads are happening in parallel
         self.part_buffer.close()
         self.part_buffer = BytesIO()
         self.part_buffer_size = 0
         self.current_part_number += 1
+        self._flushed_bytes += len(part_data)
+
+        # Submit upload asynchronously
+        self._futures[part_number] = self._executor.submit(
+            self._upload_part_sync, part_data, part_number
+        )
+
+        # Progress report
+        elapsed = time.monotonic() - self._start_time
+        written_gb = self._flushed_bytes / 1e9
+        rate = written_gb / elapsed if elapsed > 0 else 0.0
+        print(f'\r[Writer] {written_gb:.2f} GB, {rate:.2f} GB/s   ', end='', flush=True)
     
     def write_chunk(self, buffer: memoryview, size: int) -> int:
         """Write chunk, flushing parts as they fill up.
@@ -303,45 +338,60 @@ class MinIOStorageWriter(StorageWriter):
         return size
     
     def close(self) -> Dict[str, Any]:
-        """Finalize multipart upload and return metadata.
-        
+        """Wait for all in-flight uploads, then finalize multipart upload.
+
         Returns:
-            Dictionary with backend, total_bytes, etag, uri, chunk_size
+            Dictionary with backend, total_bytes, parts, etag, uri, chunk_size
         """
+        from concurrent.futures import wait as futures_wait, ALL_COMPLETED
         try:
-            # Flush any remaining data as final part
+            # Flush any remaining buffered data
             if self.part_buffer_size > 0:
                 self._flush_part()
-            
+
+            # Wait for all still-in-flight parts to complete
+            if self._futures:
+                futures_wait(list(self._futures.values()), return_when=ALL_COMPLETED)
+                for pn, f in self._futures.items():
+                    part = f.result()   # raises on upload error
+                    self._inflight_parts.append((pn, part))
+                self._futures.clear()
+
+            self._executor.shutdown(wait=False)
+            print()  # end the carriage-return progress line
+
+            # Sort all collected parts by part number (S3 requires ordered list)
+            self._inflight_parts.sort(key=lambda x: x[0])
+            sorted_parts = [p for _, p in self._inflight_parts]
+
             # Complete multipart upload
             result = self.client._complete_multipart_upload(
                 self.bucket_name,
                 self.object_name,
                 self.upload_id,
-                self.parts
+                sorted_parts,
             )
-            
+
             return {
                 'backend': 'minio-multipart',
                 'total_bytes': self.total_bytes,
-                'parts': len(self.parts),
+                'parts': len(sorted_parts),
                 'etag': result.etag if hasattr(result, 'etag') else 'unknown',
                 'uri': self.uri,
-                'chunk_size': self.chunk_size
+                'chunk_size': self.chunk_size,
             }
-        
+
         except Exception as e:
-            # Abort multipart upload on error
+            # Abort multipart upload on error (best effort)
             try:
                 self.client._abort_multipart_upload(
                     self.bucket_name,
                     self.object_name,
-                    self.upload_id
+                    self.upload_id,
                 )
-            except:
-                pass  # Best effort cleanup
+            except Exception:
+                pass
             raise e
-        
+
         finally:
-            # Clean up buffer
             self.part_buffer.close()
