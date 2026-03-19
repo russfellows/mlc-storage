@@ -143,6 +143,12 @@ Tests the two s3dlio write APIs directly (no DLIO, no mlpstorage wrapper):
 
 ```bash
 cd mlp-storage && source .venv/bin/activate
+
+# Uses defaults from .env (bucket: bucket-s3dlio)
+python tests/object-store/test_s3dlio_direct.py
+
+# Custom bucket
+python tests/object-store/test_s3dlio_direct.py --bucket my-bucket
 python tests/object-store/test_s3dlio_direct.py --help
 ```
 
