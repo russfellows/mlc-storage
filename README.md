@@ -1,6 +1,15 @@
 # MLPerf Storage Benchmark Suite
 MLPerf® Storage is a benchmark suite to characterize the performance of storage systems that support machine learning workloads.
 
+> **⚠️ TEMPORARY — Development Fork**
+>
+> This is a personal development fork ([russfellows/mlc-storage](https://github.com/russfellows/mlc-storage)) containing work-in-progress features not yet merged into the official [MLCommons Storage](https://github.com/mlcommons/storage) repository. Once this work is accepted upstream, this notice will be removed and users should switch to the official repo.
+>
+> **To clone this fork with all submodules (required):**
+> ```bash
+> git clone --recurse-submodules https://github.com/russfellows/mlc-storage.git
+> ```
+
 - [Overview](#overview)
 - [Prerequisite](#prerequisite)
 - [Installation](#installation)
