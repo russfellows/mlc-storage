@@ -39,6 +39,18 @@ CLAUDE.md
 .roomodes
 LOCAL_BRANCH_NOTES.md
 
+# DLIO test artifacts — created in cwd when running dlio_benchmark tests
+output/
+dlio_test_output/
+data/
+checkpoints/
+dlio_benchmark_test.log
+dlio_aistore_benchmark_test.log
+
+# Backup directories — local-only, never commit
+Test-Backup/
+dlio_benchmark.OLD*/
+
 # Credential / environment files — NEVER commit these
 .env
 env-fast
