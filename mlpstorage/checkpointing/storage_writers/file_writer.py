@@ -56,15 +56,9 @@ class FileStorageWriter(StorageWriter):
         
         self.fd = os.open(filepath, flags, 0o644)
         
-        # Apply SEQUENTIAL hint at file open if requested
-        if self.fadvise_mode in ['sequential', 'dontneed'] and hasattr(os, 'posix_fadvise'):
-            # POSIX_FADV_SEQUENTIAL: optimize for sequential access
-            # POSIX_FADV_DONTNEED: don't cache this data (free page cache immediately)
-            try:
-                os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
-                # Note: DONTNEED applied per-write to free cache as we go
-            except (OSError, AttributeError):
-                pass  # Not all systems support these hints
+        # No SEQUENTIAL hint: readahead is meaningless on a write-only fd and
+        # would only inflate page cache.  DONTNEED is applied per-write below
+        # to flush and drop dirty pages as we go.
     
     def write_chunk(self, buffer: memoryview, size: int) -> int:
         """Write chunk to file.
@@ -80,8 +74,9 @@ class FileStorageWriter(StorageWriter):
         written = os.write(self.fd, buffer[:size])
         self.total_bytes += written
         
-        # Tell kernel to free page cache for data we just wrote (only if mode is 'dontneed')
-        # This prevents memory bloat and matches O_DIRECT behavior
+        # Drop pages for data we just wrote so the load phase cannot serve
+        # them from DRAM — checkpoint reads must hit the actual storage device
+        # to produce a valid throughput measurement.
         if self.fadvise_mode == 'dontneed' and hasattr(os, 'posix_fadvise'):
             try:
                 os.posix_fadvise(self.fd, offset_before, written, os.POSIX_FADV_DONTNEED)

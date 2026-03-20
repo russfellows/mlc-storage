@@ -264,15 +264,29 @@ class StreamingCheckpointing:
                 "Install with: pip install dgen-py"
             )
         
-        print(f"[Main] Initializing dgen-py...")
+        # Throttle dgen-py threads when running under MPI to avoid
+        # overloading the host with 8 ranks × N-all-CPU threads simultaneously.
+        # Detect MPI world size from common env vars (OpenMPI, MPICH, MVAPICH).
+        mpi_world_size = 1
+        for _env_var in ('OMPI_COMM_WORLD_SIZE', 'PMI_SIZE', 'MV2_COMM_WORLD_SIZE'):
+            _v = os.environ.get(_env_var)
+            if _v:
+                try:
+                    mpi_world_size = max(1, int(_v))
+                    break
+                except ValueError:
+                    pass
+        total_cpus = os.cpu_count() or 4
+        max_threads = max(1, total_cpus // mpi_world_size)
+        print(f"[Main] Initializing dgen-py (MPI world_size={mpi_world_size}, threads={max_threads}/{total_cpus} CPUs)...")
         try:
             generator = dgen_py.Generator(
                 size=total_size_bytes,
                 chunk_size=self.chunk_size,  # Match our buffer size
                 dedup_ratio=1.0,
                 compress_ratio=1.0,
-                numa_mode="auto",      # CRITICAL: Enable NUMA-aware multi-threading
-                max_threads=None       # CRITICAL: Use all available cores
+                numa_mode="auto",
+                max_threads=max_threads,  # Throttled by MPI world size
             )
             print(f"[Main] Generator ready")
             return generator
@@ -539,6 +553,7 @@ class StreamingCheckpointing:
             reader = StorageReaderFactory.create(
                 filepath,
                 backend=self.backend,
+                fadvise_mode=self.fadvise_mode,
                 chunk_size=effective_chunk,
             )
             try:
@@ -598,7 +613,9 @@ class StreamingCheckpointing:
 
             readers = [
                 StorageReaderFactory.create(
-                    filepath, backend=self.backend, chunk_size=effective_chunk
+                    filepath, backend=self.backend,
+                    fadvise_mode=self.fadvise_mode,
+                    chunk_size=effective_chunk
                 )
                 for _ in range(n)
             ]
