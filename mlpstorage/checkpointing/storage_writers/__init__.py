@@ -67,6 +67,16 @@ class StorageWriterFactory:
                 path = uri_or_path[7:] if uri_or_path.startswith('file://') else uri_or_path
                 return FileStorageWriter(path, use_direct_io=use_direct_io, fadvise_mode=fadvise_mode)
             
+            elif backend == 'direct_fs':
+                # O_DIRECT via s3dlio's direct:// URI — bypasses page cache entirely.
+                # fadvise_mode is ignored; O_DIRECT never populates the page cache.
+                path = uri_or_path
+                for prefix in ('direct://', 'file://'):
+                    if path.startswith(prefix):
+                        path = path[len(prefix):]
+                        break
+                return S3DLIOStorageWriter('direct://' + path, **kwargs)
+            
             elif backend == 's3dlio':
                 return S3DLIOStorageWriter(uri_or_path, **kwargs)
             
