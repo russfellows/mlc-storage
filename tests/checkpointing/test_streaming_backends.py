@@ -10,25 +10,10 @@ import os
 import time
 import argparse
 
-# Verify required environment variables are set
-required_vars = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_ENDPOINT_URL']
-missing_vars = [var for var in required_vars if not os.getenv(var)]
-if missing_vars:
-    print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}")
-    print("\nPlease set:")
-    print("  export AWS_ACCESS_KEY_ID=your_access_key")
-    print("  export AWS_SECRET_ACCESS_KEY=your_secret_key")
-    print("  export AWS_ENDPOINT_URL=http://your-s3-endpoint:9000")
-    sys.exit(1)
-
-# Set default region if not provided
-if not os.getenv('AWS_REGION'):
-    os.environ['AWS_REGION'] = 'us-east-1'
-
 from mlpstorage.checkpointing import StreamingCheckpointing
 
 
-def test_backend(backend: str, uri: str, size_gb: float, max_in_flight: int):
+def run_backend(backend: str, uri: str, size_gb: float, max_in_flight: int):
     """Test a specific backend.
     
     Args:
@@ -81,6 +66,21 @@ def test_backend(backend: str, uri: str, size_gb: float, max_in_flight: int):
 
 def main():
     """Compare specified backends with customizable parameters."""
+    # Verify required environment variables are set
+    required_vars = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_ENDPOINT_URL']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    if missing_vars:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+        print("\nPlease set:")
+        print("  export AWS_ACCESS_KEY_ID=your_access_key")
+        print("  export AWS_SECRET_ACCESS_KEY=your_secret_key")
+        print("  export AWS_ENDPOINT_URL=http://your-s3-endpoint:9000")
+        sys.exit(1)
+
+    # Set default region if not provided
+    if not os.getenv('AWS_REGION'):
+        os.environ['AWS_REGION'] = 'us-east-1'
+
     parser = argparse.ArgumentParser(
         description='Compare S3 storage libraries for checkpoint writing',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -157,7 +157,7 @@ Examples:
         print(f"Testing {backend}...")
         print(f"  Config: {config}")
         
-        success, elapsed, io_throughput = test_backend(backend, uri, size_gb, max_in_flight)
+        success, elapsed, io_throughput = run_backend(backend, uri, size_gb, max_in_flight)
         
         if success:
             total_throughput = size_gb / elapsed

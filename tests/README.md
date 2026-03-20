@@ -453,6 +453,102 @@ Storage backends tested:
 | Backend | Type | Notes |
 |---------|------|-------|
 | `file://` | Local / NFS / Lustre | Default; no extra config needed |
+| `direct://` via **s3dlio** | Local (O_DIRECT) | Bypasses page cache entirely; use `storage_type=direct_fs` |
 | `s3://` via **s3dlio** | Object storage | High-performance, multi-endpoint |
 | `s3://` via **minio** | Object storage | Python minio client |
 | `s3://` via **s3torchconnector** | Object storage | AWS reference implementation |
+
+---
+
+## 7. Checkpoint Performance Results
+
+Full-stack checkpoint benchmark results using `mlpstorage checkpointing run` with the
+**llama3-8b** model profile (`num_layers=24`), 8 MPI ranks, 1 checkpoint write + 1
+checkpoint read.  Aggregate throughput reported by `[METRIC]` lines from the benchmark.
+
+**Test date:** March 19, 2026
+
+### Hardware / Network context
+
+| Component | Details |
+|-----------|---------|
+| Network (object storage) | 10 Gbit Ethernet — **max ~1.25 GB/s** (network-limited) |
+| Local storage (`local_fs`) | VMDK on remote vSAN — **max ~2 GB/s** |
+| Checkpoint size | ~82 GB total (8 ranks × ~10.25 GB/rank: model + optimizer) |
+| Page-cache bypass | `POSIX_FADV_DONTNEED` per chunk + `POSIX_FADV_RANDOM` at open — reads hit storage, not DRAM |
+
+### Aggregate throughput
+
+| Backend | Write (GB/s) | Read (GB/s) | Notes |
+|---------|:-----------:|:-----------:|-------|
+| `minio` | 1.04 | 1.09 | Network-limited (10 GbE cap ~1.25 GB/s) |
+| `s3torchconnector` | 1.05 | 1.11 | Network-limited |
+| `s3dlio` | 1.03 | 1.22 | Network-limited; best read (range-GET concurrency) |
+| `local_fs` (fadvise) | **1.42** | **1.82** | vSAN-limited; fadvise(DONTNEED) page-cache bypass |
+| `direct_fs` (O_DIRECT) | **1.36** | **1.48** | O_DIRECT via s3dlio `direct://`; hard page-cache bypass |
+
+### Key observations
+
+- **Object store backends** (minio, s3torchconnector, s3dlio) are all bottlenecked by the
+  10 GbE network link (~1.25 GB/s ceiling). Their write results cluster tightly at
+  1.03–1.05 GB/s. Read throughput varies slightly due to range-GET concurrency differences.
+- **s3dlio** achieves the best read among object-store backends (1.22 GB/s) thanks to
+  parallel chunk fetching via byte-range GETs.
+- **local_fs** bypasses the network entirely, reaching 1.42 GB/s write and 1.82 GB/s read
+  against the remote vSAN backing store (practical ceiling ~2 GB/s for that device).
+- **Page-cache bypass** is critical for accurate storage benchmarking.  Without it, the
+  kernel caches written checkpoint data in DRAM and subsequent reads are served from memory
+  (~20 GB/s) rather than the storage device, invalidating the measurement.  Two approaches
+  are provided:
+  - `local_fs` — `POSIX_FADV_RANDOM` at open (disables readahead) + `POSIX_FADV_DONTNEED`
+    after each chunk (soft hint; kernel reclaims asynchronously). Achieved 1.42 W / 1.82 R GB/s.
+  - `direct_fs` — O_DIRECT via s3dlio's `direct://` URI; the kernel page cache is bypassed
+    entirely at the syscall level, giving the most rigorous measurement. Achieved 1.36 W / 1.48 R GB/s.
+    The ~6% write and ~19% read gap versus `local_fs` is expected: O_DIRECT forces synchronous,
+    unbuffered I/O through the block layer, while fadvise still allows the kernel I/O scheduler
+    to batch and merge requests efficiently.
+
+### Reproducing the file-backend result
+
+```bash
+cd /home/eval/Documents/Code/mlp-storage
+source .venv/bin/activate
+
+mlpstorage checkpointing run \
+  --model llama3-8b --num-processes 8 \
+  --client-host-memory-in-gb 64 \
+  --num-checkpoints-write 1 --num-checkpoints-read 1 \
+  --checkpoint-folder /mnt/nvme_data/llama3-8b-file \
+  --allow-run-as-root --oversubscribe --open --skip-timeseries \
+  --params storage.storage_type=local_fs model.num_layers=24
+```
+
+Expected output (look for `[METRIC]` lines at the end):
+
+```
+[METRIC] Checkpoint save I/O Throughput (GB/second): 1.4152 (0.0000)
+[METRIC] Checkpoint load I/O Throughput (GB/second): 1.8159 (0.0000)
+```
+
+### Reproducing the O_DIRECT result (`direct_fs`)
+
+Uses s3dlio’s `direct://` URI to open files with `O_DIRECT`, completely bypassing
+the kernel page cache at the syscall level — the most rigorous measurement of
+raw storage throughput.
+
+```bash
+cd /home/eval/Documents/Code/mlp-storage
+source .venv/bin/activate
+
+mlpstorage checkpointing run \
+  --model llama3-8b --num-processes 8 \
+  --client-host-memory-in-gb 64 \
+  --num-checkpoints-write 1 --num-checkpoints-read 1 \
+  --checkpoint-folder /mnt/nvme_data/llama3-8b-direct \
+  --allow-run-as-root --oversubscribe --open --skip-timeseries \
+  --params storage.storage_type=direct_fs model.num_layers=24
+```
+
+> **Note:** `num_layers=24` reduces the checkpoint from the default ~105 GB to ~82 GB to
+> fit on the 98 GB test partition. Adjust `--checkpoint-folder` to a location with
+> sufficient free space before running.
