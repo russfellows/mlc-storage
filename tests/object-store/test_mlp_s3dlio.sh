@@ -45,7 +45,8 @@ echo ""
 
 S3_BUCKET="$BUCKET"
 DATA_DIR="test-run/"
-COMMON_PARAMS="dataset.num_files_train=3 dataset.num_samples_per_file=5 dataset.record_length=65536 storage.s3_force_path_style=true"
+# Real unet3d h100 workload parameters (unet3d_h100.yaml): 168 files x ~140 MB each
+COMMON_PARAMS="dataset.num_files_train=168 dataset.num_samples_per_file=1 dataset.record_length_bytes=146600628 dataset.record_length_bytes_stdev=0 dataset.record_length_bytes_resize=2097152 storage.s3_force_path_style=true"
 s3_params="storage.storage_type=s3 storage.storage_options.storage_library=s3dlio storage.storage_options.endpoint_url=${AWS_ENDPOINT_URL} storage.storage_options.access_key_id=${AWS_ACCESS_KEY_ID} storage.storage_options.secret_access_key=${AWS_SECRET_ACCESS_KEY} storage.storage_root=${S3_BUCKET}"
 
 echo "Step 1: Cleaning bucket..."
@@ -59,7 +60,7 @@ echo ""
 echo "Step 3: Running data generation..."
 set +e  # s3dlio compat layer may still have issues — capture result rather than abort
 DLIO_S3_IMPLEMENTATION=mlp mlpstorage training datagen \
-  --model unet3d -np 1 -dd "${DATA_DIR}" \
+  --model unet3d -np 8 -dd "${DATA_DIR}" \
   --param ${COMMON_PARAMS} ${s3_params}
 
 RESULT=$?
@@ -73,9 +74,29 @@ if [ $RESULT -eq 0 ]; then
     echo "Step 5: Complete bucket listing..."
     "$S3_CLI" ls -r "s3://${S3_BUCKET}/"
     echo ""
-    echo "========================================================================"
-    echo "✅ TEST COMPLETE: MLP + s3dlio"
-    echo "========================================================================"
+    echo "Step 6: Running training..."
+    set +e
+    export DLIO_S3_IMPLEMENTATION=mlp
+    mlpstorage training run \
+      --model unet3d --allow-run-as-root --skip-validation \
+      --num-accelerators 1 --accelerator-type h100 --client-host-memory-in-gb 512 \
+      --param ${COMMON_PARAMS} ${s3_params} \
+        dataset.data_folder="${DATA_DIR}unet3d"
+
+    TRAIN_RESULT=$?
+    set -e
+    echo ""
+    if [ $TRAIN_RESULT -eq 0 ]; then
+        echo "========================================================================"
+        echo "✅ TEST COMPLETE: MLP + s3dlio (datagen + training)"
+        echo "========================================================================"
+    else
+        echo "========================================================================"
+        echo "❌ TRAINING FAILED: MLP + s3dlio (exit code $TRAIN_RESULT)"
+        echo "========================================================================"
+        deactivate
+        exit $TRAIN_RESULT
+    fi
 else
     echo "Step 4: Checking if any objects were created despite error..."
     "$S3_CLI" ls -r "s3://${S3_BUCKET}/" || true

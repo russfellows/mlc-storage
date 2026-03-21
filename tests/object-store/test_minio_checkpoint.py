@@ -106,7 +106,7 @@ def main():
         description='MinIO streaming checkpoint test',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--bucket', default='bucket-minio', help='S3/MinIO bucket name')
+    parser.add_argument('--bucket', default=os.environ.get('S3_BUCKET', 'bucket-minio'), help='S3/MinIO bucket name')
     parser.add_argument('--key', default=None,
                         help='Object key (default: auto-generated with timestamp)')
     parser.add_argument('--s3-uri', default=None,

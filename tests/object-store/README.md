@@ -12,12 +12,209 @@ AWS_ENDPOINT_URL=http://<host>:<port>
 AWS_REGION=us-east-1
 ```
 
+For HTTPS endpoints with a self-signed certificate, set the CA bundle path:
+
+```bash
+export AWS_CA_BUNDLE=/path/to/selfsigned.crt
+```
+
+`AWS_CA_BUNDLE` is read by s3dlio and by the Python test scripts in this directory.
+s3torchconnector also reads the same `AWS_CA_BUNDLE` name. See **[How to Test with SSL (HTTPS)](#how-to-test-with-ssl-https)** below
+for full setup instructions.
+
 Environment variables already set in the shell take precedence over the `.env` file.
 No credentials are hard-coded in any test.
 
 ---
 
+## How to Test with SSL (HTTPS)
+
+By default all tests use plain HTTP (`http://`). If you want to test with HTTPS — for
+example against a MinIO instance configured with TLS — there are several steps required
+because each library resolves TLS trust differently.
+
+### Step 1 — Generate the correct server certificate (on the MinIO host)
+
+The certificate **must** be generated with `basicConstraints=CA:FALSE`. Rust-based
+libraries (s3dlio, s3torchconnector) use **rustls**, which strictly enforces RFC 5280
+and rejects any server certificate that advertises itself as a CA (`CA:TRUE`). OpenSSL
+and curl do not enforce this, so the error only appears with Rust clients.
+
+```bash
+# Run on the MinIO server as root (or the MinIO user)
+openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+  -keyout /home/minio-user/.minio/certs/private.key \
+  -out    /home/minio-user/.minio/certs/public.crt \
+  -subj "/CN=<minio-ip-or-hostname>" \
+  -addext "subjectAltName=IP:<minio-ip-or-hostname>" \
+  -addext "basicConstraints=CA:FALSE" \
+  -addext "keyUsage=digitalSignature,keyEncipherment" \
+  -addext "extendedKeyUsage=serverAuth"
+```
+
+Replace `<minio-ip-or-hostname>` with your MinIO server's IP or DNS name, e.g.
+`your-minio-host`.  The `subjectAltName` is **required** — modern TLS clients reject
+certificates that only set a `CN` with no SAN.
+
+Fix ownership then restart MinIO:
+
+```bash
+chown minio-user:minio-user /home/minio-user/.minio/certs/private.key \
+                             /home/minio-user/.minio/certs/public.crt
+chmod 600 /home/minio-user/.minio/certs/private.key
+chmod 644 /home/minio-user/.minio/certs/public.crt
+systemctl restart minio
+systemctl status minio    # verify it came up cleanly
+```
+
+### Step 2 — Copy the certificate to the client machine
+
+```bash
+# Run on the client (e.g. loki-russ)
+scp <minio-user>@<minio-host>:/home/minio-user/.minio/certs/public.crt \
+    ~/Documents/Code/mlp-storage/.certs/minio-selfsigned.crt
+```
+
+### Step 3 — Trust the certificate on the client
+
+```bash
+sudo cp ~/Documents/Code/mlp-storage/.certs/minio-selfsigned.crt \
+    /usr/local/share/ca-certificates/minio-selfsigned.crt
+sudo update-ca-certificates
+# Expected output: "1 added, 0 removed; done."
+```
+
+> **Note — linuxbrew Python:** If Python is installed via linuxbrew
+> (`/home/linuxbrew/...`), its OpenSSL is isolated from the system CA store.
+> The minio Python SDK will **not** pick up the cert from `update-ca-certificates`
+> automatically.  See **Step 5** below.
+
+### Step 4 — Verify with curl and openssl
+
+```bash
+# 1. Quick TLS check — should negotiate TLS and return HTTP 403 (AccessDenied is expected)
+curl -v https://<minio-ip>:9000/
+
+# 2. Inspect the deployed certificate
+openssl x509 -in /usr/local/share/ca-certificates/minio-selfsigned.crt \
+    -noout -text | grep -A3 "Basic Constraints"
+# Must show: CA:FALSE
+
+# 3. Confirm SAN is present
+openssl x509 -in /usr/local/share/ca-certificates/minio-selfsigned.crt \
+    -noout -text | grep -A2 "Subject Alternative Name"
+# Must show: IP Address:<minio-ip>
+```
+
+A successful curl output will include:
+```
+* SSL certificate verify ok.
+* subjectAltName: host "<minio-ip>" matched cert's IP address!
+< HTTP/1.1 403 Forbidden   ← expected; means TLS is working
+```
+
+### Step 5 — Configure each library
+
+Update `.env` to use `https://`:
+
+```
+AWS_ENDPOINT_URL=https://<minio-ip>:9000
+```
+
+Set the CA bundle environment variable (required even with a system-store cert, because
+not all libraries read the system store):
+
+```bash
+export AWS_CA_BUNDLE=/usr/local/share/ca-certificates/minio-selfsigned.crt
+```
+
+#### How each library resolves TLS trust
+
+Each library takes a different path to TLS certificate verification:
+
+| Library | TLS layer | Reads `AWS_CA_BUNDLE` | Reads system store | How trust is established |
+|---|---|---|---|---|
+| s3dlio | Rust/rustls | ✅ | ✅ rustls-native-certs | `AWS_CA_BUNDLE` env var, or system store after `update-ca-certificates` |
+| minio Python SDK | Python/urllib3/OpenSSL | ❌ | ❌ (linuxbrew isolates it) | Custom `urllib3.PoolManager(ssl_context=ctx)` built from `AWS_CA_BUNDLE` — handled automatically in `test_s3lib_get_bench.py` |
+| s3torchconnector | Rust/AWS SDK for Rust | ✅ | ✅ rustls-native-certs | System store pickup after `update-ca-certificates`, or `AWS_CA_BUNDLE` env var |
+
+**Key points:**
+- All three libraries now share the same env var name: `AWS_CA_BUNDLE` (the standard AWS SDK convention).
+  `test_s3lib_get_bench.py` reads it and passes the path to urllib3 explicitly for the minio Python SDK.
+- The minio Python SDK ignores AWS env vars entirely. `test_s3lib_get_bench.py`
+  reads `AWS_CA_BUNDLE` and passes it to urllib3 explicitly via
+  `_make_minio_client()`.
+- rustls enforces RFC 5280 strictly: a certificate with `basicConstraints: CA:TRUE` is
+  rejected with `CaUsedAsEndEntity` even if it is trusted. OpenSSL/curl silently accept
+  it. This is why the cert **must** be generated with `basicConstraints=CA:FALSE`.
+- s3torchconnector reads the system CA store via `rustls-native-certs`, so
+  `update-ca-certificates` is sufficient for it without any extra env var.
+
+---
+
+## Library Selection — `storage_library` YAML Key
+
+The `storage_library` key in the YAML config controls **which S3 client library is used**
+for all I/O operations (reads, writes, listing). It lives in the `storage:` section —
+**not** in `dataset:`.
+
+```yaml
+storage:
+  storage_type: s3          # the protocol family ("s3" = object storage)
+  storage_root: mlp-minio   # the bucket name
+  storage_library: minio    # which library to use ← this is the selector
+```
+
+**Valid values:**
+
+| `storage_library` | Library | Notes |
+|---|---|---|
+| `s3dlio` | s3dlio (Rust-based, Tokio async) | `get_many()` parallel batch, `MultipartUploadWriter` |
+| `minio` | minio Python SDK | `ThreadPoolExecutor`, automatic 5 MB multipart |
+| `s3torchconnector` | Amazon s3torchconnector (Rust) | `S3Client.get_object()` (direct, optimal); ⚠️ DLIO reader currently uses `S3IterableDataset` (sequential, 1 GET/worker) — see `S3library_review_21-Mar.md` |
+
+The three separate workload configs differ only on this key (and the bucket name):
+- `configs/dlio/workload/unet3d_h100_s3dlio.yaml` → `storage_library: s3dlio`
+- `configs/dlio/workload/unet3d_h100_minio.yaml` → `storage_library: minio`
+- `configs/dlio/workload/unet3d_h100_s3torch.yaml` → `storage_library: s3torchconnector`
+
+### How `storage_library` flows from YAML → code
+
+1. **`config.py` (LoadConfig, ~line 1094–1097):** `LoadConfig` reads
+   `storage.storage_library` from the YAML and **injects it** into
+   `args.storage_options["storage_library"]`. This is necessary because DLIO's `Args`
+   dataclass has no first-class `storage_library` field — the value piggybacks inside
+   the free-form `storage_options` dict.
+
+2. **`config.py` (Args.validate(), ~line 387):** `validate()` reads it back from
+   `storage_options.get("storage_library", "s3torchconnector")` (default is
+   `s3torchconnector` for backwards compat with configs that predate this key).
+   It uses the value to:
+   - Verify the library package is installed (fails fast with a clear error if not)
+   - Set the correct `reader_classname` for the DataLoader
+   - Enforce the right `checkpoint_mechanism` (`pt_s3_save` for s3torchconnector,
+     `pt_obj_save` for minio / s3dlio)
+
+3. **`storage/obj_store_lib.py` (`ObjStoreLibStorage.__init__()`, ~lines 161–166):**
+   Reads `storage_options.get("storage_library")` and instantiates the correct client:
+
+   ```python
+   if storage_library == "s3dlio":
+       # s3dlio Rust client
+   elif storage_library == "s3torchconnector":
+       # S3Client from s3torchconnector
+   elif storage_library == "minio":
+       # Minio Python SDK client
+   ```
+
+   This single branch point controls all read, write, and list operations for the
+   entire training/datagen run.
+
+---
+
 ## Results
+
+**[S3library_review_21-Mar.md](S3library_review_21-Mar.md)** — Prefetch fairness code review (March 21, 2026): analysis of concurrency models across all three libraries in the DLIO reader, root cause of the s3torchconnector benchmark gap, and remediation options. Includes s3dlio v0.9.84 fix status.
 
 **[Object_Perf_Results.md](Object_Perf_Results.md)** — Full benchmark results including:
 - Direct native-API write + read throughput (all three libraries, 12 parallel workers)
@@ -30,6 +227,134 @@ No credentials are hard-coded in any test.
 ## Test Files
 
 ### Cross-Library Comparisons
+
+#### `test_s3lib_get_bench.py`
+Benchmarks **GET throughput** across all three libraries with three rigorously fair
+test modes. All libraries read from the **same bucket and same objects** — no
+per-library data locality effects.
+
+| Mode | What it measures | Concurrency model |
+|---|---|---|
+| `serial` | Per-request latency (p50/p95/p99/max) + single-stream MB/s | One GET at a time, no parallelism |
+| `parallel` | Aggregate MB/s at matched concurrency | `ThreadPoolExecutor(max_workers=N)` — identical across all libraries |
+| `native` | s3dlio Rust async vs Python threads | `s3dlio.get_many(uris, max_in_flight=N)` |
+
+```bash
+cd mlp-storage && source .venv/bin/activate
+
+# Default: all modes, existing training data (mlp-s3dlio bucket), concurrency 1/4/8/16
+python tests/object-store/test_s3lib_get_bench.py
+
+# Write 20 synthetic 128 MB objects first, then run all tests against them
+python tests/object-store/test_s3lib_get_bench.py \
+    --write --write-num-files 20 --write-size-mb 128
+
+# Serial-only test — per-request latency and single-stream MB/s
+python tests/object-store/test_s3lib_get_bench.py --mode serial --num-files 30
+
+# Parallel sweep with custom worker counts
+python tests/object-store/test_s3lib_get_bench.py \
+    --mode parallel --workers 1 4 8 16 32 64
+
+# Test only s3dlio native get_many (Rust Tokio async) vs ThreadPoolExecutor
+python tests/object-store/test_s3lib_get_bench.py \
+    --mode native --workers 1 4 8 16 32
+
+# Test only two libraries
+python tests/object-store/test_s3lib_get_bench.py --libraries s3dlio minio
+
+# Custom bucket and prefix
+python tests/object-store/test_s3lib_get_bench.py \
+    --bucket my-bucket --prefix data/train/ --num-files 50
+
+# CLI reference
+python tests/object-store/test_s3lib_get_bench.py --help
+```
+
+#### Sample Output
+
+*Results below use HTTPS (with a self-signed MinIO certificate
+and `AWS_CA_BUNDLE` set — the more realistic and secure configuration.*
+
+```console
+(.venv) eval@loki-russ:~/Documents/Code/mlp-storage$ python ./tests/object-store/test_s3lib_get_bench.py
+Loaded credentials from: /path/to/mlp-storage/.env
+
+════════════════════════════════════════════════════════════════════════
+S3 LIBRARY GET BENCHMARK
+════════════════════════════════════════════════════════════════════════
+  Endpoint:   https://minio-host:9000
+  Libraries:  s3dlio, minio, s3torchconnector
+  Mode:       all
+  Workers:    [1, 4, 8, 16]  (concurrency sweep)
+
+── Listing objects ──────────────────────────────────────────────────────
+  Bucket: mlp-s3dlio  Prefix: test-run/unet3d/train/  (max 20)
+  Found 20 objects  (first: test-run/unet3d/train/img_000_of_168.npz)
+[s3dlio] Loading CA bundle from: /usr/local/share/ca-certificates/minio-172-16-1-40_selfsigned.crt
+  Objects:  20 × 213.7 MB = 4274 MB total
+
+── Serial GET ───────────────────────────────────────────────────────────
+  [s3dlio              ] serial: 20 × 1 GET …
+  [s3dlio              ]  done: 515 MB/s (stream), p50=0.279s
+  [minio               ] serial: 20 × 1 GET …
+  [minio               ]  done: 511 MB/s (stream), p50=0.280s
+  [s3torchconnector    ] serial: 20 × 1 GET …
+  [s3torchconnector    ]  done: 389 MB/s (stream), p50=0.358s
+
+── Parallel GET (ThreadPoolExecutor) ────────────────────────────────────
+  [s3dlio              ] parallel workers=  1: …    574 MB/s
+  [minio               ] parallel workers=  1: …    507 MB/s
+  [s3torchconnector    ] parallel workers=  1: …    402 MB/s
+  [s3dlio              ] parallel workers=  4: …   1049 MB/s
+  [minio               ] parallel workers=  4: …   1025 MB/s
+  [s3torchconnector    ] parallel workers=  4: …    544 MB/s
+  [s3dlio              ] parallel workers=  8: …   1065 MB/s
+  [minio               ] parallel workers=  8: …    930 MB/s
+  [s3torchconnector    ] parallel workers=  8: …    516 MB/s
+  [s3dlio              ] parallel workers= 16: …   1043 MB/s
+  [minio               ] parallel workers= 16: …    916 MB/s
+  [s3torchconnector    ] parallel workers= 16: …    570 MB/s
+
+── s3dlio native get_many() ─────────────────────────────────────────────
+  [s3dlio native       ] get_many max_in_flight=  1: …    653 MB/s
+  [s3dlio native       ] get_many max_in_flight=  4: …    946 MB/s
+  [s3dlio native       ] get_many max_in_flight=  8: …    971 MB/s
+  [s3dlio native       ] get_many max_in_flight= 16: …    972 MB/s
+```
+
+**Serial GET** — one object at a time, no parallelism (20 objects)
+
+| Library | p50 | p95 | p99 | max | MB/s |
+|---|---|---|---|---|---|
+| s3dlio | 0.279s | 0.454s | 0.498s | 0.509s | **515 ◀** |
+| minio | 0.280s | 0.449s | 0.464s | 0.468s | 511 |
+| s3torchconnector | 0.358s | 0.600s | 0.633s | 0.641s | 389 |
+
+*p50/p95/p99/max — per-GET wall-clock latency (s) · MB/s — single-stream throughput (sum\_bytes / sum\_latency) · ◀ = fastest library*
+
+**Parallel GET** — `ThreadPoolExecutor`, same concurrency for all (20 objects, same bucket + objects for all libraries)
+
+| Library | w=1 | w=4 | w=8 | w=16 |
+|---|---|---|---|---|
+| s3dlio | **574 ◀** | **1,049 ◀** | **1,065 ◀** | **1,043 ◀** |
+| minio | 507 | 1,025 | 930 | 916 |
+| s3torchconnector | 402 | 544 | 516 | 570 |
+
+*All values in MB/s · All libraries use `ThreadPoolExecutor(max_workers=N)` — identical concurrency model · ◀ = fastest library at that worker count*
+
+**s3dlio Native get_many()** — Rust Tokio async, s3dlio only (20 objects)
+
+| max\_in\_flight | MB/s | vs ThreadPoolExecutor |
+|---|---|---|
+| 1 | 653 | +13.7% vs w=1 |
+| 4 | 946 | −9.8% vs w=4 |
+| 8 | 971 | −8.9% vs w=8 |
+| 16 | 972 | −6.9% vs w=16 |
+
+*`get_many()` uses s3dlio's Rust Tokio async engine; all requests are scheduled in a single Rust thread pool — no Python GIL or thread creation overhead.*
+
+---
 
 #### `test_direct_write_comparison.py`
 Measures **native API write + read throughput** across all three libraries side-by-side,
@@ -156,11 +481,15 @@ python tests/object-store/test_s3dlio_direct.py --help
 
 ### Shell Script Tests
 
-These shell scripts exercise the full `mlpstorage` CLI for each library — datagen,
-training, and checkpoint — and are useful for quick end-to-end smoke tests.
+These shell scripts run the full `mlpstorage` CLI pipeline for each library —
+datagen, training, and checkpoint — using the **standard unet3d h100 workload**
+(`unet3d_h100.yaml`): 168 files × ~140 MB each (~23 GB total), batch_size=7,
+5 epochs, computation_time=0.323 s. This matches the real MLPerf Storage h100
+submission workload.
 
 #### `test_mlp_s3dlio.sh`
-Full mlpstorage smoke test with **s3dlio** as the storage backend.
+Full mlpstorage datagen + training with **s3dlio** as the storage backend,
+using the standard unet3d h100 workload paramters.
 
 ```bash
 cd mlp-storage
@@ -168,7 +497,8 @@ bash tests/object-store/test_mlp_s3dlio.sh
 ```
 
 #### `test_mlp_minio.sh`
-Full mlpstorage smoke test with **minio** as the storage backend.
+Full mlpstorage datagen + training with **minio** as the storage backend,
+using the standard unet3d h100 workload parameters.
 
 ```bash
 cd mlp-storage
@@ -176,7 +506,8 @@ bash tests/object-store/test_mlp_minio.sh
 ```
 
 #### `test_mlp_s3torch.sh`
-Full mlpstorage smoke test with **s3torchconnector** as the storage backend.
+Full mlpstorage datagen + training with **s3torchconnector** as the storage backend,
+using the standard unet3d h100 workload parameters.
 
 ```bash
 cd mlp-storage
