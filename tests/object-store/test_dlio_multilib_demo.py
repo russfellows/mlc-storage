@@ -49,9 +49,9 @@ from pathlib import Path
 DEFAULT_LIBRARIES = ['s3dlio', 'minio', 's3torchconnector']
 
 LIBRARY_BUCKETS = {
-    's3dlio':           'bucket-s3dlio',
-    'minio':            'bucket-minio',
-    's3torchconnector': 'bucket-s3torch',
+    's3dlio':           os.environ.get('BUCKET_S3DLIO', 'bucket-s3dlio'),
+    'minio':            os.environ.get('BUCKET_MINIO', 'bucket-minio'),
+    's3torchconnector': os.environ.get('BUCKET_S3TORCH', 'bucket-s3torch'),
 }
 
 # Workload 1 — Training

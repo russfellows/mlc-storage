@@ -1,7 +1,7 @@
 # S3 Library Write + Read Comparison — Results
 
 **Date:** March 18, 2026  
-**Endpoint:** `http://172.16.1.40:9000` (MinIO-compatible S3)  
+**Endpoint:** `http://minio-host:9000` (MinIO-compatible S3)  
 **Test script:** `Test-Backup/test_direct_write_comparison.py`
 
 ---
@@ -29,7 +29,7 @@ No credentials are hard-coded in the test script.  Any future tester only needs 
 
 | Library | Version |
 |---|---|
-| s3dlio | 0.9.76 |
+| s3dlio | 0.9.84 |
 | minio (Python SDK) | 7.2.20 |
 | s3torchconnector | 1.5.0 |
 
@@ -139,7 +139,7 @@ WRITE + READ COMPARISON — RESULTS
 ========================================================================================
   Library                Version       Write GB/s   Read GB/s  Wr s/obj  Rd s/obj
   ---------------------- ------------ ----------- ----------- --------- ---------
-  s3dlio                 0.9.76            0.525         1.085 ◀R    0.238s    0.115s
+  s3dlio                 0.9.84            0.525         1.085 ◀R    0.238s    0.115s
   minio                  7.2.20            0.415         1.051       0.301s    0.119s
   s3torchconnector       1.5.0             0.561 ◀W      0.541       0.223s    0.231s
 
@@ -193,7 +193,7 @@ of parallel objects.
 
 **Test script:** `Test-Backup/test_dlio_multilib_demo.py`  
 **Date:** March 18, 2026  
-**Endpoint:** `http://172.16.1.40:9000` (MinIO-compatible, ~1.2 GB/s link on this machine)
+**Endpoint:** `http://minio-host:9000` (MinIO-compatible, ~1.2 GB/s link on this machine)
 
 These results measure performance **as seen by DLIO** (via `mlpstorage`) — not direct native
 API calls. The gap versus the direct API numbers above quantifies DLIO overhead.
@@ -368,7 +368,7 @@ manages its own connection pool for reuse across calls.
 
 **Date:** March 18, 2026  
 **Test script:** `Test-Backup/test_training_mpi_sweep.py`  
-**Endpoint:** `http://172.16.1.40:9000` (MinIO-compatible S3)
+**Endpoint:** `http://minio-host:9000` (MinIO-compatible S3)
 
 These results measure performance **as seen by the full DLIO training pipeline** — including
 DLIO's MPI data generation, PyTorch DataLoader worker processes, NPZ deserialization, and

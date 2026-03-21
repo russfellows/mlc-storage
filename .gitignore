@@ -54,3 +54,6 @@ dlio_benchmark.OLD*/
 # Credential / environment files — NEVER commit these
 .env
 env-fast
+
+# TLS certificates — local only, never commit (paths to certs are in .env)
+.certs/
