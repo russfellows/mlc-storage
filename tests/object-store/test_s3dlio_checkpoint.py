@@ -179,7 +179,7 @@ Examples:
   python test_s3dlio_checkpoint.py --s3-uri s3://my-bucket/ckpt/test.dat --size-gb 8.0
         """,
     )
-    parser.add_argument('--bucket', default='bucket-s3dlio',
+    parser.add_argument('--bucket', default=os.environ.get('S3_BUCKET', 'bucket-s3dlio'),
                         help='S3 bucket name')
     parser.add_argument('--key', default=None,
                         help='Object key (default: auto-generated with timestamp)')
@@ -188,7 +188,7 @@ Examples:
     parser.add_argument('--size-gb', type=float, default=1.0,
                         help='Checkpoint size in GB')
     parser.add_argument('--endpoint', default=None,
-                        help='S3 endpoint URL (e.g. http://172.16.1.40:9000)')
+                        help='S3 endpoint URL (e.g. http://minio-host:9000)')
     parser.add_argument('--access-key', default=None, help='AWS access key ID')
     parser.add_argument('--secret-key', default=None, help='AWS secret access key')
     parser.add_argument('--region', default=None, help='AWS region')

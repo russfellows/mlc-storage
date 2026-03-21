@@ -158,10 +158,10 @@ def main():
         description='Direct s3dlio write test (streaming + multipart)',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--bucket', default='bucket-s3dlio',
+    parser.add_argument('--bucket', default=os.environ.get('S3_BUCKET', 'bucket-s3dlio'),
                         help='S3 bucket name')
     parser.add_argument('--endpoint', default=None,
-                        help='S3 endpoint URL (e.g., http://172.16.1.40:9000)')
+                        help='S3 endpoint URL (e.g., http://minio-host:9000)')
     parser.add_argument('--access-key', default=None, help='AWS/MinIO access key')
     parser.add_argument('--secret-key', default=None, help='AWS/MinIO secret key')
     parser.add_argument('--region', default=None, help='AWS region')
