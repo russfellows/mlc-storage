@@ -58,9 +58,9 @@ DEFAULT_MAX_IN_FLIGHT  = 8   # s3dlio per-object concurrent multipart parts
 MULTIPART_THRESHOLD = 32 * 1024 * 1024  # 32 MiB
 
 LIBRARY_BUCKETS = {
-    's3dlio':            'bucket-s3dlio',
-    'minio':             'bucket-minio',
-    's3torchconnector':  'bucket-s3torch',
+    's3dlio':            os.environ.get('BUCKET_S3DLIO', 'bucket-s3dlio'),
+    'minio':             os.environ.get('BUCKET_MINIO', 'bucket-minio'),
+    's3torchconnector':  os.environ.get('BUCKET_S3TORCH', 'bucket-s3torch'),
 }
 
 
@@ -160,7 +160,7 @@ def _generate_data(size_bytes: int, label: str) -> bytes:
     except ImportError:
         raise ImportError(
             "dgen-py is required for data generation. "
-            "Install with: pip install dgen-py  (or from /home/eval/Documents/Code/dgen-rs/)"
+            "Install with: pip install dgen-py"
         )
     t = time.perf_counter()
     data = bytes(dgen_py.generate_buffer(size_bytes))  # convert BytesView → bytes for sliceability
