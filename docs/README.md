@@ -24,6 +24,7 @@ mlp-storage hosts **four benchmark workloads**:
 | Your goal | Start here |
 |-----------|------------|
 | First time — install and run any benchmark | [QUICK_START.md](QUICK_START.md) |
+| Run or understand any test (unit, integration, object-store) | [../tests/README.md](../tests/README.md) |
 | Benchmark LLM KV-cache offload storage | [kv_cache_benchmark/README.md](../kv_cache_benchmark/README.md) |
 | Benchmark vector database storage (Milvus) | [vdb_benchmark/README.md](../vdb_benchmark/README.md) |
 | Set up object storage (S3 / MinIO / Azure / GCS) | [Object_Storage.md](Object_Storage.md) |
@@ -176,12 +177,6 @@ reduction). Architecture diagrams, tuning parameters, and expected output.
 
 ### Performance and Data Formats
 
-#### [PERFORMANCE_TESTING.md](PERFORMANCE_TESTING.md)
-
-Comprehensive benchmarking guide: data generation, training benchmarks, object
-storage backend comparisons, multi-node scaling, and result interpretation.
-Covers both local filesystem and object storage targets.
-
 #### [PARQUET_FORMATS.md](PARQUET_FORMATS.md)
 
 Parquet format support via two new DLIO reader classes: `ParquetReader`
@@ -200,12 +195,17 @@ dataset format registration, and integrating custom storage readers.
 
 ---
 
-## Archive and PR Notes
+## Test Scripts
 
-The `archive/`, `pr-parquet-readers/`, `pr-stream-chkpt/`, and `testing/`
-subdirectories contain supplementary material, PR-specific notes, and historical
-test records. These are reference material and not part of the primary
-documentation flow.
+For a complete guide to running tests — including environment setup, unit tests,
+integration tests, and object-store performance scripts — see
+**[tests/README.md](../tests/README.md)**.
+
+**[testing/TEST_README.md](testing/TEST_README.md)** lists legacy quick-run
+commands for the major benchmark workloads. Run those scripts from the project
+root (not from inside `docs/`).
+
+The quick-link tables below list the most commonly used scripts.
 
 ---
 

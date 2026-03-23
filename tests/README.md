@@ -5,6 +5,10 @@ supported workload types: training, checkpointing, KV-cache, and vector-database
 benchmarks — on all storage backends (local filesystem, NFS/Lustre, and S3-compatible
 object storage via s3dlio, minio, or s3torchconnector).
 
+> **New to the project?** Read [docs/README.md](../docs/README.md) first — it
+> explains all four benchmark workloads, the object storage library layer, and
+> the full document reference. Then come back here to run tests.
+
 ---
 
 ## Quick Start for New Users
@@ -375,6 +379,9 @@ python tests/object-store/test_s3dlio_direct.py    # zero-copy direct I/O path
 
 - **[Object_Perf_Results.md](object-store/Object_Perf_Results.md)** — Full benchmark
   results: native API throughput, DLIO streaming checkpoint (16 GB / 100 GB), MPI sweep
+- **[dlio_mpi_object_results.md](object-store/dlio_mpi_object_results.md)** — March 20, 2026: DLIO + MPI scaling results (UNet3D h100 profile, ~23.5 GB dataset, NP=1/2/4)
+- **[s3dlio_performance_analysis.md](object-store/s3dlio_performance_analysis.md)** — March 20, 2026 HISTORICAL: root-cause analysis of s3dlio performance (6 findings; most resolved in v0.9.84)
+- **[S3library_review_21-Mar.md](object-store/S3library_review_21-Mar.md)** — March 21, 2026: prefetch fairness review across all three libraries (analysis only; no code changes)
 
 ---
 
@@ -432,8 +439,8 @@ YAML benchmark configurations for DLIO-driven S3 testing:
 | `s3_test_mlp_minio.yaml` | minio backend config |
 | `s3_test_mlp_s3torchconnector.yaml` | s3torchconnector backend config |
 | `s3_test_dpsi.yaml` | dpsi (bucket+key) baseline config |
-| `S3_TESTING_GUIDE.md` | Architecture comparison and setup guide |
-| `S3_TEST_RESULTS.md` | Recorded test results |
+| [S3_TESTING_GUIDE.md](configs/S3_TESTING_GUIDE.md) | Architecture comparison and setup guide |
+| [S3_TEST_RESULTS.md](configs/S3_TEST_RESULTS.md) | Recorded test results |
 
 ---
 
