@@ -8,7 +8,7 @@ Complete guide to all 3 supported storage libraries for MLPerf Storage benchmark
 
 MLPerf Storage supports **3 storage libraries** for maximum flexibility:
 
-1. **s3dlio** - High-performance multi-protocol library (Rust + Python, zero-copy)
+1. **s3dlio** - Multi-protocol library (S3, Azure, GCS, local filesystem, direct I/O)
 2. **s3torchconnector** - AWS official S3 connector for PyTorch
 3. **minio** - MinIO Python SDK (S3-compatible)
 
@@ -16,11 +16,11 @@ MLPerf Storage supports **3 storage libraries** for maximum flexibility:
 
 ## Quick Comparison
 
-| Library | Protocols | Zero-Copy | Performance | Best For |
-|---------|-----------|-----------|-------------|----------|
-| **s3dlio** | S3/Azure/GCS/file/direct | ✅ Yes | ⭐⭐⭐⭐⭐ Highest | Maximum performance, multi-cloud |
-| **s3torchconnector** | S3 only | ❌ No | ⭐⭐⭐ Good | AWS S3, standard PyTorch |
-| **minio** | S3-compatible | ❌ No | ⭐⭐⭐⭐ Very Good | MinIO servers, native SDK |
+| Library | Protocols | Zero-Copy | Framework Support |
+|---------|-----------|-----------|------------------|
+| **s3dlio** | S3/Azure/GCS/file/direct | ✅ Yes | PyTorch, TensorFlow |
+| **s3torchconnector** | S3 only | ❌ No | PyTorch only |
+| **minio** | S3-compatible | ❌ No | PyTorch, TensorFlow |
 
 ---
 
@@ -80,10 +80,10 @@ python benchmark_write_comparison.py --library s3dlio
 ### s3dlio
 
 **Advantages:**
-- Zero-copy architecture (5-30 GB/s throughput)
-- Multi-protocol support (S3/Azure/GCS/file/direct)
-- Multi-endpoint load balancing
-- Drop-in replacement for s3torchconnector
+- Multi-protocol support (S3/Azure/GCS/file/direct I/O)
+- Zero-copy data path (BytesView)
+- Native multi-endpoint load balancing
+- Compatible with both PyTorch and TensorFlow
 
 **API:**
 ```python
@@ -209,55 +209,37 @@ client = Minio('localhost:9000',
                secret_key='minioadmin')
 ```
 
-### Azure Storage (s3dlio only)
+### Azure Blob Storage (s3dlio only)
 
-For Azure Blob Storage, use s3dlio with the `az://` protocol:
+Azure is supported via s3dlio using `az://` URIs. Set credentials before
+running any benchmark:
 
 ```bash
 export AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount
 export AZURE_STORAGE_ACCOUNT_KEY=your-account-key
-# Or use Azure CLI authentication: az login
 ```
 
-```python
-import s3dlio
-s3dlio.put_bytes('az://container/file', data)
-data = s3dlio.get('az://container/file')
-```
+Then use `storage_root: az://container/prefix` in your YAML workload config.
 
 ### Google Cloud Storage (s3dlio only)
+
+GCS is supported via s3dlio using `gs://` URIs:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
 ```
 
-```python
-import s3dlio
-s3dlio.put_bytes('gs://bucket/file', data)
-data = s3dlio.get('gs://bucket/file')
-```
-
-### s3dlio Drop-in Replacement for s3torchconnector (Advanced)
-
-For DLIO installations that pre-date the `storage_library` config key, s3dlio
-can be installed as a drop-in replacement that intercepts s3torchconnector calls:
-
-```python
-from s3dlio.integrations.dlio import install_dropin_replacement
-
-import dlio_benchmark, os
-dlio_path = os.path.dirname(os.path.dirname(dlio_benchmark.__file__))
-install_dropin_replacement(dlio_path)  # backs up original files
-```
-
-After this, existing S3 configs transparently use s3dlio. For all new
-deployments, prefer setting `storage_library: s3dlio` in the YAML directly.
+Then use `storage_root: gs://bucket/prefix` in your YAML workload config.
 
 ---
 
-## Multi-Endpoint Load Balancing (s3dlio only)
+## Multi-Endpoint Load Balancing
 
-s3dlio supports multi-endpoint configuration for load balancing across multiple servers:
+All three object storage libraries support multi-endpoint operation. s3dlio
+provides this natively via YAML config; minio and s3torchconnector achieve it
+via MPI rank-based endpoint selection.
+
+For s3dlio, configure multiple endpoints directly in your workload YAML:
 
 ```yaml
 reader:
@@ -269,7 +251,9 @@ reader:
   load_balance_strategy: round_robin  # or 'least_connections'
 ```
 
-**See:** [MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md) for complete guide
+**See [MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md)** for the complete
+guide covering all three libraries, MPI rank-based distribution, template
+expansion, and known limitations.
 
 ---
 
@@ -302,39 +286,6 @@ mc ls local/
 
 ---
 
-## Migration Guide
-
-### From s3torchconnector to s3dlio
-
-**Step 1:** Change DLIO config
-```yaml
-# OLD
-reader:
-  storage_library: s3torchconnector
-
-# NEW
-reader:
-  storage_library: s3dlio
-```
-
-**Step 2:** That's it! (API compatible)
-
-### From boto3 to s3dlio
-
-**Step 1:** Replace imports
-```python
-# OLD
-import boto3
-s3 = boto3.client('s3')
-s3.put_object(Bucket='bucket', Key='key', Body=data)
-
-# NEW
-import s3dlio
-s3dlio.put_bytes('s3://bucket/key', data)
-```
-
----
-
 ## Advanced Features
 
 ### Byte-Range Reads (All Libraries)
@@ -359,18 +310,22 @@ reader = client.get_object('bucket', 'file.parquet', start=1000, end=1998)
 ## Related Documentation
 
 - **[Quick Start](QUICK_START.md)** - Get running in 5 minutes
-- **[Performance Testing](PERFORMANCE_TESTING.md)** - Comprehensive benchmarks
-- **[Multi-Endpoint Guide](MULTI_ENDPOINT_GUIDE.md)** - Load balancing configuration
+- **[Object Storage Setup](Object_Storage_Library_Setup.md)** - Installation and configuration for all three libraries
+- **[Multi-Endpoint Guide](MULTI_ENDPOINT_GUIDE.md)** - Load balancing for all three libraries
 - **[Parquet Formats](PARQUET_FORMATS.md)** - Row-group reads for columnar formats
+- **[Object Storage Test Results](Object_Storage_Test_Results.md)** - Measured results per library
 
 ---
 
 ## Summary
 
-- **s3dlio**: Best performance, multi-protocol, zero-copy (RECOMMENDED)
-- **minio**: Good for MinIO servers, S3-compatible API  
-- **s3torchconnector**: Standard AWS S3, PyTorch integration
+| Library | Protocols | Framework Support | Multi-Endpoint |
+|---------|-----------|-------------------|----------------|
+| **s3dlio** | S3, Azure, GCS, file, direct | PyTorch, TensorFlow | Native config |
+| **s3torchconnector** | S3 only | PyTorch only | Via MPI rank selection |
+| **minio** | S3-compatible | PyTorch, TensorFlow | Via MPI rank selection |
 
-**For maximum performance:** Use s3dlio with zero-copy verification.  
-**For cloud compatibility:** Use s3dlio (works with S3/Azure/GCS).  
-**For MinIO servers:** Use minio or s3dlio.
+All three libraries are valid choices. Select based on your protocol requirements
+and framework. See [Object_Storage_Library_Setup.md](Object_Storage_Library_Setup.md)
+for installation and [MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md) for
+multi-endpoint configuration.
