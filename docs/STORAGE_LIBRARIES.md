@@ -213,17 +213,45 @@ client = Minio('localhost:9000',
 
 For Azure Blob Storage, use s3dlio with the `az://` protocol:
 
+```bash
+export AZURE_STORAGE_ACCOUNT_NAME=mystorageaccount
+export AZURE_STORAGE_ACCOUNT_KEY=your-account-key
+# Or use Azure CLI authentication: az login
+```
+
 ```python
 import s3dlio
-
-# Azure authentication via environment variables
-# export AZURE_STORAGE_ACCOUNT=myaccount
-# export AZURE_STORAGE_KEY=mykey
-
-# Or use Azure CLI authentication (az login)
 s3dlio.put_bytes('az://container/file', data)
 data = s3dlio.get('az://container/file')
 ```
+
+### Google Cloud Storage (s3dlio only)
+
+```bash
+export GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json
+```
+
+```python
+import s3dlio
+s3dlio.put_bytes('gs://bucket/file', data)
+data = s3dlio.get('gs://bucket/file')
+```
+
+### s3dlio Drop-in Replacement for s3torchconnector (Advanced)
+
+For DLIO installations that pre-date the `storage_library` config key, s3dlio
+can be installed as a drop-in replacement that intercepts s3torchconnector calls:
+
+```python
+from s3dlio.integrations.dlio import install_dropin_replacement
+
+import dlio_benchmark, os
+dlio_path = os.path.dirname(os.path.dirname(dlio_benchmark.__file__))
+install_dropin_replacement(dlio_path)  # backs up original files
+```
+
+After this, existing S3 configs transparently use s3dlio. For all new
+deployments, prefer setting `storage_library: s3dlio` in the YAML directly.
 
 ---
 
@@ -241,7 +269,7 @@ reader:
   load_balance_strategy: round_robin  # or 'least_connections'
 ```
 
-**See:** [MULTI_ENDPOINT.md](MULTI_ENDPOINT.md) for complete guide
+**See:** [MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md) for complete guide
 
 ---
 
@@ -332,9 +360,8 @@ reader = client.get_object('bucket', 'file.parquet', start=1000, end=1998)
 
 - **[Quick Start](QUICK_START.md)** - Get running in 5 minutes
 - **[Performance Testing](PERFORMANCE_TESTING.md)** - Comprehensive benchmarks
-- **[S3DLIO Integration](S3DLIO_INTEGRATION.md)** - Deep dive on s3dlio
-- **[Multi-Endpoint Guide](MULTI_ENDPOINT.md)** - Load balancing configuration
-- **[Parquet Formats](PARQUET_FORMATS.md)** - Byte-range reads for columnar formats
+- **[Multi-Endpoint Guide](MULTI_ENDPOINT_GUIDE.md)** - Load balancing configuration
+- **[Parquet Formats](PARQUET_FORMATS.md)** - Row-group reads for columnar formats
 
 ---
 
