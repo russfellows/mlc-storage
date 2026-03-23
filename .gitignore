@@ -29,6 +29,8 @@ ENV/
 env/
 .env
 env-*
+**/.venv
+**/.env
 
 # uv
 .uv/
