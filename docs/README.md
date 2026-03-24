@@ -30,6 +30,7 @@ mlp-storage hosts **four benchmark workloads**:
 | Set up object storage (S3 / MinIO / Azure / GCS) | [Object_Storage.md](Object_Storage.md) |
 | Install and configure an object storage library | [Object_Storage_Library_Setup.md](Object_Storage_Library_Setup.md) |
 | Compare object storage libraries (s3dlio, minio, s3torchconnector) | [STORAGE_LIBRARIES.md](STORAGE_LIBRARIES.md) |
+| Understand AIStore gaps, reader/checkpoint issues, rationalization options | [dlio_benchmark/docs/AIStore_Analysis.md](../dlio_benchmark/docs/AIStore_Analysis.md) |
 | Test streaming checkpointing | [Streaming-Chkpt-Guide.md](Streaming-Chkpt-Guide.md) |
 | Configure multi-endpoint / load-balanced object storage | [MULTI_ENDPOINT_GUIDE.md](MULTI_ENDPOINT_GUIDE.md) |
 | Understand the system architecture | [ARCHITECTURE.md](ARCHITECTURE.md) |
@@ -137,6 +138,17 @@ s3torchconnector):
 Side-by-side comparison of all three supported object storage libraries:
 protocol support, installation, API usage examples, configuration snippets, and
 multi-protocol examples for s3dlio (S3 / Azure / GCS / file / direct).
+
+#### [dlio_benchmark/docs/AIStore_Analysis.md](../dlio_benchmark/docs/AIStore_Analysis.md)
+
+Detailed gap analysis of the native AIStore support (`storage_type: aistore`)
+versus the S3 multi-library path. Covers four specific gaps — checkpointing
+(silently falls back to local-disk PT_SAVE), per-format reader routing
+(JPEG/PNG broken; NPY/NPZ loses streaming reader; Parquet untested), config
+validation gaps, and zero checkpoint test coverage. Includes a full feature-parity
+table and three concrete rationalization options (A: S3 gateway, B: fill gaps,
+C: consolidate as 4th library) with a pros/cons comparison and a per-option file
+change list.
 
 #### [Object_Storage_Test_Guide.md](Object_Storage_Test_Guide.md)
 

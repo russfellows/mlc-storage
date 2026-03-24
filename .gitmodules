@@ -1,4 +1,4 @@
 [submodule "dlio_benchmark"]
 	path = dlio_benchmark
-	url = https://github.com/russfellows/dlio_benchmark.git
-	branch = main
+        url = https://github.com/russfellows/dlio_benchmark.git
+        branch = main
