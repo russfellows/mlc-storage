@@ -1,79 +1,63 @@
-# Python
+# Python cache
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
 
-# Virtual Environments
-.venv/
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
 venv/
-ENV/
+.venv/
 env/
 .env
 env-*
 **/.venv
 **/.env
 
-# uv
-.uv/
-uv.lock
-
-# IDEs
-.vscode/
+# IDE
 .idea/
+.vscode/
 *.swp
 *.swo
-*~
 
-# Testing
+# Test artifacts
 .pytest_cache/
 .coverage
 htmlcov/
-.tox/
+*.html
 
-# DLIO outputs
-hydra_out/
-results/
-*.log
-*.history
-
-# MLPerf Storage outputs
-results_dir/
-mlperf.history
-
-# Temporary files
-*.tmp
-.tmp/
-*.bak
-*.backup
-*.OLD_*/
-
-# OS
+# OS files
 .DS_Store
 Thumbs.db
 
-# Test artifacts
-hydra_log/
-minio_test/
-Test-Backup/
 
-# Dependencies (installed via pip)
-dlio_benchmark/
+# Coding Agents
+.agent/
+.roo/
+.vscode/
+CLAUDE.md
+.roomodes
+LOCAL_BRANCH_NOTES.md
+
+# DLIO test artifacts — created in cwd when running dlio_benchmark tests
+output/
+dlio_test_output/
+data/
+checkpoints/
+dlio_benchmark_test.log
+dlio_aistore_benchmark_test.log
+
+# Backup directories — local-only, never commit
+Test-Backup/
+dlio_benchmark.OLD*/
+
+# Credential / environment files — NEVER commit these
+.env
+env-fast
+
+# TLS certificates — local only, never commit (paths to certs are in .env)
+.certs/

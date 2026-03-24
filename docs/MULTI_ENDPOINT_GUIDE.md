@@ -424,6 +424,88 @@ mpirun -np 4 python -c "import os; print(f'Rank: {os.environ.get(\"OMPI_COMM_WOR
 
 ---
 
+## Known Limitations
+
+The following gaps were identified during code review and have **not** been
+addressed in the current implementation. They are documented here to prevent
+data loss and to inform future contributors.
+
+### 1. SLURM not supported for MPI rank detection
+
+**Affected**: all three backends (`minio_writer.py`, `s3torch_writer.py`,
+`s3dlio_writer.py`)
+
+`_get_mpi_rank()` checks only two environment variables:
+- `OMPI_COMM_WORLD_RANK` (Open MPI v4+)
+- `PMI_RANK` (MPICH, Intel MPI, MVAPICH2)
+
+`SLURM_PROCID` (set by SLURM's `srun`) is **not checked**. On SLURM-managed
+HPC clusters, MPI rank detection will silently return `None`, causing all ranks
+to fall back to the first endpoint rather than distributing across endpoints.
+
+**Workaround**: Set `OMPI_COMM_WORLD_RANK` manually in your SLURM job script:
+```bash
+export OMPI_COMM_WORLD_RANK=$SLURM_PROCID
+```
+
+**Fix**: Add `SLURM_PROCID` to `_get_mpi_rank()` in all three writer files,
+before the MPICH check:
+```python
+# SLURM uses SLURM_PROCID
+rank_str = os.environ.get('SLURM_PROCID')
+if rank_str:
+    try:
+        return int(rank_str)
+    except ValueError:
+        pass
+```
+
+---
+
+### 2. Template expansion handles only the first `{N...M}` pattern
+
+**Affected**: all three backends (`_expand_template()`)
+
+`S3_ENDPOINT_TEMPLATE` uses `re.search()`, which stops at the first match.
+A template with multiple patterns (e.g., `http://{1...2}.{10...12}:9000`) only
+expands the first `{N...M}`, leaving the second as a literal string:
+
+```
+Input:    http://{1...2}.rack{1...4}.example.com
+Output:   http://1.rack{1...4}.example.com
+          http://2.rack{1...4}.example.com   ← second pattern NOT expanded
+```
+
+**Workaround**: Enumerate endpoints explicitly using `S3_ENDPOINT_URIS` instead
+of a template with multiple ranges.
+
+**Fix**: Replace `re.search()` with `re.findall()` and apply recursive
+expansion, or raise a clear error when more than one pattern is detected.
+
+---
+
+### 3. No URI validation — malformed endpoints pass through silently
+
+**Affected**: all three backends (`_detect_and_select_endpoint()`)
+
+Endpoint URIs from `S3_ENDPOINT_URIS`, `S3_ENDPOINT_TEMPLATE`, or
+`S3_ENDPOINT_FILE` are accepted without format checking. Missing `http://` or
+`https://` prefix, extra whitespace, or typographical errors result in confusing
+failures deep in the storage client rather than a clear error at startup.
+
+**Workaround**: Double-check your endpoint URIs manually before running.
+
+**Fix**: Add a validation step after endpoint list construction:
+```python
+import re
+_URI_RE = re.compile(r'^https?://.+:\d+$')
+for uri in endpoints:
+    if not _URI_RE.match(uri):
+        raise ValueError(f"Malformed endpoint URI: {uri!r} — expected http(s)://host:port")
+```
+
+---
+
 ## Summary
 
 **Multi-endpoint support provides**:

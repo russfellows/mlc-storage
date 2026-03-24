@@ -45,12 +45,12 @@ class StorageBackend:
         device: float
         host: float
 
-    def write(self, key: str, data) -> 'StorageBackend.IOTiming':
-        """Writes data (bytes-like) to the backend and returns latency breakdown."""
+    def write(self, key: str, data: np.ndarray) -> 'StorageBackend.IOTiming':
+        """Writes data to the backend and returns latency breakdown."""
         raise NotImplementedError
 
-    def read(self, key: str) -> Tuple[bytes, 'StorageBackend.IOTiming']:
-        """Reads data from the backend; returns raw bytes and latency."""
+    def read(self, key: str) -> Tuple[np.ndarray, 'StorageBackend.IOTiming']:
+        """Reads data from the backend and returns the data and latency."""
         raise NotImplementedError
 
     def delete(self, key: str):
@@ -199,135 +199,43 @@ class GPUMemoryBackend(StorageBackend):
             pinned_mempool.free_all_blocks()
 
 
-class SimulatedGPUBackend(StorageBackend):
-    """
-    Simulated GPU VRAM tier — no GPU hardware, PyTorch, or CuPy required.
-
-    This is an in-memory metadata tracker: it stores only ``{key → size_bytes}``
-    in a plain dict and models read/write latency by dividing ``size_bytes`` by a
-    configurable bandwidth (default: PCIe 5.0 x16, 64 GB/s).
-
-    Read operations regenerate fresh random bytes via dgen-py so that entries
-    demoted to the CPU or NVMe tier receive correctly-sized data — consistent
-    with the rest of the pipeline where bytes are synthetic.
-
-    Because this backend is always available (no hardware dependency), the GPU
-    tier exists in every run and the benchmark produces a realistic three-tier
-    workload distribution regardless of the host machine.
-    """
-
-    _BYTES_PER_GB: int = 1024 ** 3
-
-    def __init__(self, bandwidth_gb_s: float = 64.0, on_eviction_callback=None):
-        """
-        Parameters
-        ----------
-        bandwidth_gb_s :
-            Simulated host↔GPU transfer bandwidth in GB/s.
-            Default 64.0 models a PCIe 5.0 x16 link.
-            Use ~3350.0 to model intra-GPU HBM3 bandwidth (H100/H200).
-        on_eviction_callback :
-            Optional callback kept for API compatibility with GPUMemoryBackend.
-            Not triggered by this backend (eviction is handled by MultiTierCache).
-        """
-        self._bandwidth_b_per_s: float = bandwidth_gb_s * self._BYTES_PER_GB
-        self.on_eviction_callback = on_eviction_callback
-        self._sizes: Dict[str, int] = {}
-
-    def write(self, key: str, data) -> StorageBackend.IOTiming:
-        """Record size and return simulated PCIe transfer latency."""
-        size = len(data)
-        self._sizes[key] = size
-        simulated = size / self._bandwidth_b_per_s
-        return StorageBackend.IOTiming(total=simulated, device=simulated, host=0.0)
-
-    def write_size(self, key: str, size_bytes: int) -> StorageBackend.IOTiming:
-        """Trace-mode shortcut: record size without passing data."""
-        self._sizes[key] = size_bytes
-        simulated = size_bytes / self._bandwidth_b_per_s
-        return StorageBackend.IOTiming(total=simulated, device=simulated, host=0.0)
-
-    def read(self, key: str) -> Tuple[bytes, StorageBackend.IOTiming]:
-        """
-        Return fresh random bytes of the correct size with simulated latency.
-
-        The actual byte content is regenerated (not stored) — only the size is
-        tracked.  This is correct for simulation: the bytes are synthetic anyway.
-        """
-        if key not in self._sizes:
-            raise KeyError(f"Key {key} not found in SimulatedGPUBackend")
-        size = self._sizes[key]
-        simulated = size / self._bandwidth_b_per_s
-        try:
-            import dgen_py
-            data = dgen_py.generate_buffer(size)
-        except ImportError:
-            data = bytes(size)  # zero-byte fallback
-        return data, StorageBackend.IOTiming(total=simulated, device=simulated, host=0.0)
-
-    def delete(self, key: str):
-        self._sizes.pop(key, None)
-
-    def clear(self):
-        self._sizes.clear()
-
-
 class CPUMemoryBackend(StorageBackend):
-    """
-    CPU RAM storage backend.  Second tier in the cache hierarchy.
-
-    Data layout
-    -----------
-    Each entry is stored as a ``bytes`` object — immutable, no GC overhead,
-    no numpy dtype, no shape metadata.  This is a byte-level cache.
-
-    Write path — ``bytes(data)`` converts any buffer-protocol object (BytesView,
-                 memoryview, bytes) into an owned ``bytes`` object: one copy.
-    Read path  — returns the stored ``bytes`` reference directly: zero-copy.
-    """
+    """CPU RAM storage backend. This is the second tier in the cache hierarchy."""
 
     def __init__(self):
-        self._raw: Dict[str, bytes] = {}
+        self.cache = {}
 
-    def write(self, key: str, data) -> StorageBackend.IOTiming:
-        """Store data as owned bytes (one copy from caller's buffer)."""
+    def write(self, key: str, data: np.ndarray) -> StorageBackend.IOTiming:
+        """Writes data by copying it into the cache dictionary."""
         start = time.perf_counter()
-        self._raw[key] = bytes(data)
+        self.cache[key] = np.copy(data)
         total = time.perf_counter() - start
         return StorageBackend.IOTiming(total=total, device=total, host=total)
 
-    def read(self, key: str) -> Tuple[bytes, StorageBackend.IOTiming]:
-        """Return the stored bytes — zero-copy reference."""
-        if key not in self._raw:
+    def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
+        """Reads data by copying it from the cache dictionary."""
+        if key not in self.cache:
             raise KeyError(f"Key {key} not found in CPU cache")
         start = time.perf_counter()
-        data  = self._raw[key]
+        data = np.copy(self.cache[key])
         total = time.perf_counter() - start
         return data, StorageBackend.IOTiming(total=total, device=total, host=total)
 
     def delete(self, key: str):
-        self._raw.pop(key, None)
+        if key in self.cache:
+            del self.cache[key]
 
     def clear(self):
-        self._raw.clear()
+        for key in list(self.cache.keys()):
+            del self.cache[key]
+        self.cache.clear()
         gc.collect()
 
 
 class NVMeBackend(StorageBackend):
     """
-    NVMe/SSD storage backend using raw binary files.
-
-    Data layout
-    -----------
-    Each cache entry is stored as a flat ``<key>.bin`` file containing the raw
-    little-endian bytes of the array payload (no numpy format header).
-    Shape and dtype are kept in the ``metadata`` dict in memory.
-
-    Write path — stores ``data.tobytes()`` (one copy, unavoidable for durability).
-    Read path  — ``path.read_bytes()`` + ``np.frombuffer(...).reshape(...).copy()``.
-                 The final ``.copy()`` is necessary to:
-                   1. Free the transient ``bytes`` object returned by ``read_bytes()``.
-                   2. Return a writeable, owned array to callers.
+    NVMe/SSD storage backend using memory-mapped files.
+    This is the third and slowest tier, used for offloading from CPU RAM.
     """
 
     def __init__(self, base_path: str = None):
@@ -340,7 +248,7 @@ class NVMeBackend(StorageBackend):
             if self.base_path.exists():
                 if not self.base_path.is_dir():
                     raise NotADirectoryError(f"Cache path {self.base_path} exists but is not a directory.")
-                for entry in self.base_path.glob("*.bin"):
+                for entry in self.base_path.glob("*.npy"):
                     try:
                         entry.unlink()
                     except OSError:
@@ -355,42 +263,39 @@ class NVMeBackend(StorageBackend):
 
     def _get_path(self, key: str) -> Path:
         """Constructs the file path for a given cache key."""
-        return self.base_path / f"{key}.bin"
+        return self.base_path / f"{key}.npy"
 
-    def write(self, key: str, data) -> StorageBackend.IOTiming:
-        """Write raw bytes to disk — accepts any buffer-protocol object."""
+    def write(self, key: str, data: np.ndarray) -> StorageBackend.IOTiming:
+        """Writes a NumPy array to a binary .npy file on disk."""
         start = time.perf_counter()
-        path  = self._get_path(key)
-        size  = len(data)
+        path = self._get_path(key)
 
         with open(path, 'wb') as f:
-            f.write(data)
+            np.save(f, data, allow_pickle=False)
             post_save = time.perf_counter()
             f.flush()
             os.fsync(f.fileno())
             post_fsync = time.perf_counter()
 
-        self.metadata[key] = {'size': size}
+        self.metadata[key] = {'shape': data.shape, 'dtype': str(data.dtype), 'size': data.nbytes}
 
-        host_time   = post_save  - start
+        host_time = post_save - start
         device_time = post_fsync - post_save
-        total       = post_fsync - start
+        total = post_fsync - start
         return StorageBackend.IOTiming(total=total, device=device_time, host=host_time)
 
-    def read(self, key: str) -> Tuple[bytes, StorageBackend.IOTiming]:
-        """Read raw bytes from disk — returns bytes, no numpy conversion."""
+    def read(self, key: str) -> Tuple[np.ndarray, StorageBackend.IOTiming]:
+        """Reads a .npy file from disk, dropping page cache first for accurate benchmarking."""
         start = time.perf_counter()
-        path  = self._get_path(key)
+        path = self._get_path(key)
 
         if not path.exists():
             raise KeyError(f"Key {key} not found in NVMe cache")
-        if key not in self.metadata:
-            raise KeyError(f"Metadata for {key} not found in NVMe cache")
 
         try:
             fd = os.open(path, os.O_RDONLY)
             try:
-                os.posix_fadvise(fd, 0, 0, 4)  # POSIX_FADV_DONTNEED — drop page cache
+                os.posix_fadvise(fd, 0, 0, 4)  # POSIX_FADV_DONTNEED
             except AttributeError:
                 pass
             finally:
@@ -398,30 +303,30 @@ class NVMeBackend(StorageBackend):
         except Exception:
             pass
 
-        pre_load    = time.perf_counter()
-        data        = path.read_bytes()
-        load_done   = time.perf_counter()
+        pre_load = time.perf_counter()
+        data = np.load(path, allow_pickle=False)
+        load_done = time.perf_counter()
+        data = np.array(data)
+        copy_done = time.perf_counter()
 
         device_time = load_done - pre_load
-        host_time   = pre_load - start
-        total       = load_done - start
+        host_time = (pre_load - start) + (copy_done - load_done)
+        total = copy_done - start
         return data, StorageBackend.IOTiming(total=total, device=device_time, host=host_time)
 
     def delete(self, key: str):
         path = self._get_path(key)
-        if path.exists():
-            path.unlink()
-        if key in self.metadata:
-            del self.metadata[key]
+        path.unlink(missing_ok=True)
+        self.metadata.pop(key, None)
 
     def clear(self):
-        """Delete all binary cache files from the cache directory."""
-        for file in self.base_path.glob("*.bin"):
+        """Deletes all .npy files from the cache directory."""
+        for file in self.base_path.glob("*.npy"):
             file.unlink()
         self.metadata.clear()
 
     def __del__(self):
-        """Clean up the temporary directory when the object is destroyed."""
+        """Cleans up the temporary directory when the object is destroyed."""
         if self.temp_dir:
             self.temp_dir.cleanup()
 

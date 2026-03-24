@@ -62,12 +62,3 @@ except ImportError:
     HAS_OPENPYXL = False
 
 OPENPYXL_AVAILABLE = HAS_OPENPYXL
-
-try:
-    import dgen_py
-    HAS_DGEN = True
-except ImportError:
-    dgen_py = None
-    HAS_DGEN = False
-
-DGEN_AVAILABLE = HAS_DGEN

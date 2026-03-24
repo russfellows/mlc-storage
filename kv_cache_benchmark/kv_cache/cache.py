@@ -5,134 +5,194 @@ Contains KVCacheGenerator (data generation with pre-allocated buffers)
 and MultiTierCache (3-tier LRU cache with waterfall eviction).
 """
 
+import os
 import time
 import hashlib
-import shutil
 import logging
 import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE, DGEN_AVAILABLE
+from kv_cache._compat import TORCH_AVAILABLE, CUPY_AVAILABLE
 from kv_cache.config import cfg
 from kv_cache.models import ModelConfig, InferencePhase
 from kv_cache.backends import (
-    StorageBackend, SimulatedGPUBackend, GPUMemoryBackend,
-    CPUMemoryBackend, NVMeBackend, NullBackend,
+    StorageBackend, GPUMemoryBackend, CPUMemoryBackend, NVMeBackend, NullBackend,
 )
 from kv_cache.tracer import IOTracer
-from kv_cache.data_producer import DataGeneratorPool
 
 logger = logging.getLogger(__name__)
 
 
 class KVCacheGenerator:
-    """
-    Generates raw bytes for KV cache entries used in simulation benchmarking.
+    """Generates realistic-looking KV cache data for testing."""
 
-    When dgen-py is available, calls ``dgen_py.generate_buffer(size_bytes)``
-    in-process (GIL released, Rayon-parallel Xoshiro256++, 10–100 GB/s).
-    Returns a ``BytesView`` backed by Rust-heap memory — zero-copy, no
-    conversion, no numpy dtype, no reshape.
-
-    Falls back to a pre-computed random bytes buffer when dgen-py is absent.
-    """
-
-    _FALLBACK_BUFFER_SIZE: int = 256 * 1024 * 1024  # 256 MB
-
-    def __init__(self, model_config: ModelConfig, global_seed: Optional[int] = None,
-                 prefetch_depth: int = 8):
+    def __init__(self, model_config: ModelConfig, global_seed: Optional[int] = None):
         self.model_config = model_config
-        self.global_seed  = 0 if global_seed is None else int(global_seed)
+        self.global_seed = 0 if global_seed is None else int(global_seed)
 
-        self._producer_pool: Optional[DataGeneratorPool] = None
+        self.buffer_size_elements = 128 * 1024 * 1024  # 128 million elements (~256MB for float16)
+        self.dtype = np.float16 if 'float16' in self.model_config.dtype else np.float32
 
-        if DGEN_AVAILABLE:
-            if prefetch_depth > 0:
-                self._producer_pool = DataGeneratorPool(
-                    buffer_size_mb=256,
-                    prefetch_depth=prefetch_depth,
-                ).start()
-                logger.info(
-                    f"KVCacheGenerator: zero-copy producer pool started "
-                    f"(256 MB buffers, depth={prefetch_depth}, "
-                    f"no data copies). Generation runs ahead of storage writes."
-                )
-            else:
-                logger.info("KVCacheGenerator: using dgen-py in-process (zero-copy BytesView, no prefetch)")
-            self.precomputed_buffer: Optional[bytes] = None
-        else:
-            # Fallback: 256 MB of seeded random bytes — no numpy dtype involved.
-            logger.info(
-                f"KVCacheGenerator: pre-generating "
-                f"{self._FALLBACK_BUFFER_SIZE / 1024**2:.0f} MB random bytes buffer…"
-            )
-            rng = np.random.default_rng(self.global_seed)
-            self.precomputed_buffer = rng.bytes(self._FALLBACK_BUFFER_SIZE)
+        logger.info(f"Pre-generating {self.buffer_size_elements * 2 / 1024**2:.0f} MB noise buffer...")
+        rng = np.random.default_rng(self.global_seed)
+        self.precomputed_buffer = rng.uniform(-1.0, 1.0, size=self.buffer_size_elements).astype(self.dtype)
 
     def _seed_from_key(self, key: str) -> int:
+        """Derives a deterministic seed from the key string, combined with the global seed."""
+        # Use SHA-256 to get a consistent hash of the key, then combine with global_seed.
         h = hashlib.sha256(key.encode('utf-8')).digest()
+        # Take the first 8 bytes of the hash to form a 64-bit integer, then XOR with global_seed.
         key_hash64 = int.from_bytes(h[:8], 'little')
+        # Mask to 64 bits to ensure it stays within the range of uint64.       
         return (key_hash64 ^ self.global_seed) & 0xFFFFFFFFFFFFFFFF
 
-    def generate(self, sequence_length: int, key: Optional[str] = None):
+    @staticmethod
+    def _apply_xor_stamp(data: np.ndarray, seed: int) -> None:
+        """XOR-stamp data IN-PLACE so every 4 KB block is unique on disk.
+
+        Problem solved:
+            All entries are sliced from the same 256 MB precomputed buffer.
+            A repeating stamp fixes cross-entry dedup (different keys →
+            different stamps) but NOT intra-entry dedup: a 2.5 GB entry
+            reuses each buffer block ~10×, and a repeating XOR leaves
+            those copies identical — measured at **95-97% dedup ratio**.
+
+        Solution (two-layer XOR):
+            1. XOR every block with a key-derived 4 KB base stamp.
+               → eliminates cross-entry duplicates.
+            2. XOR the first 8 bytes of each block with its block index.
+               → eliminates intra-entry duplicates (same buffer content
+                 at different positions becomes different on disk).
+
+            Properties preserved:
+              - Same key  → same output → reproducible  ✓
+              - Diff keys → diff output → no cross-entry dedup  ✓
+              - Diff positions → diff output → no intra-entry dedup  ✓
+
+        Performance:
+            Layer 1 (full XOR) is the same cost as before: ~15-20 GB/s,
+            limited by memcpy bandwidth.  Layer 2 touches only 8 bytes
+            per 4 KB block (0.2% of data) with one small allocation
+            (8 × n_blocks bytes ≈ 5 MB per 2.5 GB entry).  Net overhead
+            of Layer 2 vs. original single-layer stamp: <1%.
         """
-        Return raw bytes for a KV cache entry of ``sequence_length`` tokens.
+        STAMP_BYTES = 4096  # one 4 KB disk block
+        stamp_rng = np.random.default_rng(seed)
+        stamp = stamp_rng.integers(0, 0xFF, size=STAMP_BYTES,
+                                   dtype=np.uint8, endpoint=True)
 
-        dgen-py path (preferred)
-        ~~~~~~~~~~~~~~~~~~~~~~~~
-        Calls ``dgen_py.generate_buffer(total_bytes)`` in-process.  Returns a
-        ``BytesView`` (buffer-protocol object backed by Rust-heap memory).
-        No dtype conversion, no numpy reshape — just bytes of the right size.
+        raw = data.view(np.uint8)
+        n = raw.shape[0]
 
-        Bytes fallback path
-        ~~~~~~~~~~~~~~~~~~~
-        Slice of the pre-computed 256 MB random bytes buffer.  If the entry is
-        larger than the buffer the bytes are tiled via ``bytes * n`` (one alloc).
+        full = (n // STAMP_BYTES) * STAMP_BYTES
+        if full > 0:
+            blocks = raw[:full].reshape(-1, STAMP_BYTES)
+
+            # Layer 1: base stamp — same pattern per key (cross-entry dedup)
+            blocks ^= stamp
+
+            # Layer 2: block index in first 8 bytes (intra-entry dedup)
+            # Each block gets its positional index XOR'd in, so identical
+            # buffer regions at different offsets produce different disk blocks.
+            # Allocation: 8 × n_blocks bytes (~5 MB per 2.5 GB entry).
+            n_blocks = blocks.shape[0]
+            idx_bytes = (np.arange(n_blocks, dtype=np.uint64)
+                         .view(np.uint8)
+                         .reshape(n_blocks, 8))
+            blocks[:, :8] ^= idx_bytes
+
+        remainder = n - full
+        if remainder > 0:
+            raw[full:] ^= stamp[:remainder]
+
+    def generate(self, sequence_length: int, key: Optional[str] = None) -> np.ndarray:
         """
-        # Size is derived entirely from the model config — no numpy involved.
-        total_bytes = self.model_config.kv_cache_size_per_token * int(sequence_length)
+        Generates a NumPy array with the correct shape and dtype for a KV cache.
+        Uses a pre-computed buffer to avoid CPU bottlenecks during benchmarking.
 
-        # ── Producer-consumer pool path (preferred) ───────────────────────────
-        # Data was generated AHEAD OF TIME in background threads.
-        # get_view() returns a memoryview pointer (<1 µs) — zero copy, zero
-        # generation lag.  storage timer starts with data already in hand.
-        if self._producer_pool is not None:
-            return self._producer_pool.get_view(total_bytes)
-
-        # ── dgen-py in-process path (no pool) ────────────────────────────────
-        # Falls here when prefetch_depth=0.  Generation happens inline;
-        # storage timer starts AFTER this call returns.
-        if DGEN_AVAILABLE:
-            try:
-                import dgen_py
-                return dgen_py.generate_buffer(total_bytes)  # BytesView — zero-copy
-            except Exception as exc:
-                logger.warning(
-                    f"KVCacheGenerator: dgen-py error ({exc}); "
-                    "falling back to bytes buffer for this entry."
-                )
-
-        # ── Bytes fallback path ───────────────────────────────────────────────
-        buf = self.precomputed_buffer  # bytes, 256 MB
-        if total_bytes <= len(buf):
-            if key:
-                seed      = self._seed_from_key(key)
-                divisor   = len(buf) - total_bytes
-                start_idx = int(seed % divisor) if divisor > 0 else 0
-            else:
-                start_idx = 0
-            return buf[start_idx : start_idx + total_bytes]  # zero-copy bytes slice
+        Anti-dedup guarantee:
+            Every entry is XOR-stamped with a key-derived base pattern
+            (cross-entry uniqueness) AND a per-block positional index
+            (intra-entry uniqueness).  This ensures no two 4 KB blocks
+            are identical, even when buffer regions repeat within one
+            large entry.
+        """
+        if self.model_config.attention_type == 'mla':
+            # MLA: compressed latent (kv_lora_rank) + decoupled RoPE key (qk_rope_head_dim)
+            # No separate K and V — jointly compressed into single latent vector per layer
+            kv_shape = (
+                self.model_config.num_layers,
+                int(sequence_length),
+                self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim,
+            )
         else:
-            repeats = (total_bytes + len(buf) - 1) // len(buf)
-            return (buf * repeats)[:total_bytes]  # one allocation, correct size
+            kv_shape = (
+                self.model_config.num_layers,
+                2,
+                int(sequence_length),
+                self.model_config.kv_heads,
+                self.model_config.kv_dim_per_head,
+            )
 
-    def shutdown(self) -> None:
-        """Stop the background producer thread (if running)."""
-        if self._producer_pool is not None:
-            self._producer_pool.stop()
-            logger.info("KVCacheGenerator: producer-consumer pool stopped")
+        total_elements = int(np.prod(kv_shape))
+
+        # Derive a deterministic seed for this entry (used for offset + XOR stamp).
+        entry_seed = self._seed_from_key(key) if key else self.global_seed
+
+        if total_elements <= self.buffer_size_elements:
+            divisor = self.buffer_size_elements - total_elements
+            start_idx = int(entry_seed % divisor) if divisor > 0 else 0
+
+            # COPY (not view) so we can XOR-stamp without mutating the
+            # shared precomputed buffer.  Cost: ~6 ms per 64 MB on modern
+            # CPUs — negligible vs. NVMe write latency.
+            data = self.precomputed_buffer[start_idx : start_idx + total_elements].copy()
+
+            # XOR-stamp to break 4 KB block-level deduplication.
+            # Zero-allocation: reshape-broadcast over a 4 KB pattern.
+            self._apply_xor_stamp(data, entry_seed)
+
+            return data.reshape(kv_shape)
+        else:
+            # Large entry: exceeds the 256 MB precomputed buffer.
+            # Each chunk gets a unique random offset (with wraparound) so that:
+            #   - Different keys produce different data  (no cross-entry dedup)
+            #   - Each chunk within one entry differs    (no intra-entry dedup)
+            #
+            # Performance note: for a 10 GB entry this copies ~40 × 256 MB chunks.
+            # Using np.concatenate of pre-sliced views would not help because the
+            # wraparound means each chunk is up to 2 non-contiguous slices.
+            # The bottleneck is memcpy bandwidth (~12 GB/s), not Python overhead.
+            large_data = np.empty(total_elements, dtype=self.dtype)
+
+            # Always initialise rng so there is no UnboundLocalError risk.
+            # When key is None, seed=0 gives a fixed (but still varied per-chunk)
+            # offset sequence; when key is provided, each key gets its own sequence.
+            rng = np.random.default_rng(entry_seed)
+
+            buf = self.precomputed_buffer          # local alias — avoids repeated attr lookup
+            buf_n = self.buffer_size_elements
+
+            pos = 0
+            while pos < total_elements:
+                chunk_size = min(buf_n, total_elements - pos)
+                offset = int(rng.integers(0, buf_n))
+
+                # Copy with wraparound: buffer[offset:] then buffer[:remainder]
+                first_part = min(chunk_size, buf_n - offset)
+                large_data[pos:pos + first_part] = buf[offset:offset + first_part]
+                remaining = chunk_size - first_part
+                if remaining > 0:
+                    large_data[pos + first_part:pos + chunk_size] = buf[:remaining]
+                pos += chunk_size
+
+            # XOR-stamp the entire large entry to break dedup.
+            # Zero-allocation: reshape-broadcast over a 4 KB pattern.
+            self._apply_xor_stamp(large_data, entry_seed)
+
+            return large_data.reshape(kv_shape)
 
 
 # ============================================================================
@@ -158,9 +218,7 @@ class MultiTierCache:
                  max_concurrent_allocs: int = 0,
                  storage_capacity_gb: float = 0,
                  tensor_parallel: int = 1,
-                 io_tracer: Optional['IOTracer'] = None,
-                 gpu_bandwidth_gb_s: float = 64.0,
-                 prefetch_depth: int = 8):
+                 io_tracer: Optional['IOTracer'] = None):
 
         self.model_config = model_config
         self.gpu_memory_limit = gpu_memory_gb * 1024**3
@@ -171,7 +229,6 @@ class MultiTierCache:
         self.max_concurrent_allocs = max_concurrent_allocs
         self.tensor_parallel = max(1, tensor_parallel)
         self.io_tracer = io_tracer
-        self.gpu_bandwidth_gb_s = gpu_bandwidth_gb_s
 
         # Initialize storage backends for each tier.
         # In trace mode all backends are NullBackend — no real hardware I/O.
@@ -182,31 +239,29 @@ class MultiTierCache:
             self.backends['cpu'] = NullBackend()
             self.backends['nvme'] = NullBackend()
         else:
-            # SimulatedGPUBackend always succeeds — no hardware required.
-            # It models PCIe host↔GPU transfer latency and tracks byte counts
-            # without allocating any real VRAM or requiring PyTorch/CuPy.
-            self.backends['gpu'] = SimulatedGPUBackend(
-                bandwidth_gb_s=gpu_bandwidth_gb_s,
-                on_eviction_callback=self._handle_gpu_eviction,
-            )
-            logger.info(
-                f"MultiTierCache: GPU tier simulated at {gpu_bandwidth_gb_s:.0f} GB/s "
-                f"(capacity {gpu_memory_gb:.0f} GB)"
-            )
+            try:
+                if TORCH_AVAILABLE or CUPY_AVAILABLE:
+                    self.backends['gpu'] = GPUMemoryBackend(
+                        use_torch=TORCH_AVAILABLE,
+                        on_eviction_callback=self._handle_gpu_eviction
+                    )
+            except Exception as e:
+                logger.warning(f"Could not initialize GPU backend: {e}")
+
             self.backends['cpu'] = CPUMemoryBackend()
             self.backends['nvme'] = NVMeBackend(base_path=cache_dir)
 
-        self.generator = KVCacheGenerator(model_config, global_seed=self.seed,
-                                           prefetch_depth=prefetch_depth)
+        self.generator = KVCacheGenerator(model_config, global_seed=self.seed)
 
-        self.cache_entries: Dict[str, dict] = {}
+        self.cache_entries = {}
         self.entry_locks: Dict[str, threading.Lock] = {}
         if storage_capacity_gb > 0:
             self.nvme_memory_limit = storage_capacity_gb * 1024**3
         else:
             try:
                 nvme_base = self.backends['nvme'].base_path
-                self.nvme_memory_limit = float(shutil.disk_usage(nvme_base).free)
+                st = os.statvfs(str(nvme_base))
+                self.nvme_memory_limit = float(st.f_bavail * st.f_frsize) * 0.95
             except Exception:
                 self.nvme_memory_limit = float('inf')
 
@@ -248,10 +303,6 @@ class MultiTierCache:
 
             'storage_tokens_processed': 0,
         }
-
-    def shutdown(self) -> None:
-        """Release any resources held by this cache instance."""
-        self.generator.shutdown()   # stop background producer thread if running
 
     def _get_entry_lock(self, key: str) -> threading.Lock:
         """Get or create a lock for a specific cache entry."""
@@ -363,7 +414,7 @@ class MultiTierCache:
                     elif to_tier == 'nvme':
                         self.stats['offloads_storage'] += 1
                         bytes_per_token = (self.model_config.kv_cache_size_per_token
-                                           // max(1, self.tensor_parallel))
+                                          // max(1, self.tensor_parallel))
                         if bytes_per_token > 0:
                             tokens = size // bytes_per_token
                             self.stats['storage_tokens_processed'] += tokens
@@ -400,87 +451,189 @@ class MultiTierCache:
         if next_tier is None and tier != 'nvme':
             return False
 
+        # When NVMe is the terminal tier (no tier after it), the entry MUST
+        # be written here — relax capacity guards and evict to full limit.
+        is_last_tier = (next_tier is None)
+
         limit = self._get_tier_limit(tier)
         target_usage_ratio = cfg('eviction', 'target_usage_ratio', default=0.8)
         target_usage = limit * target_usage_ratio
 
         large_entry_limit_ratio = cfg('eviction', 'large_entry_limit_ratio', default=0.95)
-        if required_bytes > limit * large_entry_limit_ratio:
+        # Only reject oversized entries on non-terminal tiers (they can cascade).
+        # On the last tier, we must accommodate the entry regardless of size.
+        if not is_last_tier and required_bytes > limit * large_entry_limit_ratio:
             return False
 
-        entries_in_tier = len(self._get_lru_entries_in_tier(tier))
+        # On the last tier, evict to full capacity (not 80%) since there's
+        # no next tier that needs a buffer for cascading entries.
+        effective_target = limit if is_last_tier else target_usage
+
+        # ────────────────────────────────────────────────────────────────
+        # SNAPSHOT-BASED LRU EVICTION
+        #
+        # Performance context:
+        #   _get_lru_entries_in_tier() copies every entry in cache_entries
+        #   that belongs to this tier, then sorts by last_access time.
+        #   At 15 TB with 60k entries, that's ~60k dict copies + sort.
+        #
+        # Old behavior (O(n²)):
+        #   The while loop called _get_lru_entries_in_tier() on EVERY
+        #   iteration, but only used lru_entries[0] — the single oldest
+        #   entry.  Evicting 100 entries meant 100 full scans.
+        #
+        # New behavior (O(n)):
+        #   Take ONE sorted snapshot before the loop.  Walk through it
+        #   with an index.  Each entry is either:
+        #     - Still valid → evict it (delete or demote)
+        #     - Already gone (another thread got it) → skip, advance index
+        #   If we exhaust the snapshot without freeing enough space,
+        #   refresh it ONCE (new entries may have been written since the
+        #   snapshot).  Worst case: 2 scans instead of thousands.
+        #
+        # Why stale snapshots are safe:
+        #   - DELETE path: the existence check under metadata_lock already
+        #     skips entries that another thread evicted.  A stale snapshot
+        #     just means we hit more skips — no double-decrement.
+        #   - DEMOTE path: _demote_entry() checks that the entry still
+        #     exists in from_tier before moving it.  If it's gone, it
+        #     returns False and we advance to the next entry.
+        #   - New entries added after the snapshot are NEWER than
+        #     everything in it (higher last_access time), so LRU order
+        #     says evict them last.  Not including them is correct.
+        #
+        # Impact on MLPerf metrics:
+        #   Storage device latencies (write_device_p50, read_device_p50)
+        #   are timed INSIDE the backend — after eviction has already
+        #   freed space.  This optimization only reduces the untimed CPU
+        #   overhead between I/O operations.  Throughput (req/s) improves
+        #   because the benchmark can push I/O faster; device-level
+        #   numbers stay the same.
+        # ────────────────────────────────────────────────────────────────
+
+        lru_entries = self._get_lru_entries_in_tier(tier)
+        lru_idx = 0
+
         max_evictions_hard_cap = cfg('eviction', 'max_evictions_hard_cap', default=5000)
         max_evictions_min = cfg('eviction', 'max_evictions_min', default=1000)
-        max_evictions_per_call = min(max_evictions_hard_cap, max(max_evictions_min, entries_in_tier + 100))
+        max_evictions_per_call = min(max_evictions_hard_cap, max(max_evictions_min, len(lru_entries) + 100))
         eviction_count = 0
 
         while eviction_count < max_evictions_per_call:
+            # ── Check 1: Is there already enough space? ──
             with self.memory_lock:
                 current_usage = self._get_tier_usage(tier)
-                if current_usage + required_bytes <= target_usage:
+                if current_usage + required_bytes <= effective_target:
                     self._update_tier_usage(tier, required_bytes)
                     return True
 
-                if current_usage < limit * 0.05 and required_bytes <= limit * large_entry_limit_ratio:
+                # Near-empty tier: usage tracking may have drifted from
+                # accumulated rounding.  Trust it and allow the write.
+                if current_usage < limit * 0.05:
                     self._update_tier_usage(tier, required_bytes)
                     return True
 
-            lru_entries = self._get_lru_entries_in_tier(tier)
+            # ── Check 2: Advance through the LRU snapshot ──
+            # If we've walked past the end of the snapshot, try one
+            # refresh — concurrent threads may have evicted most of our
+            # snapshot, or new entries may have landed in this tier.
+            if lru_idx >= len(lru_entries):
+                lru_entries = self._get_lru_entries_in_tier(tier)
+                lru_idx = 0
 
-            if not lru_entries:
-                with self.metadata_lock:
-                    actual_usage = sum(
-                        entry['size'] for entry in self.cache_entries.values()
-                        if entry['location'] == tier
-                    )
-                with self.memory_lock:
-                    if tier == 'gpu':
-                        self.gpu_memory_used = actual_usage
-                    elif tier == 'cpu':
-                        self.cpu_memory_used = actual_usage
-                    elif tier == 'nvme':
-                        self.nvme_memory_used = actual_usage
+                if not lru_entries:
+                    # Tier is truly empty.  Recount actual usage from
+                    # cache_entries to correct any drift, then decide.
+                    with self.metadata_lock:
+                        actual_usage = sum(
+                            entry['size'] for entry in self.cache_entries.values()
+                            if entry['location'] == tier
+                        )
+                    with self.memory_lock:
+                        if tier == 'gpu':
+                            self.gpu_memory_used = actual_usage
+                        elif tier == 'cpu':
+                            self.cpu_memory_used = actual_usage
+                        elif tier == 'nvme':
+                            self.nvme_memory_used = actual_usage
 
-                with self.memory_lock:
-                    current_usage = self._get_tier_usage(tier)
-                    if current_usage + required_bytes <= target_usage:
-                        self._update_tier_usage(tier, required_bytes)
+                    with self.memory_lock:
+                        current_usage = self._get_tier_usage(tier)
+                        if current_usage + required_bytes <= effective_target:
+                            self._update_tier_usage(tier, required_bytes)
+                            return True
+
+                    # Last tier with nothing left to evict — allow the
+                    # write and let the OS enforce disk space.
+                    if is_last_tier:
+                        with self.memory_lock:
+                            self._update_tier_usage(tier, required_bytes)
                         return True
 
-                return False
+                    return False
 
-            total_size_in_tier = sum(e['size'] for _, e in lru_entries)
-            if total_size_in_tier < limit * 0.2 and required_bytes > target_usage * 0.5:
-                return False
+            # On non-terminal tiers, bail out if there's little data to
+            # evict relative to what we need.  On the last tier, keep
+            # going — there's nowhere else to send the entry.
+            # (Only check on first pass through the snapshot to avoid
+            # re-summing on every iteration.)
+            if lru_idx == 0 and not is_last_tier:
+                total_size_in_tier = sum(e['size'] for _, e in lru_entries)
+                if total_size_in_tier < limit * 0.2 and required_bytes > target_usage * 0.5:
+                    return False
 
-            lru_key, lru_entry = lru_entries[0]
+            # ── Pick the next LRU entry from the snapshot ──
+            lru_key, lru_entry = lru_entries[lru_idx]
             lru_size = lru_entry['size']
+            lru_idx += 1
 
+            # ── Evict: DELETE (terminal tier) or DEMOTE (non-terminal) ──
             if next_tier is None and tier == 'nvme':
+                # Terminal tier: delete the .npy file from disk.
+                # The existence check prevents double-decrementing when
+                # multiple threads race on the same stale snapshot entry.
                 entry_lock = self._get_entry_lock(lru_key)
                 with entry_lock:
+                    with self.metadata_lock:
+                        existing = self.cache_entries.get(lru_key)
+                        if existing is None or existing['location'] != 'nvme':
+                            # Another thread already evicted this entry.
+                            # Safe to skip — just advance to the next one.
+                            eviction_count += 1
+                            continue
+                        actual_size = existing['size']
+                        del self.cache_entries[lru_key]
+                        self.entry_locks.pop(lru_key, None)
                     try:
                         self.backends['nvme'].delete(lru_key)
                     except Exception as e:
                         logger.warning(f"Failed to delete NVMe entry {lru_key}: {e}")
-                    with self.metadata_lock:
-                        self.cache_entries.pop(lru_key, None)
                     with self.memory_lock:
-                        self.nvme_memory_used = max(0, self.nvme_memory_used - lru_size)
+                        self.nvme_memory_used = max(0, self.nvme_memory_used - actual_size)
                 with self.stats_lock:
                     self.stats['evictions'] += 1
             else:
+                # Non-terminal tier: demote entry to the next tier down.
+                # Recursively ensure space in next_tier first.
                 if not self._ensure_space_in_tier(next_tier, lru_size, recursion_depth + 1):
                     logger.warning(f"Could not make space in {next_tier} for demotion")
                     return False
 
                 success, _ = self._demote_entry(lru_key, tier, next_tier)
                 if not success:
-                    # Entry may have been deleted/moved by another thread; skip to next
+                    # Entry was deleted/moved by another thread between
+                    # the snapshot and now.  Skip to the next one.
                     eviction_count += 1
                     continue
 
             eviction_count += 1
+
+        # Exhausted eviction budget.  On the last tier, allow the write
+        # anyway — we've freed as much as we can.
+        if is_last_tier:
+            with self.memory_lock:
+                self._update_tier_usage(tier, required_bytes)
+            return True
 
         return False
 
@@ -502,7 +655,7 @@ class MultiTierCache:
     def _allocate_cache_inner(self, key: str, num_tokens: int, phase: InferencePhase) -> Tuple[bool, str, float]:
         """Inner implementation of allocate_cache, called within semaphore."""
         if self.io_tracer is not None:
-            # Trace mode: compute size from model config — no data generation needed.
+            # Trace mode: compute size from model config — no numpy allocation needed.
             # Divide by tensor_parallel: each TP rank stores only its 1/TP shard.
             size_bytes = (self.model_config.kv_cache_size_per_token * num_tokens
                           ) // self.tensor_parallel
@@ -517,10 +670,11 @@ class MultiTierCache:
                 logger.error(f"Failed to generate cache for key {key}: {exc}")
                 return False, 'none', 0.0
             if self.tensor_parallel > 1:
-                # Each TP rank owns 1/tensor_parallel of the data bytes.
-                tp_bytes = len(data) // self.tensor_parallel
-                data = memoryview(data)[:tp_bytes]
-            size_bytes = len(data)
+                # Each TP rank owns 1/tensor_parallel of the KV heads.
+                # Take the first shard of the flat buffer as this rank's share.
+                tp_elements = data.size // self.tensor_parallel
+                data = data.ravel()[:tp_elements]
+            size_bytes = data.nbytes
 
         with self.stats_lock:
             if phase == InferencePhase.PREFILL:
@@ -539,6 +693,8 @@ class MultiTierCache:
         if allocated_tier is None:
             logger.warning("All tiers full — eviction could not free space, forcing write to NVMe")
             allocated_tier = 'nvme'
+            with self.memory_lock:
+                self._update_tier_usage('nvme', size_bytes)
 
         try:
             if self.io_tracer is not None:
