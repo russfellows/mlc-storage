@@ -4,42 +4,97 @@ This tool benchmarks and compares vector database performance, with current supp
 
 ## Installation
 
-### Using Docker (recommended)
+### Clone the repository
 ```bash
 git clone https://github.com/mlcommons/storage.git
 cd storage/vdb_benchmark
-docker compose up -d   # docker-compose v2; use docker-compose up for v1
 ```
 
-### Manual Installation
+### Setup a virtual environment (recommended)
+The python environment can be setup via the bash script setup_env.sh from the top level.
+
+### Manual installation
 ```bash
-git clone https://github.com/mlcommons/storage.git
 cd storage/vdb_benchmark
-pip3 install ./
+# Note:  For development use editable installs (-e option):
+pip3 install -e ./
 ```
 
 ---
 
 ## Deploying a Standalone Milvus Instance
 
-The `docker-compose.yml` configures a 3-container Milvus stack:
+Stand-alone instances are available via Docker containers in the stacks directory.
+> stacks
+> └── milvus
+>     ├── cluster
+>     └── standalone
+>         ├── minio
+>         │   ├── .env.example
+>         │   └── docker-compose.yml
+>         └── s3
+>             ├── .env.example
+>             └── docker-compose-s3.yml
+
+For each specific instance, copy the `.env.example` file to `.env` and update the values as needed.
+```bash
+# Example
+cp stacks/milvus/standalone/minio/.env.example stacks/milvus/standalone/minio/.env
+```
+
+### Local Storage -- MinIO
+The configuration file `stacks/milvus/standalone/minio/docker-compose.yml` creates a 3-container Milvus stack using local storage:
 - **Milvus** database
 - **MinIO** object storage
 - **etcd** metadata store
 
-The compose file uses `/mnt/vdb` as the root directory for Docker volumes. Set
-`DOCKER_VOLUME_DIRECTORY` or edit the compose file to point to your target storage:
 
+The compose file uses `/mnt/vdb` as the root directory for Docker volumes. Set
+`DOCKER_VOLUME_DIRECTORY` or edit the compose file to point to your target storage location.
+To test more than one storage solution use separate compose stacks with different port mappings,
+or bring containers down, copy `/mnt/vdb` to a new location, update the mount point, and restart.
+
+
+### Start the container
 ```bash
-cd storage/vdb_benchmark
-docker compose up -d
+# Version 1
+docker compose -f stacks/milvus/standalone/minio/docker-compose.yml up -d
+# Version 2
+docker-compose -f stacks/milvus/standalone/minio/docker-compose.yml up -d
 ```
 
 > **Tip:** The `-d` flag detaches from container logs. Without it, `ctrl+c` stops all containers.
 > For proxy issues see: https://medium.com/@SrvZ/docker-proxy-and-my-struggles-a4fd6de21861
 
-To test more than one storage solution use separate compose stacks with different port mappings,
-or bring containers down, copy `/mnt/vdb` to a new location, update the mount point, and restart.
+```bash
+docker ps -a
+CONTAINER ID   IMAGE                                      COMMAND                  CREATED          STATUS                     PORTS                                                                                      NAMES
+7bbb96825428   milvusdb/milvus:v2.5.10                    "/tini -- milvus run…"   14 minutes ago   Up 14 minutes (healthy)    0.0.0.0:9091->9091/tcp, :::9091->9091/tcp, 0.0.0.0:19530->19530/tcp, :::19530->19530/tcp   milvus-standalone
+e35d11ee6eba   minio/minio:RELEASE.2023-03-20T20-16-18Z   "/usr/bin/docker-ent…"   14 minutes ago   Up 14 minutes (healthy)    0.0.0.0:9000-9001->9000-9001/tcp, :::9000-9001->9000-9001/tcp                              milvus-minio
+06b3aa6c777b   quay.io/coreos/etcd:v3.5.18                "etcd -advertise-cli…"   14 minutes ago   Up 14 minutes (healthy)    0.0.0.0:2379->2379/tcp, :::2379->2379/tcp, 2380/tcp                                        milvus-etcd
+```
+
+
+### S3 Storage
+The configuration file `stacks/milvus/standalone/s3/docker-compose.yml` creates a Milvus stack using an external S3-compatible object storage service (such as MinIO or AWS S3).
+- **Milvus** database
+
+### Start the container
+```bash
+# Version 1
+docker compose -f stacks/milvus/standalone/s3/docker-compose.yml up -d
+# Version 2
+docker-compose -f stacks/milvus/standalone/s3/docker-compose.yml up -d
+```
+
+> **Tip:** The `-d` flag detaches from container logs. Without it, `ctrl+c` stops all containers.
+> For proxy issues see: https://medium.com/@SrvZ/docker-proxy-and-my-struggles-a4fd6de21861
+
+```bash
+docker ps -a
+CONTAINER ID   IMAGE                                      COMMAND                  CREATED          STATUS                      PORTS                                                                                      NAMES
+beec3366bea4   milvusdb/milvus:v2.5.10                    "/tini -- milvus run…"   4 minutes ago    Up 4 minutes                0.0.0.0:9091->9091/tcp, :::9091->9091/tcp, 0.0.0.0:19530->19530/tcp, :::19530->19530/tcp   milvus-s3                                       milvus-etcd
+```
 
 ---
 
