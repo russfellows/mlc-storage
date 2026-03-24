@@ -33,8 +33,8 @@ storage:
   load_balance_strategy: round_robin  # Options: round_robin, random
   
   storage_options:
-    access_key_id: minioadmin
-    secret_access_key: minioadmin
+    # Credentials come from environment variables — NEVER hardcode in YAML.
+    # Before running: source /path/to/.env  (sets AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
     region: us-east-1
 
 reader: 

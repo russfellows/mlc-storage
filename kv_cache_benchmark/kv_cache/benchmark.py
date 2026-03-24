@@ -77,9 +77,7 @@ class IntegratedBenchmark:
                  replay_cycles: int = 0,
                  prefill_only: bool = False,
                  decode_only: bool = False,
-                 io_trace_log: Optional[str] = None,
-                 gpu_bandwidth_gb_s: float = 64.0,
-                 prefetch_depth: int = 8):
+                 io_trace_log: Optional[str] = None):
 
         self.model_config = model_config
         self.num_users = num_users
@@ -113,8 +111,6 @@ class IntegratedBenchmark:
         self.replay_cycles = replay_cycles
         self.prefill_only = prefill_only
         self.decode_only = decode_only
-        self.gpu_bandwidth_gb_s = gpu_bandwidth_gb_s
-        self.prefetch_depth = prefetch_depth
 
         # Trace mode: IOTracer is created here and closed at the end of run()
         if io_trace_log:
@@ -149,8 +145,6 @@ class IntegratedBenchmark:
             storage_capacity_gb=storage_capacity_gb,
             tensor_parallel=self.tensor_parallel,
             io_tracer=self.io_tracer,
-            gpu_bandwidth_gb_s=self.gpu_bandwidth_gb_s,
-            prefetch_depth=self.prefetch_depth,
         )
         self.conversation_manager = ConversationManager()
         self.prefix_cache_manager = PrefixCacheManager(self.cache) if enable_prefix_caching else None
@@ -804,7 +798,6 @@ class IntegratedBenchmark:
 
         if self.io_tracer is not None:
             self.io_tracer.close()
-        self.cache.shutdown()
 
         return self.results
 
@@ -830,6 +823,7 @@ class IntegratedBenchmark:
         state = {'written_bytes': 0, 'seq': 0, 'last_report': 0}
 
         def worker():
+            consecutive_failures = 0
             while True:
                 with lock:
                     if state['written_bytes'] >= target_bytes:
@@ -841,6 +835,7 @@ class IntegratedBenchmark:
                 success, tier, latency = self.cache.allocate_cache(key, tokens_per_entry)
 
                 if success:
+                    consecutive_failures = 0
                     entry = self.cache.cache_entries.get(key)
                     if entry:
                         with lock:
@@ -849,6 +844,13 @@ class IntegratedBenchmark:
                             if gb_written - state['last_report'] >= 10:
                                 print(f"  Preconditioning progress: {gb_written:.1f} / {target_gb:.1f} GB")
                                 state['last_report'] = gb_written
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures > 50:
+                        with lock:
+                            print(f"  WARNING: Preconditioning stalled at {state['written_bytes']/1024**3:.1f} GB — filesystem full. Continuing.")
+                        return
+                    time.sleep(0.1)
 
         with ThreadPoolExecutor(max_workers=num_threads) as executor:
             futures = [executor.submit(worker) for _ in range(num_threads)]
@@ -998,6 +1000,38 @@ class IntegratedBenchmark:
         print("BENCHMARK RESULTS - MLPerf KV Cache Storage Benchmark")
         print(f"Generation Mode: {self.generation_mode.value} ({self.ms_per_token:.1f}ms/token)")
         print("=" * 80)
+
+        # ── KV Block Size Context ──────────────────────────────────────
+        # Raised on 2026-03-10 KV Cache TF call: latencies are per entire
+        # KV cache block, not per token or per 4 KB page.  Block sizes
+        # depend on model architecture and sequence length; they can range
+        # from tens of MB to multiple GB.
+        bpt = self.model_config.kv_cache_size_per_token
+        print(f"\nIMPORTANT: All storage latencies below are measured per KV cache BLOCK,")
+        print(f"not per token or per disk page.  Each block holds the full KV state for")
+        print(f"one request (all layers, all heads, full sequence length).")
+        print(f"  Model KV bytes/token: {bpt:,} bytes ({bpt/1024:.1f} KB)")
+
+        # Compute entry size distribution from live cache entries
+        with self.cache.metadata_lock:
+            entry_sizes = [e['size'] for e in self.cache.cache_entries.values()]
+        if entry_sizes:
+            sizes = np.array(entry_sizes)
+            print(f"  Entries in cache: {len(sizes)}")
+            print(f"  Block size min:   {np.min(sizes)/1024**2:.1f} MB")
+            print(f"  Block size mean:  {np.mean(sizes)/1024**2:.1f} MB")
+            print(f"  Block size P95:   {np.percentile(sizes, 95)/1024**2:.1f} MB")
+            print(f"  Block size max:   {np.max(sizes)/1024**2:.1f} MB")
+        else:
+            # Fall back to average from aggregate stats
+            total_write_bytes = summary.get('cache_stats', {}).get('total_write_bytes', 0)
+            write_ops = summary.get('cache_stats', {}).get('write_iops', 0)
+            if write_ops > 0:
+                avg_mb = (total_write_bytes / write_ops) / 1024**2
+                print(f"  Avg block size:   {avg_mb:.1f} MB (from {write_ops} writes)")
+
+        print(f"  A 200 MB block at 1 GB/s NVMe read = ~200 ms device latency.")
+        print(f"  Compare latencies against block sizes, not against 4 KB page I/O.\n")
 
         PASS_SYMBOL = "[OK]"
         FAIL_SYMBOL = "[X]"

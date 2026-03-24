@@ -1,6 +1,15 @@
 # MLPerf Storage Benchmark Suite
 MLPerf® Storage is a benchmark suite to characterize the performance of storage systems that support machine learning workloads.
 
+> **⚠️ TEMPORARY — Development Fork**
+>
+> This is a personal development fork ([russfellows/mlc-storage](https://github.com/russfellows/mlc-storage)) containing work-in-progress features not yet merged into the official [MLCommons Storage](https://github.com/mlcommons/storage) repository. Once this work is accepted upstream, this notice will be removed and users should switch to the official repo.
+>
+> **To clone this fork with all submodules (required):**
+> ```bash
+> git clone --recurse-submodules https://github.com/russfellows/mlc-storage.git
+> ```
+
 - [Overview](#overview)
 - [Prerequisite](#prerequisite)
 - [Installation](#installation)
@@ -14,7 +23,24 @@ MLPerf® Storage is a benchmark suite to characterize the performance of storage
 	- [CLOSED](#closed)
 	- [OPEN](#open)
 - [Submission Rules](#submission-rules)
-- 
+
+---
+
+## Documentation
+
+Two README files cover the full project in detail — read both before diving into the
+code or running benchmarks:
+
+| Document | What it covers |
+|----------|----------------|
+| **[docs/README.md](docs/README.md)** | Complete project overview: all four benchmark workloads, document reference, object storage library guides, and quick-link index to every test script |
+| **[tests/README.md](tests/README.md)** | Everything needed to run tests: environment setup, unit tests, integration tests, object-store performance scripts, and how pytest is configured |
+
+The top-level sections below give the official MLCommons parameter reference and
+are retained for submission compliance.
+
+---
+
 ## Overview
 For an overview of how this benchmark suite is used by submitters to compare the performance of storage systems supporting an AI cluster, see the MLPerf® Storage Benchmark submission rules here: [doc](https://github.com/mlcommons/storage/blob/main/Submission_guidelines.md). 
 
@@ -79,13 +105,15 @@ The benchmark simulation will be performed through the [dlio_benchmark](https://
 
 ## Testing and Demos
 
-The `tests/` directory contains validation scripts and demonstrations of new features:
+See **[tests/README.md](tests/README.md)** for the complete test guide — environment
+setup, unit tests (no infrastructure required), integration tests, and object-store
+performance scripts for all three supported object storage libraries.
 
 ### Quick Demos
 
-- **StreamingCheckpointing Demo**: Run `./tests/scripts/demo_streaming_checkpoint.sh` to see:
-  - dgen-py integration (155x faster data generation)
-  - StreamingCheckpointing (192x memory reduction)
+- **StreamingCheckpointing Demo**: Run `./tests/checkpointing/demo_checkpoint_methods.sh` to see:
+  - dgen-py integration (155× faster data generation)
+  - StreamingCheckpointing (192× memory reduction)
   - Comparison of old vs new checkpoint methods
 
 - **Backend Validation**: Test multi-library support:
@@ -93,7 +121,10 @@ The `tests/` directory contains validation scripts and demonstrations of new fea
   python tests/checkpointing/test_streaming_backends.py --backends s3dlio minio
   ```
 
-See [tests/README.md](tests/README.md) for complete documentation of all test scripts and demos.
+- **Unit tests** (no infrastructure required):
+  ```bash
+  pytest tests/unit/
+  ```
 
 ## Operation
 The benchmarks uses nested commands to select the workload category, workload, and workload parameters.
@@ -186,7 +217,7 @@ If the list of clients is passed in for this command the amount of memory is fou
 usage: mlpstorage training datasize [-h] [--hosts HOSTS [HOSTS ...]] --model {cosmoflow,resnet50,unet3d}
                                     --client-host-memory-in-gb CLIENT_HOST_MEMORY_IN_GB [--exec-type {mpi,docker}]
                                     [--mpi-bin {mpirun,mpiexec}] [--oversubscribe] [--allow-run-as-root]
-                                    --max-accelerators MAX_ACCELERATORS --accelerator-type {h100,a100}
+                                    --max-accelerators MAX_ACCELERATORS --accelerator-type {h100,a100,b200,mi355}
                                     --num-client-hosts NUM_CLIENT_HOSTS [--data-dir DATA_DIR]
                                     [--params PARAMS [PARAMS ...]]
                                     [--results-dir RESULTS_DIR] [--loops LOOPS] [--open | --closed] [--debug]
@@ -211,7 +242,7 @@ optional arguments:
                         Max number of simulated accelerators. In multi-host configurations the accelerators will be
                         initiated in a round-robin fashion to ensure equal distribution of simulated accelerator
                         processes
-  --accelerator-type {h100,a100}, -g {h100,a100}
+  --accelerator-type {h100,a100,b200,mi355}, -g {h100,a100,b200,mi355}
                         Accelerator to simulate for the benchmark. A specific accelerator defines the data access
                         sizes and rates for each supported workload
   --num-client-hosts NUM_CLIENT_HOSTS, -nc NUM_CLIENT_HOSTS
@@ -332,7 +363,7 @@ mlpstorage training datagen --hosts 10.117.61.121,10.117.61.165 --model unet3d -
 usage: mlpstorage training run [-h] [--hosts HOSTS [HOSTS ...]] --model {cosmoflow,resnet50,unet3d}
                                --client-host-memory-in-gb CLIENT_HOST_MEMORY_IN_GB [--exec-type {mpi,docker}]
                                [--mpi-bin {mpirun,mpiexec}] [--oversubscribe] [--allow-run-as-root] --num-accelerators
-                               NUM_ACCELERATORS --accelerator-type {h100,a100} --num-client-hosts NUM_CLIENT_HOSTS
+                               NUM_ACCELERATORS --accelerator-type {h100,a100,b200,mi355} --num-client-hosts NUM_CLIENT_HOSTS
                                [--data-dir DATA_DIR] [--ssh-username SSH_USERNAME] [--params PARAMS [PARAMS ...]]
                                [--results-dir RESULTS_DIR] [--loops LOOPS] [--open | --closed] [--debug] [--verbose]
                                [--stream-log-level STREAM_LOG_LEVEL] [--allow-invalid-params] [--what-if]
@@ -355,7 +386,7 @@ optional arguments:
                         Number of simulated accelerators. In multi-host configurations the accelerators will be
                         initiated in a round-robin fashion to ensure equal distribution of simulated accelerator
                         processes
-  --accelerator-type {h100,a100}, -g {h100,a100}
+  --accelerator-type {h100,a100,b200,mi355}, -g {h100,a100,b200,mi355}
                         Accelerator to simulate for the benchmark. A specific accelerator defines the data access
                         sizes and rates for each supported workload
   --num-client-hosts NUM_CLIENT_HOSTS, -nc NUM_CLIENT_HOSTS
