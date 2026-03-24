@@ -11,7 +11,7 @@ import sys
 from typing import Dict, List, Tuple
 
 try:
-    from pymilvus import connections, utility
+    from pymilvus import connections, utility, DataType
     from pymilvus.exceptions import MilvusException
 except ImportError:
     print("Error: pymilvus package not found. Please install it with 'pip install pymilvus'")
@@ -67,7 +67,7 @@ def get_collections_info() -> List[Dict]:
             vector_field = None
             vector_dim = None
             for field in schema.fields:
-                if field.dtype == 100:  # DataType.FLOAT_VECTOR
+                if field.dtype in (DataType.FLOAT_VECTOR, DataType.BINARY_VECTOR, DataType.FLOAT16_VECTOR, DataType.BFLOAT16_VECTOR):
                     vector_field = field.name
                     vector_dim = field.params.get("dim")
                     break
@@ -76,8 +76,8 @@ def get_collections_info() -> List[Dict]:
             index_info = []
             try:
                 for field_name in collection.schema.fields:
-                    if collection.has_index(field_name.name):
-                        index = collection.index(field_name.name)
+                    if collection.has_index(index_name=field_name.name):
+                        index = collection.index(index_name=field_name.name)
                         index_info.append({
                             "field": field_name.name,
                             "index_type": index.params.get("index_type"),

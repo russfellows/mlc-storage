@@ -13,6 +13,10 @@ build/
 venv/
 .venv/
 env/
+.env
+env-*
+**/.venv
+**/.env
 
 # IDE
 .idea/
