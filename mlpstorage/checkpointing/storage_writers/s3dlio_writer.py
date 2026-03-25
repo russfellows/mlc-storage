@@ -5,6 +5,7 @@ unified s3dlio library interface with multi-endpoint load balancing.
 """
 
 import os
+import time
 from typing import Dict, Any, List, Optional
 from .base import StorageWriter
 
@@ -80,6 +81,7 @@ class S3DLIOStorageWriter(StorageWriter):
         self.part_size = part_size
         self.max_in_flight = max_in_flight
         self.total_bytes = 0
+        self._start_time = time.monotonic()
         self.writer = None
         self.writer_type = None
         self.multi_endpoint_mode = False
@@ -289,6 +291,10 @@ class S3DLIOStorageWriter(StorageWriter):
             self.writer.write_chunk(buffer[:size])
         
         self.total_bytes += size
+        elapsed = time.monotonic() - self._start_time
+        written_gb = self.total_bytes / 1e9
+        rate = written_gb / elapsed if elapsed > 0 else 0.0
+        print(f'\r[Writer] {written_gb:.2f} GB, {rate:.2f} GB/s   ', end='', flush=True)
         return size
     
     def close(self) -> Dict[str, Any]:
@@ -309,6 +315,7 @@ class S3DLIOStorageWriter(StorageWriter):
         if self.writer_type == 'multipart':
             # MultipartUploadWriter.close() returns detailed stats
             stats = self.writer.close()
+            print()  # end the \r progress line
             result = {
                 'backend': 's3dlio-multipart',
                 'total_bytes': stats.get('total_bytes', self.total_bytes),
@@ -331,6 +338,7 @@ class S3DLIOStorageWriter(StorageWriter):
         else:
             # Streaming writer uses finalize()
             self.writer.finalize()
+            print()  # end the \r progress line
             return {
                 'backend': 's3dlio-streaming',
                 'total_bytes': self.total_bytes,

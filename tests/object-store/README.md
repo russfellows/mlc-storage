@@ -547,3 +547,216 @@ AWS_REGION=us-east-1
 
 `.env` is already listed in `.gitignore`. All scripts and Python tests read it
 automatically at startup; shell environment variables always take precedence.
+
+---
+
+## Real Checkpoint Tests — `dlio_xxx_checkpoint.sh`
+
+These scripts run **end-to-end LLaMA 3 8B checkpoint workloads** directly through
+`dlio_benchmark` using the mlp-storage storage backends. They are the authoritative
+benchmark for checkpoint write and read throughput, equivalent to what a real
+distributed training run produces during a checkpoint save/restore cycle.
+
+> **No data generation required** — checkpoint workloads synthesize tensor data
+> on the fly using the model sizing parameters. Run these tests standalone without
+> any prior `datagen` step.
+
+### Common parameters
+
+| Variable | Default | Description |
+|---|---|---|
+| `NP` | `1` | MPI rank count — simulates that many GPU processes |
+| `CHECKPOINTS` | `2` | Number of checkpoint write + read cycles |
+
+**NP guidance:**
+
+> **Important:** NP controls the number of shards, **not** the total amount of data.
+> The LLaMA 3 8B checkpoint has two components that are always saved together:
+> model weights (~16 GB, fp16) and optimizer state (~89 GB, fp32). Combined that is
+> ~105 GB total per checkpoint. All NP settings produce the same ~105 GB total I/O —
+> NP only splits that data into more, smaller per-rank objects.
+
+| NP | Total I/O per checkpoint | Per-rank object size | s3dlio | minio | s3torchconnector |
+|---|---|---|---|---|---|
+| `1` | ~105 GB write + ~105 GB read | ~105 GB | ✅ | ✅ | ❌ fails (> 78 GB limit) |
+| `2` | ~105 GB write + ~105 GB read | ~52.5 GB | ✅ | ✅ | ✅ |
+| `4` | ~105 GB write + ~105 GB read | ~26 GB | ✅ | ✅ | ✅ |
+| `8` | ~105 GB write + ~105 GB read | ~13.1 GB | ✅ | ✅ | ✅ |
+
+> **s3torchconnector NP=1 failure:** The AWS CRT library (used internally by
+> s3torchconnector) cannot write a single object larger than approximately 78 GB. At
+> NP=1 the full ~105 GB checkpoint (weights + optimizer state) is written as one object,
+> which exceeds this limit and causes the upload to fail. Use NP=2 or larger with
+> s3torchconnector — with 2 ranks the per-rank shard is ~52.5 GB, well within the CRT
+> limit. s3dlio and minio are not affected by this limit.
+
+Each rank independently writes its shard to a unique object key under:
+```
+s3://chckpt-test1/<library>/llama3-8b/<checkpoint_id>/<rank>.pt
+```
+
+### Prerequisites
+
+```bash
+cd /path/to/mlp-storage
+source .venv/bin/activate
+
+# Ensure credentials and endpoint are set
+source .env
+
+# Verify bucket exists and is reachable
+python3 -c "import s3dlio; print(s3dlio.list('s3://chckpt-test1/', recursive=False))"
+```
+
+For HTTPS endpoints (self-signed MinIO certificate), set:
+```bash
+# Already in .env if configured — verify with:
+echo $AWS_CA_BUNDLE    # should point to the .crt file
+```
+
+### Scripts
+
+All three scripts share identical interface — only the storage library and bucket
+prefix differ.
+
+#### `dlio_s3dlio_checkpoint.sh` — s3dlio (Rust / Tokio)
+
+```bash
+cd /path/to/mlp-storage
+
+# Single-rank sanity check (default, ~13 GB I/O)
+bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# 2-rank run
+NP=2 bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# Full 8-rank llama3-8b reference (~89 GB total, 8 × ~11 GB shards)
+NP=8 bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# Quick 1-checkpoint run (write once, read once)
+CHECKPOINTS=1 bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# Combine overrides
+NP=4 CHECKPOINTS=1 bash tests/object-store/dlio_s3dlio_checkpoint.sh
+```
+
+Objects land at: `s3://chckpt-test1/s3dlio/llama3-8b/`
+
+#### `dlio_minio_checkpoint.sh` — minio Python SDK
+
+```bash
+cd /path/to/mlp-storage
+
+bash tests/object-store/dlio_minio_checkpoint.sh          # NP=1 (default)
+NP=2 bash tests/object-store/dlio_minio_checkpoint.sh
+NP=8 bash tests/object-store/dlio_minio_checkpoint.sh    # full reference
+CHECKPOINTS=1 bash tests/object-store/dlio_minio_checkpoint.sh
+```
+
+Objects land at: `s3://chckpt-test1/minio/llama3-8b/`
+
+#### `dlio_s3torch_checkpoint.sh` — s3torchconnector (AWS CRT)
+
+> ⚠️ **Known limitation — NP=1 will fail.**  The AWS CRT library used by
+> s3torchconnector cannot write a single object larger than ~78 GB. At NP=1 the full
+> LLaMA 3 8B checkpoint (~105 GB: model weights ~16 GB + optimizer state ~89 GB) is
+> written as one object and the upload fails with a CRT internal error.  **Always use
+> NP≥2 with s3torchconnector.**  This is not a configuration problem — it is a hard
+> limit in the AWS CRT library.
+
+```bash
+cd /path/to/mlp-storage
+
+# NP=1 WILL FAIL for llama3-8b (105 GB object > 78 GB CRT limit)
+# bash tests/object-store/dlio_s3torch_checkpoint.sh
+
+# Minimum working rank count for s3torchconnector
+NP=2 bash tests/object-store/dlio_s3torch_checkpoint.sh
+NP=4 bash tests/object-store/dlio_s3torch_checkpoint.sh
+NP=8 bash tests/object-store/dlio_s3torch_checkpoint.sh  # full reference
+CHECKPOINTS=1 bash tests/object-store/dlio_s3torch_checkpoint.sh
+```
+
+Objects land at: `s3://chckpt-test1/s3torch/llama3-8b/`
+
+> **Note:** `s3torchconnector` only supports AWS S3 and S3-compatible endpoints that
+> accept AWS Signature V4. It does not support Azure or GCS endpoints.
+
+### Progress output
+
+During a checkpoint write each library prints a live throughput line that updates in
+place (carriage-return style):
+
+```
+[Writer] 6.55 GB, 0.31 GB/s   
+```
+
+The line shows cumulative GB written and the current instantaneous throughput. When the
+upload completes the line is finalised with a newline and DLIO prints per-rank summary
+statistics.
+
+### Cleanup
+
+After a run, delete the objects to reclaim bucket space:
+
+```bash
+bash tests/object-store/dlio_s3dlio_cleanup.sh
+bash tests/object-store/dlio_minio_cleanup.sh
+bash tests/object-store/dlio_s3torch_cleanup.sh
+```
+
+---
+
+## Full Workflow — Datagen → Train → Checkpoint
+
+The scripts below run the complete DLIO UNet3D H100 workload for each library. Use
+these when you want to benchmark **training data loading** rather than checkpointing.
+
+### Phase 1 — Generate training data
+
+Data generation writes synthetic NPZ files to the object store. This is a one-time
+step per bucket/library combination; you can reuse the generated data for multiple
+training runs.
+
+```bash
+# Generate UNet3D training data (do this once per library bucket)
+bash tests/object-store/dlio_s3dlio_datagen.sh    # → mlp-s3dlio bucket
+bash tests/object-store/dlio_minio_datagen.sh     # → mlp-minio bucket
+bash tests/object-store/dlio_s3torch_datagen.sh   # → mlp-s3torch bucket
+```
+
+Override the number of samples (default varies per config):
+```bash
+NUM_FILES=100 bash tests/object-store/dlio_s3dlio_datagen.sh
+```
+
+### Phase 2 — Training throughput
+
+Runs the training I/O loop (no actual GPU compute — pure storage benchmark):
+
+```bash
+NP=1  bash tests/object-store/dlio_s3dlio_train.sh
+NP=2  bash tests/object-store/dlio_minio_train.sh
+NP=4  bash tests/object-store/dlio_s3torch_train.sh
+```
+
+### Phase 3 — Checkpoint (standalone)
+
+See **[Real Checkpoint Tests](#real-checkpoint-tests--dlio_xxx_checkpointsh)** above.
+Checkpointing does not require training data — it runs independently.
+
+### Phase 4 — Full cycle (datagen + train + checkpoint)
+
+```bash
+bash tests/object-store/dlio_s3dlio_cycle.sh    # all three phases, s3dlio
+bash tests/object-store/dlio_minio_cycle.sh     # all three phases, minio
+bash tests/object-store/dlio_s3torch_cycle.sh   # all three phases, s3torch
+```
+
+### Cleanup
+
+```bash
+bash tests/object-store/dlio_s3dlio_cleanup.sh
+bash tests/object-store/dlio_minio_cleanup.sh
+bash tests/object-store/dlio_s3torch_cleanup.sh
+```

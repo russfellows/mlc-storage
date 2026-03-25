@@ -1,7 +1,7 @@
 # UNet3D H100 — s3torchconnector datagen config (MinIO)
 #
 # Purpose : Generate the full UNet3D h100 training dataset into MinIO.
-# Storage : MinIO at http://172.16.1.40:9000  (bucket: mlp-s3torch)
+# Storage : MinIO at https://172.16.1.40:9000  (bucket: mlp-s3torch)
 # Output  : 168 × ~140 MB NPZ files at s3://mlp-s3torch/test-run/unet3d/train/
 #
 # Prerequisites:
@@ -49,7 +49,7 @@ storage:
   storage_library: s3torchconnector
 
   storage_options:
-    endpoint_url: http://172.16.1.40:9000
+    endpoint_url: https://172.16.1.40:9000
     region: us-east-1
     secure: false
     # Credentials from env vars — NEVER hardcode here:

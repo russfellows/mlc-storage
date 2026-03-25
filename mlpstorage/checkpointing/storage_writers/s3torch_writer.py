@@ -11,6 +11,7 @@ Multi-Endpoint Support:
 
 import os
 import re
+import time
 from io import BytesIO
 from typing import Optional, Dict, Any, List
 
@@ -190,6 +191,7 @@ class S3TorchConnectorWriter(StorageWriter):
         # Start streaming writer immediately (supports incremental writes)
         self.writer = self.s3_client.put_object(self.bucket_name, self.object_key)
         self.total_bytes = 0
+        self._start_time = time.monotonic()
         
         print(f"[S3TorchWriter] Using s3torchconnector library (streaming)")
         print(f"[S3TorchWriter]   region={region}, endpoint={endpoint or 'AWS S3'}")
@@ -208,6 +210,10 @@ class S3TorchConnectorWriter(StorageWriter):
         data = bytes(buffer[:size])
         self.writer.write(data)  # Stream directly to S3
         self.total_bytes += size
+        elapsed = time.monotonic() - self._start_time
+        written_gb = self.total_bytes / 1e9
+        rate = written_gb / elapsed if elapsed > 0 else 0.0
+        print(f'\r[Writer] {written_gb:.2f} GB, {rate:.2f} GB/s   ', end='', flush=True)
         return size
     
     def close(self) -> Dict[str, Any]:
@@ -218,6 +224,7 @@ class S3TorchConnectorWriter(StorageWriter):
         """
         # Close the streaming writer (completes multipart upload)
         self.writer.close()
+        print()  # end the \r progress line
         
         return {
             'backend': 's3torchconnector',
