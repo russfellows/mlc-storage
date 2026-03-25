@@ -560,3 +560,133 @@ the libraries were used** (range splitting, HEAD overhead, Python copy) rather t
 fundamental differences in the underlying S3 client implementations. With the s3dlio
 fixes in place, all three libraries now achieve effectively equivalent throughput when
 used with matched concurrency.
+
+---
+
+## 13. s3dlio Checkpoint Write Throughput — Multipart Upload Tuning (March 2026)
+
+### 13.1 Background — v0.9.82 pipeline stall regression
+
+Before v0.9.82, `spawn_part()` and `spawn_part_bytes()` in `src/multipart.rs` acquired
+the concurrency semaphore **inside** the spawned Tokio task. The Python writer thread
+never blocked — it returned from `write()` immediately after enqueuing each part. The
+bug: for a 14.96 GB object with 32 MB parts this spawned **~467 Tokio tasks simultaneously**,
+each holding 32 MB = **~15 GB Rust heap**, causing OOM / runtime overload.
+
+The v0.9.82 fix moved semaphore acquisition to **before** spawn (via `run_on_global_rt`),
+correctly bounding peak memory to `max_in_flight × part_size`. However it introduced a
+new regression: the Python writer thread blocks on `run_on_global_rt(sem.acquire_owned())`
+every time all `max_in_flight` slots are occupied. This stalls the entire
+producer↔writer pipeline:
+
+```
+Producer (main process)                Writer subprocess (sequential loop)
+─────────────────────────              ─────────────────────────────────────
+generator.fill_chunk(shm.buf)   →→→   buffer_queue.get()
+buffer_queue.put((idx, size))         writer.write_chunk(shm.buf, size)
+                                            └─ write_owned_blocking(data)
+                                                  └─ spawn_part_bytes(chunk)
+                                                        └─ run_on_global_rt(
+                                                             sem.acquire_owned()
+                                                           )  ← BLOCKS HERE
+                                       ↑ writer stuck, buffer_queue fills up ↑
+```
+
+### 13.2 Measured write impact
+
+| Client / config | NP=1 write throughput | Notes |
+|---|:-:|---|
+| s3torchconnector (AWS CRT) | ~0.50 GB/s | Non-blocking `write()` — CRT enqueues and returns |
+| s3dlio v0.9.82 (128 MB × 8) | ~0.16 GB/s | Stalls every 1 GB in-flight |
+| s3dlio v0.9.82 NP=4 aggregate | ~1.2 GB/s = 4 × 0.30 | 4 independent objects |
+
+Adjusting `part_size` or `max_in_flight` has **no effect at NP=1** when the bottleneck
+is the number of stall cycles, not the upload bandwidth. Confirmed: with `128 MB × 8`
+the log showed `[S3DLIOWriter] part_size=128 MB, max_in_flight=8` but throughput was
+unchanged at 0.16 GB/s.
+
+### 13.3 Tuning theory — more concurrent connections
+
+With the current blocking design, increasing `max_in_flight` delays the stall (more
+in-flight data before the Python thread blocks) and opens more concurrent `UploadPart`
+connections to MinIO. MinIO does parallelize UploadPart requests across erasure-coding
+data nodes, so higher concurrency can improve per-object throughput.
+
+The recommended direction: **smaller parts + more concurrent slots**, matching the CRT
+model (many small concurrent requests, non-blocking caller).
+
+### 13.4 Benchmark parameter matrix
+
+The following configurations have identical peak Rust memory (`max_in_flight × part_size`):
+
+| `part_size` | `max_in_flight` | Peak memory | MinIO connections | Stall every |
+|:-----------:|:---------------:|:-----------:|:-----------------:|:-----------:|
+| 16 MB | 16 | 256 MB | 16 | 256 MB in-flight |
+| 16 MB | 32 | 512 MB | 32 | 512 MB in-flight |
+| 16 MB | 64 | 1 GB | 64 | 1 GB in-flight |
+| 32 MB | 32 | 1 GB | 32 | 1 GB in-flight |
+| 64 MB | 16 | 1 GB | 16 | 1 GB in-flight |
+| 128 MB | 8 | 1 GB | 8 | 1 GB in-flight |
+
+### 13.5 How to run the benchmark matrix
+
+`pytorch_obj_store_checkpointing.py` now reads two environment variables (with defaults
+matching the s3dlio library's built-in defaults):
+
+```bash
+# Library defaults (was previously: 128 MB × 8 hardcoded)
+bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# 16 concurrent connections, 16 MB parts (library defaults)
+S3DLIO_MULTIPART_PART_SIZE_MB=16  S3DLIO_MULTIPART_MAX_IN_FLIGHT=16  bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# 32 connections, 16 MB parts
+S3DLIO_MULTIPART_PART_SIZE_MB=16  S3DLIO_MULTIPART_MAX_IN_FLIGHT=32  bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# 64 connections, 16 MB parts
+S3DLIO_MULTIPART_PART_SIZE_MB=16  S3DLIO_MULTIPART_MAX_IN_FLIGHT=64  bash tests/object-store/dlio_s3dlio_checkpoint.sh
+
+# 32 connections, 32 MB parts
+S3DLIO_MULTIPART_PART_SIZE_MB=32  S3DLIO_MULTIPART_MAX_IN_FLIGHT=32  bash tests/object-store/dlio_s3dlio_checkpoint.sh
+```
+
+### 13.6 Root-cause fix (pending)
+
+A proper fix is tracked in **GitHub issue #134** on `russfellows/s3dlio`. The proposed
+architecture replaces `run_on_global_rt(sem.acquire_owned())` with a coordinator Tokio
+task that drains a bounded `mpsc::channel`. The Python writer calls `blocking_send()`
+which only blocks if the coordinator is a full `max_in_flight` parts behind — in
+steady state (coordinator is CPU-bound per item) this never happens.
+
+| Approach | Peak memory | Python writer blocks? |
+|---|:-:|:-:|
+| Pre-v0.9.82 (semaphore inside task) | **~15 GB** (467 tasks × 32 MB) | Never |
+| v0.9.82 current (semaphore before spawn) | `max_in_flight × part_size` | Every cycle when full |
+| Issue #134 fix (coordinator + channel) | `≤ 2 × max_in_flight × part_size` | Essentially never |
+
+### 13.7 Results (March 25, 2026 — NP=1, MinIO `https://172.16.1.40:9000`)
+
+Each run was observed for ~20–40 seconds (3–4 GB written) and Ctrl-C'd once steady
+state was confirmed. First-chunk values are inflated because the semaphore has free
+slots on start; steady state is the repeating plateau.
+
+| `part_size` | `max_in_flight` | First chunk GB/s | Steady-state GB/s | Notes |
+|:-----------:|:---------------:|:----------------:|:-----------------:|-------|
+| 128 MB | 8 | — | 0.16 | Previous hardcoded default (pre-change baseline) |
+| 16 MB | 16 | 0.18 | **0.16** | Library defaults |
+| 16 MB | 32 | 0.19 | **0.16** | 2× connections, no improvement |
+| 32 MB | 32 | 0.23 | **0.16** | Higher first-chunk burst; same steady state |
+| 16 MB | 64 | _not tested_ | | |
+
+**Conclusion: all configurations converge to 0.16 GB/s in steady state.**
+
+The first-chunk burst (0.18–0.23 GB/s) is higher with larger part sizes because the
+semaphore starts with all slots free — the first `max_in_flight` parts are spawned
+without blocking. Once those slots fill, `run_on_global_rt(sem.acquire_owned())` starts
+blocking the Python writer thread on every part, and throughput locks to ~0.16 GB/s
+regardless of part size or slot count.
+
+This definitively confirms: **`part_size` and `max_in_flight` are not the bottleneck.**
+The bottleneck is the blocking semaphore acquisition on the Python writer thread. The
+tuning matrix is exhausted. The only fix is the coordinator channel architecture
+described in §13.6 (GitHub issue #134).

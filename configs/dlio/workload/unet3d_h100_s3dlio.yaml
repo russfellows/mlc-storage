@@ -1,7 +1,7 @@
 # UNet3D H100 — s3dlio + MinIO Training Config
 #
 # Purpose : Train unet3d with h100 workload params using s3dlio for object I/O.
-# Storage : MinIO at http://172.16.1.40:9000  (bucket: mlp-s3dlio)
+# Storage : MinIO at https://172.16.1.40:9000  (bucket: mlp-s3dlio)
 # Data    : 168 × ~140 MB NPZ files at  mlp-s3dlio/test-run/unet3d/train/
 #
 # Prerequisites (before running dlio_benchmark):
@@ -57,7 +57,7 @@ storage:
   storage_library: s3dlio
 
   storage_options:
-    endpoint_url: http://172.16.1.40:9000
+    endpoint_url: https://172.16.1.40:9000
     region: us-east-1
     # Credentials come from environment variables — do NOT hardcode here.
     # Set these before running:

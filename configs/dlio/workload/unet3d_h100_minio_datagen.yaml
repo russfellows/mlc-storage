@@ -1,7 +1,7 @@
 # UNet3D H100 — minio SDK datagen config (MinIO)
 #
 # Purpose : Generate the full UNet3D h100 training dataset into MinIO.
-# Storage : MinIO at http://172.16.1.40:9000  (bucket: mlp-minio)
+# Storage : MinIO at https://172.16.1.40:9000  (bucket: mlp-minio)
 # Output  : 168 × ~140 MB NPZ files at s3://mlp-minio/test-run/unet3d/train/
 #
 # Run (from mlp-storage repo root, after sourcing .env):
@@ -45,7 +45,7 @@ storage:
   storage_library: minio
 
   storage_options:
-    endpoint_url: http://172.16.1.40:9000
+    endpoint_url: https://172.16.1.40:9000
     region: us-east-1
     secure: false
     # Credentials from env vars — NEVER hardcode here:

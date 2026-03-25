@@ -368,42 +368,48 @@ class StreamingCheckpointing:
         except Exception as e:
             print(f"[Writer] ERROR: Failed to create storage writer: {e}")
             stats_queue.put({'error': str(e)})
+            stats_queue.close()
+            stats_queue.join_thread()
             for shm in buffers:
                 shm.close()
-            sys.exit(1)
+            sys.stdout.flush()
+            os._exit(1)
         
         written = 0
         total_io_time = 0.0
         chunks_written = 0
-        
+        _write_error = None  # Error from write loop, if any
+
         try:
             while written < total_size:
                 item = buffer_queue.get()
                 if item is None:
                     break
-                
+
                 buffer_idx, nbytes = item
                 shm = buffers[buffer_idx]
-                
+
                 # Time ONLY the I/O operation
                 io_start = time.perf_counter()
                 bytes_written = writer.write_chunk(shm.buf, nbytes)
                 total_io_time += time.perf_counter() - io_start
-                
+
                 written += bytes_written
                 chunks_written += 1
-                
+
                 if chunks_written % 10 == 0:
                     throughput = (written / (1024**3)) / total_io_time if total_io_time > 0 else 0
                     print(f"[Writer] {written / (1024**3):.2f} GB, {throughput:.2f} GB/s")
-        
+
         except Exception as e:
+            # Record the error; let the finally block handle the single stats_queue.put().
+            _write_error = str(e)
             print(f"[Writer] ERROR during write: {e}")
-            stats_queue.put({'error': str(e)})
-            sys.exit(1)
-        
+
         finally:
-            # Close writer and get stats
+            # Close writer and collect stats — runs whether write succeeded or failed.
+            close_time = 0.0
+            writer_stats = {'backend': backend or 'auto', 'total_bytes': written}
             try:
                 close_start = time.perf_counter()
                 writer_stats = writer.close()
@@ -412,35 +418,45 @@ class StreamingCheckpointing:
                 print(f"[Writer] Closed: {writer_stats} (close time: {close_time:.4f}s)")
             except Exception as e:
                 print(f"[Writer] ERROR closing writer: {e}")
-                writer_stats = {'backend': backend or 'auto', 'total_bytes': written}
-                close_time = 0.0
-            
-            # Force cleanup of s3dlio resources
+                if _write_error is None:
+                    _write_error = f"close() failed: {e}"
+
+            # Force cleanup of storage-library resources.
             try:
                 del writer
                 print(f"[Writer] Deleted writer object")
-            except:
+            except Exception:
                 pass
-            
-            # Report stats
-            stats_queue.put({
+
+            # Build result dict — single put to stats_queue.
+            result = {
                 'io_time': total_io_time,
                 'close_time': close_time,
                 'total_bytes': written,
                 'chunks_written': chunks_written,
                 'backend_stats': writer_stats,
-            })
-            
+            }
+            if _write_error is not None:
+                result['error'] = _write_error
+
+            # CRITICAL: flush stats_queue's background sender thread BEFORE
+            # os._exit() kills it.  mp.Queue.put() is non-blocking — it queues
+            # the item locally and a background thread sends it over the pipe.
+            # os._exit() bypasses Python cleanup, killing that thread and losing
+            # the data.  close() + join_thread() drain the pipe synchronously.
+            stats_queue.put(result)
+            print(f"[Writer] Flushing stats queue...")
+            stats_queue.close()
+            stats_queue.join_thread()
+
             for shm in buffers:
                 shm.close()
-            
-            print(f"[Writer] Finished")
-            
-            # Explicitly exit to avoid hanging on background threads/resources  
-            # Use os._exit() instead of sys.exit() to bypass Python cleanup
+
+            exit_code = 1 if _write_error is not None else 0
+            print(f"[Writer] Finished (exit_code={exit_code})")
             print(f"[Writer] Exiting (PID={os.getpid()})")
             sys.stdout.flush()
-            os._exit(0)
+            os._exit(exit_code)
     
     def _format_results(self, stats, gen_time, total_time, total_size_bytes):
         """Format results for return."""

@@ -215,12 +215,29 @@ class MinIOStorageWriter(StorageWriter):
                 secure = False
         
         # Initialize MinIO client
+        # Support custom CA certificate via AWS_CA_BUNDLE (same env var as s3dlio/boto3).
+        # Required when the MinIO server uses a self-signed or private CA certificate.
+        http_client = None
+        ca_bundle = os.environ.get('AWS_CA_BUNDLE')
+        if secure and ca_bundle:
+            import urllib3
+            http_client = urllib3.PoolManager(
+                timeout=urllib3.Timeout.DEFAULT_TIMEOUT,
+                maxsize=max(num_parallel_uploads, 10),
+                cert_reqs='CERT_REQUIRED',
+                ca_certs=ca_bundle,
+                retries=urllib3.Retry(total=5, backoff_factor=0.2,
+                                      status_forcelist=[500, 502, 503, 504]),
+            )
+            print(f"[MinIOWriter] TLS: using CA bundle from AWS_CA_BUNDLE={ca_bundle}")
+
         self.client = Minio(
             endpoint,
             access_key=access_key,
             secret_key=secret_key,
             secure=secure,
-            region=os.environ.get('AWS_REGION', 'us-east-1')
+            region=os.environ.get('AWS_REGION', 'us-east-1'),
+            http_client=http_client,
         )
         
         # Create multipart upload using MinIO's S3-compatible API

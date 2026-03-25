@@ -2,7 +2,7 @@
 #
 # Purpose : Train unet3d with h100 workload params using the AWS s3torchconnector
 #           library for object I/O.
-# Storage : MinIO at http://172.16.1.40:9000  (bucket: mlp-s3torch)
+# Storage : MinIO at https://172.16.1.40:9000  (bucket: mlp-s3torch)
 # Data    : 168 × ~140 MB NPZ files at  mlp-s3torch/test-run/unet3d/train/
 #
 # Prerequisites:
@@ -58,7 +58,7 @@ storage:
   storage_library: s3torchconnector
 
   storage_options:
-    endpoint_url: http://172.16.1.40:9000
+    endpoint_url: https://172.16.1.40:9000
     region: us-east-1
     secure: false
     # Credentials come from environment variables — do NOT hardcode here.

@@ -2,7 +2,7 @@
 #
 # Purpose : Train unet3d with h100 workload params using the minio Python SDK
 #           for object I/O.
-# Storage : MinIO at http://172.16.1.40:9000  (bucket: mlp-minio)
+# Storage : MinIO at https://172.16.1.40:9000  (bucket: mlp-minio)
 # Data    : 168 × ~140 MB NPZ files at  mlp-minio/test-run/unet3d/train/
 #
 # Prerequisites (before running dlio_benchmark):
@@ -58,7 +58,7 @@ storage:
   storage_library: minio
 
   storage_options:
-    endpoint_url: http://172.16.1.40:9000
+    endpoint_url: https://172.16.1.40:9000
     region: us-east-1
     secure: false
     # Credentials come from environment variables — do NOT hardcode here.
