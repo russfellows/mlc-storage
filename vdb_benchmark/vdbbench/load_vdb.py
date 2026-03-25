@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import logging
 import sys
@@ -172,24 +173,28 @@ def create_collection(collection_name, dim, num_shards, vector_dtype, force=Fals
 
 
 def generate_vectors(num_vectors, dim, distribution='uniform'):
-    """Generate random vectors based on the specified distribution"""
+    """Generate random vectors based on the specified distribution.
+
+    Returns a numpy float32 array (accepted directly by pymilvus),
+    avoiding the huge memory overhead of converting to Python lists.
+    """
     if distribution == 'uniform':
-        vectors = np.random.random((num_vectors, dim)).astype('float16')
+        vectors = np.random.random((num_vectors, dim)).astype(np.float32)
     elif distribution == 'normal':
-        vectors = np.random.normal(0, 1, (num_vectors, dim)).astype('float16')
+        vectors = np.random.normal(0, 1, (num_vectors, dim)).astype(np.float32)
     elif distribution == 'zipfian':
         # Simplified zipfian-like distribution
-        base = np.random.random((num_vectors, dim)).astype('float16')
-        skew = np.random.zipf(1.5, (num_vectors, 1)).astype('float16')
+        base = np.random.random((num_vectors, dim)).astype(np.float32)
+        skew = np.random.zipf(1.5, (num_vectors, 1)).astype(np.float32)
         vectors = base * (skew / 10)
     else:
-        vectors = np.random.random((num_vectors, dim)).astype('float16')
+        vectors = np.random.random((num_vectors, dim)).astype(np.float32)
 
-    # Normalize vectors
+    # Normalize vectors in-place to avoid extra allocations
     norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-    normalized_vectors = vectors / norms
+    vectors /= norms
 
-    return normalized_vectors.tolist()
+    return vectors
 
 
 def insert_data(collection, vectors, batch_size=10000):

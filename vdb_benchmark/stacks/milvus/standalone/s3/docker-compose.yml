@@ -1,6 +1,21 @@
 #version: '3.5'
 
 services:
+  etcd:
+    image: ${ETCD_IMAGE}
+    container_name: ${ETCD_CONTAINER_NAME}
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=${ETCD_AUTO_COMPACTION_MODE}
+      - ETCD_AUTO_COMPACTION_RETENTION=${ETCD_AUTO_COMPACTION_RETENTION}
+      - ETCD_QUOTA_BACKEND_BYTES=${ETCD_QUOTA_BACKEND_BYTES}
+      - ETCD_SNAPSHOT_COUNT=${ETCD_SNAPSHOT_COUNT}
+    command: etcd -advertise-client-urls=http://etcd:${ETCD_PORT} -listen-client-urls http://0.0.0.0:${ETCD_PORT} --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
   milvus:
     image: ${MILVUS_IMAGE}
     container_name: ${MILVUS_CONTAINER_NAME}
@@ -8,6 +23,9 @@ services:
     security_opt:
       - seccomp:unconfined
     environment:
+      # ---- etcd (required for Milvus >= 2.6) ----
+      ETCD_ENDPOINTS: etcd:${ETCD_PORT}
+
       # ---- Object Storage (S3) ----
       MINIO_ADDRESS: ${MINIO_ENDPOINT}
       MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY_ID}
@@ -17,10 +35,11 @@ services:
       AWS_REGION: ${MINIO_REGION}
       MINIO_ROOT_PATH: ${MINIO_ROOT_PATH}
 
-      # ---- Optional performance tuning ----
-      ETCD_USE_EMBED: "true"
+      # ---- Storage type ----
       COMMON_STORAGETYPE: "remote"
     ports:
       - "${MILVUS_GRPC_PORT}:${MILVUS_GRPC_PORT}"     # gRPC
       - "${MILVUS_HTTP_PORT}:${MILVUS_HTTP_PORT}"     # HTTP
+    depends_on:
+      - etcd
     restart: unless-stopped
