@@ -1981,6 +1981,92 @@ data = buffer[start:start+size].reshape(kv_shape)
 
 ---
 
+## 8.5 Block-Layer Latency Tracing & fio Workload Distiller
+
+The benchmark includes an integrated block-layer tracing capability that decomposes storage I/O across every layer of the Linux I/O stack; from the application (VFS) down to the NVMe controller (D2C). This is enabled with a single flag and requires no code changes, no separate tooling, and adds minimal overhead to the benchmark run.
+
+### Motivation
+
+The L4 "device" latency reported by the benchmark measures the time to read or write an entire .npy file through NumPy. For large KV cache entries (500 MB to 2 GB), the kernel splits each file I/O into hundreds of NVMe commands at the MDTS boundary. The resulting P95 device latency reflects the total time to load a large entry; it includes both the actual NVMe hardware time and the numpy deserialization overhead within that single np.load() call. Without block-layer visibility, there is no way to distinguish how much of that latency is the drive vs the host.
+
+### Enabling Tracing
+
+```bash
+kv-cache --config config.yaml --model llama3.1-8b \
+    --num-users 10 --duration 30 \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --max-concurrent-allocs 1 \
+    --generation-mode none \
+    --cache-dir /mnt/nvme --seed 42 \
+    --enable-latency-tracing \
+    --xlsx-output results_traced.xlsx
+```
+
+The benchmark spawns bpftrace as a sudo subprocess before the run, attaches to 16 kernel tracepoints, and on completion sends SIGINT to collect the histogram data. The tracing subprocess runs in its own process group; the benchmark itself does not require root.
+
+### Histograms Captured
+
+| Histogram | Layer | What It Measures |
+|-----------|-------|-----------------|
+| D2C read/write | Device | Per-NVMe-command completion time (actual hardware latency) |
+| Q2D read/write | I/O Scheduler | Time in the scheduler queue before dispatch to the NVMe driver |
+| VFS read/write | Application | Full syscall time including page cache, filesystem, and block I/O |
+| fsync | Device | Actual device flush latency after buffered writes |
+| write-to-fsync gap | Serialization | CPU idle time between write() return and fsync() entry |
+| fadvise-to-read gap | Cache mgmt | Overhead of page cache invalidation before reads |
+| bssplit read/write | Block sizes | I/O size distribution at the kernel layer |
+| Queue depth read/write | Concurrency | Instantaneous in-flight I/O count at the moment of dispatch |
+| LBA heatmap read/write | Spatial | Where on the device the I/O lands (10 GB linear buckets) |
+
+### fio Workload Distiller
+
+When tracing is enabled, the benchmark automatically generates a standalone fio .ini file that reproduces the observed I/O pattern. The distiller extracts bssplit (block size distribution with separate read/write splits), rwmixread (from the I/O count ratio), iodepth (from the in-flight I/O histogram), and thinktime (from the write-to-fsync serialization gap) and writes them into a fio config that can be run independently against any device.
+
+Example output from a traced benchmark run on Kingston DC3000ME:
+
+```ini
+[kv-cache-traced]
+ioengine=libaio
+direct=1
+time_based
+runtime=300
+rw=randrw
+rwmixread=87
+bssplit=4k/1:8k/1:16k/1:32k/1:64k/1:128k/100,4k/7:8k/1:16k/1:32k/4:64k/4:128k/83
+iodepth=2048
+iodepth_batch_submit=2048
+iodepth_batch_complete_min=1
+size=100G
+thinktime=32
+thinktime_blocks=2048
+thinktime_iotime=1s
+refill_buffers=1
+norandommap=1
+randrepeat=0
+numjobs=1
+group_reporting
+percentile_list=50:95:99:99.9:99.99
+```
+
+### Standalone Usage Against Inference Engines
+
+The tracing tools work independently of the benchmark. The shell wrapper and Python distiller can be pointed at any process:
+
+```bash
+# Trace vLLM and generate fio workload
+sudo ./utils/storage_latency_stack.sh vllm --fio
+
+# Trace llm-d
+sudo ./utils/storage_latency_stack.sh llm-d --fio
+
+# Manual distill from saved trace output
+python3 utils/distill_fio.py -i trace_output.txt --process vllm -o vllm_workload.ini
+```
+
+This means you can characterize the I/O profile of a real inference engine on a production node, take the generated fio .ini file to a test bench, and run it against multiple drives with fio to compare storage performance without deploying the full inference stack.
+
+---
+
 ## 9. Common Issues & Troubleshooting
 
 ### Issue: High Host Latency

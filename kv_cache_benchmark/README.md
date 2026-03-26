@@ -25,7 +25,8 @@ A storage benchmarking tool for Large Language Model inference systems. This ben
 12. [Understanding Results](#understanding-results)
 13. [Unit Testing](#unit-testing)
 14. [Excel Export](#excel-export)
-15. [MLPerf Submission Guidelines](#mlperf-submission-guidelines)
+15. [Block-Layer Latency Tracing](#block-layer-latency-tracing)
+16. [MLPerf Submission Guidelines](#mlperf-submission-guidelines)
 16. [Troubleshooting](#troubleshooting)
 
 ---
@@ -1498,10 +1499,39 @@ The test suite covers 23 component categories with ~170+ individual tests:
 | `TestPerTierPhaseMetrics` | 7 | Per-tier (GPU/CPU/Storage) KV bytes read/written tracking during prefill/decode phases |
 | `TestPerTierPhaseMetricsWithGPU` | 4 | GPU tier metrics tracking, phase-aware read/write separation (skipped without GPU) |
 
+### Visualize User Request Flow
+
+The `TestVisualizeUserRequestFlow` test class traces the complete I/O path of real requests through the benchmark; these are the tests to run when you want to understand exactly what the benchmark does at each step:
+
+```bash
+# Part 3: The 4 latency levels (L1-L4) with real NVMe timing
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part3_four_latency_levels -v -s
+
+# Part 3b: How requests become .npy files on disk
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part3b_request_to_npy_file_mapping -v -s
+
+# Part 3c: Multi-turn conversation I/O (triangular read pattern)
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part3c_multi_turn_prefill_decode_file_io -v -s
+
+# Part 3d: Multi-turn with eviction pressure (hits vs misses under LRU)
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part3d_multi_turn_with_eviction -v -s
+
+# Part 4: 3-tier waterfall LRU eviction cascade (GPU -> CPU -> NVMe -> DELETE)
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part4_three_tier_waterfall_eviction -v -s
+
+# Part 5: NVMe-only eviction (what happens when the drive fills up)
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow::test_part5_one_tier_nvme_only_eviction -v -s
+
+# Run all visualization tests at once
+pytest tests/test_kv_cache.py::TestVisualizeUserRequestFlow -v -s
+```
+
+Use `-s` to see the printed I/O traces; without it pytest captures the output and you lose the visualization.
+
 ### Expected Runtime
 
-- **Without GPU**: ~5-10 seconds
-- **With GPU**: ~10-15 seconds
+- **Without GPU**: ~4-5 minutes (211 tests)
+- **With GPU**: ~5-6 minutes
 
 GPU tests are automatically skipped if CUDA is not available.
 
@@ -1550,6 +1580,106 @@ The Excel file contains a single row with all key metrics:
 - **With openpyxl**: Exports to `.xlsx` format
 - **Without openpyxl**: Falls back to `.csv` format
 - **Without pandas**: Export is skipped with a warning
+
+---
+
+## Block-Layer Latency Tracing
+
+The `--enable-latency-tracing` flag adds block-layer visibility to the benchmark with a single flag; no code changes, no separate tooling, minimal overhead. It spawns bpftrace as a sudo subprocess, attaches to the kernel block layer tracepoints during the benchmark run, and on completion distills the I/O profile into structured telemetry across stdout, JSON, and XLSX.
+
+This is the same class of telemetry that storage engineers use when characterizing production workloads; the difference is that it is fully integrated into the benchmark and the results are machine-readable.
+
+### What It Captures
+
+15 histograms across the full I/O stack:
+
+| Category | Histograms | What It Tells You |
+|----------|-----------|-------------------|
+| Device hardware | D2C read/write | Per-NVMe-command completion time; this is what the SSD controller actually took |
+| I/O scheduler | Q2D read/write | Time sitting in the Linux I/O scheduler queue before dispatch |
+| Application visible | VFS read/write | Full syscall latency from the application's perspective |
+| Serialization | write-to-fsync gap, fsync, fadvise-to-read gap | CPU vs device bottleneck decomposition |
+| Block sizes | bssplit read/write | I/O size distribution at the kernel layer (matches MDTS splits) |
+| Queue depth | In-flight at dispatch read/write | Instantaneous I/O concurrency at the moment of dispatch |
+| Spatial | LBA heatmap read/write | Where on the device the I/O lands (10 GB linear buckets) |
+
+### Usage
+
+```bash
+# Run benchmark with tracing (requires sudo for bpftrace)
+kv-cache --config config.yaml --model llama3.1-8b \
+    --num-users 10 --duration 30 \
+    --gpu-mem-gb 0 --cpu-mem-gb 0 \
+    --max-concurrent-allocs 1 \
+    --generation-mode none \
+    --cache-dir /mnt/nvme --seed 42 \
+    --enable-latency-tracing \
+    --xlsx-output results_traced.xlsx
+```
+
+The tracing output appears at the end of the benchmark results. The XLSX gets two additional sheets: **Device Tracing** (P50/P95/P99 summary per histogram) and **Trace Histograms** (raw bucket data for charting).
+
+### Standalone Tracing Against vLLM / llm-d
+
+The bpftrace scripts work independently of the benchmark. Point them at any inference engine process:
+
+```bash
+# Trace vLLM and generate a fio workload
+sudo ./utils/storage_latency_stack.sh vllm --fio
+
+# Trace llm-d
+sudo ./utils/storage_latency_stack.sh llm-d --fio
+
+# Trace any process
+sudo ./utils/storage_latency_stack.sh python3
+
+# Manual distill from saved trace
+python3 utils/distill_fio.py -i trace_output.txt --process vllm -o vllm_workload.ini
+```
+
+The `--fio` flag captures the bpftrace output and pipes it through `distill_fio.py` to generate a standalone fio workload file. This means you can trace vLLM on a production node, take the generated .ini file, and replay the exact I/O pattern on a bare-metal test rig with fio to compare drives without running the inference stack.
+
+### fio Workload Distiller
+
+When `--enable-latency-tracing` is used with the benchmark, or when `--fio` is passed to the shell wrapper, a fio .ini file is generated automatically. The fio config includes:
+
+- **bssplit** from the traced block size distribution (separate read/write splits)
+- **rwmixread** from the read/write I/O count ratio
+- **iodepth** from the in-flight I/O histogram P50
+- **thinktime** from the write-to-fsync serialization gap (idle time between I/O bursts)
+- D2C latency summary and LBA hot zone in the header comments
+
+Example generated config:
+```ini
+[kv-cache-traced]
+ioengine=libaio
+direct=1
+time_based
+runtime=300
+rw=randrw
+rwmixread=87
+bssplit=4k/1:8k/1:16k/1:32k/1:64k/1:128k/100,4k/7:8k/1:16k/1:32k/4:64k/4:128k/83
+iodepth=2048
+iodepth_batch_submit=2048
+iodepth_batch_complete_min=1
+size=100G
+thinktime=32
+thinktime_blocks=2048
+thinktime_iotime=1s
+refill_buffers=1
+norandommap=1
+randrepeat=0
+numjobs=1
+group_reporting
+percentile_list=50:95:99:99.9:99.99
+```
+
+### Requirements
+
+- Linux 5.x+ with BTF support
+- bpftrace 0.14+ (`sudo apt install bpftrace`)
+- sudo or CAP_BPF privileges
+- If bpftrace is not available, the flag degrades gracefully; the benchmark runs normally without tracing.
 
 ---
 
