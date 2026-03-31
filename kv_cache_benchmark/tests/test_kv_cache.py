@@ -221,6 +221,8 @@ def mock_args():
         duration = 60
         gpu_mem_gb = 16
         cpu_mem_gb = 32
+        num_gpus = 1
+        tensor_parallel = 1
         generation_mode = 'none'
         performance_profile = 'latency'
         disable_multi_turn = False
@@ -231,6 +233,8 @@ def mock_args():
         max_concurrent_allocs = 0
         request_rate = 0
         max_requests = 0
+        max_conversations = 500
+        rag_num_docs = 10
         dataset_path = None
         cache_dir = None
         storage_capacity_gb = 0
@@ -239,6 +243,13 @@ def mock_args():
         precondition_threads = 0
         trace_speedup = 1.0
         replay_cycles = 0
+        prefill_only = False
+        decode_only = False
+        validation_trace = None
+        use_burst_trace = False
+        burst_trace_path = None
+        io_trace_log = None
+        enable_latency_tracing = False
     return MockArgs()
 
 
@@ -1383,6 +1394,8 @@ class TestValidateArgs:
             duration=60,
             gpu_mem_gb=16,
             cpu_mem_gb=32,
+            num_gpus=1,
+            tensor_parallel=1,
             rag_num_docs=10,
             max_conversations=500,
             max_concurrent_allocs=0,
@@ -3341,31 +3354,21 @@ class TestVisualizeUserRequestFlow:
 
     def test_part3c_multi_turn_prefill_decode_file_io(self, tiny_model):
         """
-        Shows how a multi-turn conversation creates and reads .npy files.
+        Shows how a multi-turn conversation reads ALL previous turns.
 
-        Conversation with 4 turns:
+        Each turn writes its own new tokens. On subsequent turns, ALL
+        previous turns are read via access_cache to reload the full
+        conversation context. Evicted turns return (None, 0.0) with
+        no I/O; surviving turns trigger real np.load reads.
 
-        Turn 1 (no previous context):
-          cache_key = "conv_XXX_turn_1"
-          PREFILL: allocate_cache() → WRITE conv_XXX_turn_1.npy   (new file)
-          DECODE:  access_cache()   → READ  conv_XXX_turn_1.npy
+        Turn 1: WRITE turn_1 + READ turn_1 (decode)
+        Turn 2: READ [turn_1] + WRITE turn_2 + READ turn_2
+        Turn 3: READ [turn_1, turn_2] + WRITE turn_3 + READ turn_3
+        Turn 4: READ [turn_1, turn_2, turn_3] + WRITE turn_4 + READ turn_4
 
-        Turn 2 (has previous turn):
-          cache_key = "conv_XXX_turn_2"
-          MULTI-TURN READ:  access_cache(turn_1) → READ conv_XXX_turn_1.npy  ← reuse!
-          PREFILL: allocate_cache() → WRITE conv_XXX_turn_2.npy   (new file)
-          DECODE:  access_cache()   → READ  conv_XXX_turn_2.npy
-
-        Turn 3:
-          MULTI-TURN READ:  access_cache(turn_2) → READ conv_XXX_turn_2.npy  ← reuse!
-          PREFILL: WRITE conv_XXX_turn_3.npy
-          DECODE:  READ  conv_XXX_turn_3.npy
-
-        Each turn:
-          - Reads the PREVIOUS turn's .npy (multi-turn cache reuse)
-          - Writes a NEW .npy for this turn's KV cache
-          - Reads the NEW .npy during decode
-          - File count grows by 1 per turn (until eviction cleans old ones)
+        Multi-turn reads (triangular): 0+1+2+3 = 6
+        Decode reads: 4 (one per turn)
+        Total decode_reads stat: 10
 
         This is the exact flow from benchmark.py process_requests() steps 2, 3, 5.
         """
@@ -3411,25 +3414,21 @@ class TestVisualizeUserRequestFlow:
             storage_latency = 0.0
             file_ops = []
 
-            # ── Step 2: Multi-turn read (previous turn's cache) ──
+            # ── Step 2: Multi-turn read (ALL previous turns) ──
             if turn > 1:
-                prev_key = f"{conv_id}_turn_{turn - 1}"
-                prev_file = nvme_dir / f"{prev_key}.npy"
-
-                print(f"\n  Step 2: MULTI-TURN READ (reuse previous turn)")
-                print(f"    Read:  {prev_key}.npy")
-                print(f"    Exists: {prev_file.exists()}")
-
-                location, read_lat = cache.access_cache(
-                    prev_key, InferencePhase.DECODE, 'multi_turn'
-                )
-                storage_latency += read_lat
-                file_ops.append(f"READ  {prev_key}.npy  ({read_lat*1000:.3f} ms)  [multi-turn reuse]")
-
-                if location:
-                    print(f"    Hit: location={location}, latency={read_lat*1000:.3f} ms")
-                else:
-                    print(f"    Miss: previous turn not in cache")
+                prev_keys = conv_mgr.get_all_previous_turn_keys(conv_id, turn)
+                print(f"\n  Step 2: MULTI-TURN READ ({len(prev_keys)} previous turn(s))")
+                for prev_key in prev_keys:
+                    location, read_lat = cache.access_cache(
+                        prev_key, InferencePhase.DECODE, 'multi_turn'
+                    )
+                    storage_latency += read_lat
+                    if location:
+                        file_ops.append(f"READ  {prev_key}.npy  ({read_lat*1000:.3f} ms)  [hit, {location}]")
+                        print(f"    {prev_key} -> Hit ({location}, {read_lat*1000:.3f} ms)")
+                    else:
+                        file_ops.append(f"READ  {prev_key}.npy  [miss, evicted]")
+                        print(f"    {prev_key} -> Miss (evicted)")
             else:
                 print(f"\n  Step 2: MULTI-TURN READ — skipped (turn 1, no history)")
 
@@ -3488,33 +3487,144 @@ class TestVisualizeUserRequestFlow:
         print(f"  Total write bytes:     {cache.stats['total_write_bytes']/1024:.0f} KB")
         print(f"  Total read bytes:      {cache.stats['total_read_bytes']/1024:.0f} KB")
 
-        print(f"\n  File-per-turn pattern:")
-        print(f"    Turn 1: WRITE turn_1.npy + READ turn_1.npy")
-        print(f"    Turn 2: READ  turn_1.npy + WRITE turn_2.npy + READ turn_2.npy")
-        print(f"    Turn 3: READ  turn_2.npy + WRITE turn_3.npy + READ turn_3.npy")
-        print(f"    Turn N: READ  turn_(N-1).npy + WRITE turn_N.npy + READ turn_N.npy")
+        multi_turn_reads = (num_turns * (num_turns - 1)) // 2
+
+        print(f"\n  Full-context reload pattern:")
+        print(f"    Turn 1: WRITE turn_1 + READ turn_1")
+        print(f"    Turn 2: READ [turn_1] + WRITE turn_2 + READ turn_2")
+        print(f"    Turn 3: READ [turn_1, turn_2] + WRITE turn_3 + READ turn_3")
+        print(f"    Turn N: READ [turns 1..N-1] + WRITE turn_N + READ turn_N")
         print(f"")
         print(f"  I/O per turn:")
         print(f"    Turn 1:  1 write + 1 read  = 2 I/O ops")
-        print(f"    Turn 2+: 1 write + 2 reads = 3 I/O ops  (extra read = multi-turn reuse)")
-        print(f"")
-        print(f"  Write amplification over {num_turns} turns:")
-        total_data = num_turns * context_per_turn * bpt
-        total_written = cache.stats['total_write_bytes']
-        print(f"    Unique KV data: {total_data/1024:.0f} KB  "
-              f"({num_turns} turns × {context_per_turn} tok × {bpt:,d} B)")
-        print(f"    Bytes written:  {total_written/1024:.0f} KB")
-        print(f"    Ratio:          {total_written / total_data:.2f}x")
+        print(f"    Turn N:  1 write + N reads  = {num_turns + 1} I/O ops  (turn {num_turns})")
+        print(f"  Multi-turn reads (triangular): {multi_turn_reads}")
 
         # Assertions
         assert len(all_npy) == num_turns, \
             f"Should have {num_turns} .npy files (one per turn), got {len(all_npy)}"
         assert cache.stats['prefill_writes'] == num_turns, \
             f"Should have {num_turns} prefill writes"
-        # decode_reads: turn 1 has 1, turns 2-4 have 2 each (multi-turn + decode)
-        expected_reads = 1 + (num_turns - 1) * 2
+        # decode_reads = multi-turn reads (triangular) + decode reads (one per turn)
+        expected_reads = num_turns + multi_turn_reads
         assert cache.stats['decode_reads'] == expected_reads, \
             f"Expected {expected_reads} decode reads, got {cache.stats['decode_reads']}"
+
+    # ------------------------------------------------------------------
+    # Part 3d: Multi-turn with eviction pressure
+    # ------------------------------------------------------------------
+
+    def test_part3d_multi_turn_with_eviction(self, tiny_model):
+        """
+        Shows what happens when previous turns get evicted by the LRU
+        waterfall before the next turn reads them.
+
+        Setup: NVMe capacity fits only 3 entries. A 6-turn conversation
+        forces turns 1-3 to be evicted as turns 4-6 are written. The
+        multi-turn reads for later turns show a mix of hits and misses.
+
+        This validates that access_cache returns (None, 0.0) cleanly for
+        evicted entries, and that the benchmark correctly counts misses.
+        """
+        print("\n" + "=" * 72)
+        print("  PART 3d: MULTI-TURN WITH EVICTION PRESSURE")
+        print("=" * 72)
+
+        bpt = tiny_model.kv_cache_size_per_token
+        context_per_turn = 200
+        entry_bytes = context_per_turn * bpt
+        # Capacity for ~3 entries; turns 4+ force eviction of oldest
+        capacity_bytes = entry_bytes * 3.5
+        capacity_gb = capacity_bytes / (1024 ** 3)
+
+        cache = MultiTierCache(
+            model_config=tiny_model,
+            gpu_memory_gb=0,
+            cpu_memory_gb=0,
+            seed=42,
+            storage_capacity_gb=capacity_gb,
+        )
+
+        nvme_dir = cache.backends['nvme'].base_path
+        conv_mgr = ConversationManager(max_conversations=10)
+        conv_id = conv_mgr.start_conversation("bob")
+
+        num_turns = 6
+        print(f"\n  Entry size: {entry_bytes/1024:.0f} KB")
+        print(f"  NVMe capacity: {capacity_bytes/1024:.0f} KB (~{capacity_bytes/entry_bytes:.1f} entries)")
+        print(f"  Turns: {num_turns} (will force eviction after turn 3)")
+
+        total_hits = 0
+        total_misses = 0
+
+        for turn in range(1, num_turns + 1):
+            turn_num, cache_key = conv_mgr.add_turn(conv_id, context_per_turn, 50)
+
+            print(f"\n  Turn {turn}:")
+
+            # Step 2: read all previous turns
+            if turn > 1:
+                prev_keys = conv_mgr.get_all_previous_turn_keys(conv_id, turn)
+                hits = 0
+                misses = 0
+                for prev_key in prev_keys:
+                    location, _ = cache.access_cache(prev_key, InferencePhase.DECODE, 'multi_turn')
+                    if location is not None:
+                        hits += 1
+                    else:
+                        misses += 1
+                total_hits += hits
+                total_misses += misses
+                print(f"    Step 2: read {len(prev_keys)} previous turns -> {hits} hits, {misses} misses")
+
+            # Step 3: write this turn
+            success, tier, _ = cache.allocate_cache(
+                cache_key, num_tokens=context_per_turn, phase=InferencePhase.PREFILL
+            )
+            npy_count = len(list(nvme_dir.glob("*.npy")))
+            print(f"    Step 3: write {cache_key} -> {tier}, files on disk: {npy_count}")
+
+        npy_files = sorted(nvme_dir.glob("*.npy"))
+        print(f"\n  {'=' * 64}")
+        print(f"  EVICTION SUMMARY")
+        print(f"  {'=' * 64}")
+        print(f"  Multi-turn hits:   {total_hits}")
+        print(f"  Multi-turn misses: {total_misses}")
+        print(f"  Files on disk:     {len(npy_files)} (capacity held ~3)")
+        print(f"  Evictions:         {cache.stats['evictions']}")
+        print(f"  Cache misses:      {cache.stats['cache_misses']}  (tier-level, all types)")
+        for f in npy_files:
+            print(f"    {f.name}")
+
+        print(f"\n  HOW CACHE MISSES INCREMENT:")
+        print(f"  ────────────────────────────")
+        print(f"  Two separate counters track misses:")
+        print(f"")
+        print(f"  1. cache.stats['cache_misses'] (tier-level, inside access_cache):")
+        print(f"     Increments when ANY access_cache() call finds the key missing")
+        print(f"     from cache_entries. Covers all miss types: multi-turn, decode,")
+        print(f"     prefix, RAG. Returns (None, 0.0) immediately; no I/O, no np.load.")
+        print(f"")
+        print(f"  2. results['multi_turn_cache_misses'] (benchmark-level, step 2 only):")
+        print(f"     Increments when a multi-turn access_cache() returns None.")
+        print(f"     This is a SUBSET of cache_misses; it counts only the misses")
+        print(f"     from the step 2 previous-turn read loop.")
+        print(f"")
+        print(f"  In this test: {cache.stats['cache_misses']} tier-level misses total,")
+        print(f"  {total_misses} of which are multi-turn misses from evicted turns.")
+        print(f"")
+        print(f"  A high multi-turn miss rate ({total_misses}/{total_hits + total_misses}"
+              f" = {total_misses*100/max(total_hits+total_misses,1):.0f}%) means the")
+        print(f"  NVMe tier is too small to hold the full conversation history.")
+        print(f"  The LRU waterfall evicts old turns before they can be reused.")
+
+        # Assertions
+        assert total_misses > 0, "Eviction should cause some multi-turn misses"
+        assert total_hits > 0, "Recent turns should still be cached"
+        assert cache.stats['evictions'] > 0, "Eviction should have occurred"
+        assert cache.stats['cache_misses'] >= total_misses, \
+            "Tier-level misses should be >= multi-turn misses (superset)"
+        assert len(npy_files) <= 4, "NVMe should hold ~3 entries, not all 6"
 
     # ------------------------------------------------------------------
     # Part 4: 3-tier waterfall LRU eviction
@@ -3830,6 +3940,7 @@ class TestValidateNewTraceArgs:
         import argparse
         return argparse.Namespace(
             num_users=100, duration=60, gpu_mem_gb=16, cpu_mem_gb=32,
+            num_gpus=1, tensor_parallel=1,
             rag_num_docs=10, max_conversations=500, max_concurrent_allocs=0,
             request_rate=0, max_requests=0, target_saturation=0.8,
             cache_dir=None, storage_capacity_gb=0, precondition_size_gb=0,

@@ -743,6 +743,22 @@ class MultiTierCache:
             del data
             return False, 'none', 0.0
 
+    def check_cache_exists(self, key: str) -> Tuple[Optional[str], int]:
+        """Metadata-only existence check. No I/O, no LRU update.
+
+        Used by multi-turn virtual context checks: determines whether a
+        previous turn's KV cache entry survived LRU eviction without
+        loading data from disk (no np.load, no memory allocation).
+
+        Returns:
+            (location, size_bytes) if the entry exists, (None, 0) otherwise.
+        """
+        with self.metadata_lock:
+            entry = self.cache_entries.get(key)
+            if entry is None:
+                return None, 0
+            return entry['location'], entry['size']
+
     def access_cache(self, key: str, phase: InferencePhase = InferencePhase.DECODE,
                      cache_type: str = 'user') -> Tuple[Optional[str], float]:
         """Accesses an existing cached entry and records the read performance."""

@@ -211,6 +211,78 @@ def export_results_to_xlsx(results: Dict, args, output_path: str):
                         qos_df = pd.DataFrame(qos_rows)
                         qos_df.to_excel(writer, sheet_name='QoS Metrics', index=False)
 
+                # Device tracing sheet (when --enable-latency-tracing is used)
+                trace_data = results.get('device_latency_tracing', {})
+                if trace_data:
+                    trace_rows = []
+                    display_order = [
+                        ('d2c_read_us', 'D2C Read (us)', 'Device hardware time'),
+                        ('d2c_write_us', 'D2C Write (us)', 'Device hardware time'),
+                        ('q2d_read_us', 'Q2D Read (us)', 'I/O scheduler queue'),
+                        ('q2d_write_us', 'Q2D Write (us)', 'I/O scheduler queue'),
+                        ('vfs_read_us', 'VFS Read (us)', 'Application-visible'),
+                        ('vfs_write_us', 'VFS Write (us)', 'Application-visible'),
+                        ('fsync_us', 'fsync (us)', 'Device flush'),
+                        ('write_to_fsync_us', 'Write-to-fsync (us)', 'CPU serialization gap'),
+                        ('fadvise_to_read_us', 'fadvise-to-read (us)', 'Cache drop overhead'),
+                        ('bssplit_read_kb', 'Block Size Read (KB)', 'I/O size distribution'),
+                        ('bssplit_write_kb', 'Block Size Write (KB)', 'I/O size distribution'),
+                        ('qd_read', 'Queue Depth Read', 'Instantaneous QD at dispatch'),
+                        ('qd_write', 'Queue Depth Write', 'Instantaneous QD at dispatch'),
+                        ('lba_read_gb', 'LBA Heatmap Read (GB)', 'Spatial I/O distribution'),
+                        ('lba_write_gb', 'LBA Heatmap Write (GB)', 'Spatial I/O distribution'),
+                    ]
+
+                    def hist_pct(buckets, pct):
+                        total = sum(b['count'] for b in buckets)
+                        if total == 0:
+                            return 0
+                        target = total * pct / 100.0
+                        cum = 0
+                        for b in buckets:
+                            cum += b['count']
+                            if cum >= target:
+                                return b['range_us'][0]
+                        return buckets[-1]['range_us'][0]
+
+                    for key, label, description in display_order:
+                        if key not in trace_data or not trace_data[key].get('buckets'):
+                            continue
+                        buckets = trace_data[key]['buckets']
+                        total_count = sum(b['count'] for b in buckets)
+                        if total_count == 0:
+                            continue
+                        trace_rows.append({
+                            'Metric': label,
+                            'Description': description,
+                            'Samples': total_count,
+                            'P50': hist_pct(buckets, 50),
+                            'P95': hist_pct(buckets, 95),
+                            'P99': hist_pct(buckets, 99),
+                            'Min Bucket': buckets[0]['range_us'][0],
+                            'Max Bucket': buckets[-1]['range_us'][1],
+                        })
+
+                    if trace_rows:
+                        trace_df = pd.DataFrame(trace_rows)
+                        trace_df.to_excel(writer, sheet_name='Device Tracing', index=False)
+
+                        # Raw histograms sheet
+                        raw_rows = []
+                        for key, label, _ in display_order:
+                            if key not in trace_data or not trace_data[key].get('buckets'):
+                                continue
+                            for b in trace_data[key]['buckets']:
+                                raw_rows.append({
+                                    'Histogram': label,
+                                    'Bucket Low': b['range_us'][0],
+                                    'Bucket High': b['range_us'][1],
+                                    'Count': b['count'],
+                                })
+                        if raw_rows:
+                            raw_df = pd.DataFrame(raw_rows)
+                            raw_df.to_excel(writer, sheet_name='Trace Histograms', index=False)
+
             logger.info(f"XLSX results saved to {output_path}")
         else:
             csv_path = output_path.replace('.xlsx', '.csv') if output_path.endswith('.xlsx') else output_path
@@ -321,6 +393,8 @@ def main():
                             'Timestamp,Operation,Object_Size_Bytes,Tier (Tier-0=GPU, Tier-1=CPU, Tier-2=NVMe). '
                             'The resulting trace can be replayed by an external storage benchmark tool.'
                         ))
+    parser.add_argument('--enable-latency-tracing', action='store_true',
+                        help='Enable bpftrace device latency tracing (requires sudo, bpftrace).')
 
     args = parser.parse_args()
 
@@ -406,6 +480,7 @@ def main():
         prefill_only=args.prefill_only,
         decode_only=args.decode_only,
         io_trace_log=args.io_trace_log,
+        enable_latency_tracing=args.enable_latency_tracing
     )
 
     results = benchmark.run()
@@ -428,6 +503,15 @@ def main():
 
     if args.xlsx_output:
         export_results_to_xlsx(results, args, args.xlsx_output)
+
+    # Save fio workload file when latency tracing produced one
+    fio_config = results.get('fio_workload')
+    if fio_config:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fio_filename = f"fio_kv_cache_workload_{timestamp}.ini"
+        with open(fio_filename, 'w') as f:
+            f.write(fio_config)
+        logger.info(f"fio workload saved to {fio_filename}")
 
 
 if __name__ == "__main__":
