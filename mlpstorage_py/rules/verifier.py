@@ -70,7 +70,7 @@ class BenchmarkVerifier:
             elif isinstance(source, str):
                 # Assume it's a result directory path
                 self.benchmark_runs.append(BenchmarkRun.from_result_dir(source, logger))
-            elif "mlpstorage.benchmarks." in str(type(source)):
+            elif "mlpstorage_py.benchmarks." in str(type(source)):
                 # It's a Benchmark instance - use the factory method
                 self.benchmark_runs.append(BenchmarkRun.from_benchmark(source, logger))
             else:
