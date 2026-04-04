@@ -58,7 +58,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.run]
-source = ["mlpstorage"]
+source = ["mlpstorage_py"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]
