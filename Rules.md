@@ -186,11 +186,24 @@ root_folder (or any name you prefer)
 │	  	│		│		└── YYYYMMDD_HHmmss
 │	  	│		│	 		└── dlio_config
 │	  	│	 	└── vdb_bench
-│	  	│	 		└── YYYYMMDD_HHmmss
-│	  	│			│	└── summary.json
-│	  	│			... (5x Runs total)
-│	  	│			└── YYYYMMDD_HHmmss
-│	  	│				└── summary.json
+|		|			├── AiSEQ
+│	  	│	 		|	├── YYYYMMDD_HHmmss
+│	  	│			|	│	└── summary.json
+│	  	│			|	... (5x Runs total)
+│	  	│			|	└── YYYYMMDD_HHmmss
+│	  	│			|		└── summary.json
+|		|			├── DiskANN
+│	  	│	 		|	├── YYYYMMDD_HHmmss
+│	  	│			|	│	└── summary.json
+│	  	│			|	... (5x Runs total)
+│	  	│			|	└── YYYYMMDD_HHmmss
+│	  	│			|		└── summary.json
+|		|			└── HNSW
+│	  	│	 			├── YYYYMMDD_HHmmss
+│	  	│				│	└── summary.json
+│	  	│				... (5x Runs total)
+│	  	│				└── YYYYMMDD_HHmmss
+│	  	│					└── summary.json
 │	  	└── systems
 │	  		├──system-name-1.yaml
 │	  		├──system-name-1.pdf
@@ -266,11 +279,24 @@ root_folder (or any name you prefer)
 	  	│		│		└── YYYYMMDD_HHmmss
 	  	│		│	 		└── dlio_config
 	  	│	 	└── vdb_bench
-	  	│	 		└── YYYYMMDD_HHmmss
-	  	│			│	└── summary.json
-	  	│			... (5x Runs total)
-	  	│			└── YYYYMMDD_HHmmss
-	  	│				└── summary.json
+		|			├── AiSEQ
+	  	│	 		|	├── YYYYMMDD_HHmmss
+	  	│			|	│	└── summary.json
+	  	│			|	... (5x Runs total)
+	  	│			|	└── YYYYMMDD_HHmmss
+	  	│			|		└── summary.json
+		|			├── DiskANN
+	  	│	 		|	├── YYYYMMDD_HHmmss
+	  	│			|	│	└── summary.json
+	  	│			|	... (5x Runs total)
+	  	│			|	└── YYYYMMDD_HHmmss
+	  	│			|		└── summary.json
+		|			└── HNSW
+	  	│	 			├── YYYYMMDD_HHmmss
+	  	│				│	└── summary.json
+	  	│				... (5x Runs total)
+	  	│				└── YYYYMMDD_HHmmss
+	  	│					└── summary.json
 		└── systems
 			├──system-name-1.yaml
 			├──system-name-1.pdf
