@@ -11,7 +11,7 @@
 # Data    : s3://mlp-s3torch/test-run/unet3d/train/
 #
 # Prerequisites:
-#   pip install s3torchconnector        # or s3-torch-connector-builder
+#   uv sync (s3torchconnector must be added to pyproject.toml dependencies)
 #   (s3dlio is used for pre-flight listing — it must also be installed)
 #
 # MPI vs PyTorch workers — these are different:
@@ -48,7 +48,7 @@ fi
 if [[ ! -f .venv/bin/activate ]]; then
     echo "ERROR: .venv not found" >&2; exit 1
 fi
-source .venv/bin/activate  # shellcheck disable=SC1091
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 
 DLIO_BIN=".venv/bin/dlio_benchmark"
 if [[ ! -x "$DLIO_BIN" ]]; then
@@ -58,8 +58,8 @@ fi
 # ── Check s3torchconnector is installed ───────────────────────────────────────
 if ! python3 -c "import s3torchconnector" 2>/dev/null; then
     echo "ERROR: s3torchconnector is not installed." >&2
-    echo "  Install with: pip install s3torchconnector" >&2
-    echo "  Or: pip install s3-torch-connector-builder" >&2
+    echo "  Install with: uv sync (s3torchconnector must be added to pyproject.toml dependencies)" >&2
+    echo "  Or: uv sync" >&2
     exit 1
 fi
 

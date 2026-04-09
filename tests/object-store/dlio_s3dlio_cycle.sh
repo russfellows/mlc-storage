@@ -48,11 +48,11 @@ fi
 
 # ── Virtual environment ────────────────────────────────────────────────────────
 if [[ ! -f .venv/bin/activate ]]; then
-    echo "ERROR: .venv not found — run: python -m venv .venv && pip install -e ." >&2
+    echo "ERROR: .venv not found — run: python -m venv .venv && uv sync >&2
     exit 1
 fi
 # shellcheck disable=SC1091
-source .venv/bin/activate
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 
 DLIO_BIN=".venv/bin/dlio_benchmark"
 if [[ ! -x "$DLIO_BIN" ]]; then

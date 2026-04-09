@@ -366,7 +366,7 @@ def run_checkpoint(library: str, config: dict, network_gbps: float = None) -> di
       chunk_size × num_buffers = 32 MB × 4 = 128 MB RAM, regardless of checkpoint size.
     dgen-py generates data in parallel while the library uploads it — memory stays flat.
     """
-    from mlpstorage.checkpointing import StreamingCheckpointing
+    from mlpstorage_py.checkpointing import StreamingCheckpointing
 
     bucket      = LIBRARY_BUCKETS[library]
     env         = build_env(config, library)

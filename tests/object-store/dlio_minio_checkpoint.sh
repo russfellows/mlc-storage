@@ -44,7 +44,7 @@ fi
 if [[ ! -f .venv/bin/activate ]]; then
     echo "ERROR: .venv not found" >&2; exit 1
 fi
-source .venv/bin/activate  # shellcheck disable=SC1091
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 
 DLIO_BIN=".venv/bin/dlio_benchmark"
 if [[ ! -x "$DLIO_BIN" ]]; then
@@ -54,7 +54,7 @@ fi
 # ── Check minio is installed ──────────────────────────────────────────────────
 if ! python3 -c "from minio import Minio" 2>/dev/null; then
     echo "ERROR: minio is not installed." >&2
-    echo "  Install with: pip install minio" >&2
+    echo "  Install with: uv sync" >&2
     exit 1
 fi
 

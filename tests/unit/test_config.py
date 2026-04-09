@@ -10,7 +10,7 @@ Tests cover:
 import os
 import pytest
 
-from mlpstorage.config import (
+from mlpstorage_py.config import (
     check_env,
     get_datetime_string,
     BENCHMARK_TYPES,

@@ -13,43 +13,40 @@ object storage via s3dlio, minio, or s3torchconnector).
 
 ## Quick Start for New Users
 
-### Step 1 — Clone and set up the virtual environment
+### Step 1 — Clone and set up the environment
 
 ```bash
-git clone https://github.com/russfellows/mlc-storage.git mlp-storage
+git clone https://github.com/mlcommons/storage.git mlp-storage
 cd mlp-storage
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[test]"
+uv sync
 ```
 
-The `[test]` extra installs `pytest`, `pytest-cov`, and `pytest-mock` in addition to
-the core package. The package itself is installed in editable mode (`-e`) so changes
-to `mlpstorage/` source files are reflected immediately without reinstalling.
+[`uv`](https://docs.astral.sh/uv/) creates and manages the virtual environment
+automatically — no manual `venv` or `pip` steps required. If `uv` is not installed:
 
-> **Already cloned / returning user?**
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+To include test and full extras:
+
+```bash
+uv sync --all-extras
+```
+
+> **Already cloned / returning user?** Just run `uv sync` again after pulling — it
+> is idempotent and fast. It updates the environment to match `uv.lock` automatically.
 >
-> Always activate the venv first, then reinstall to pick up any dependency or version
-> changes since your last pull:
+> Confirm the installed version:
 > ```bash
-> source .venv/bin/activate
-> pip install -e ".[test]"
-> ```
-> This is fast (seconds) if nothing changed, and critical if `pyproject.toml` has
-> been updated — for example after a version bump or a new dependency was added.
-> Skipping it can leave `mlpstorage.__version__` and package metadata reporting
-> the old version, and new dependencies missing.
->
-> Confirm the installed version matches the repo:
-> ```bash
-> python -c "import mlpstorage; print(mlpstorage.VERSION)"
+> uv run python -c "import mlpstorage_py; print(mlpstorage_py.VERSION)"
 > # Should print: 3.0.0
 > ```
 
 ### Step 2 — Run the unit tests (no infrastructure required)
 
 ```bash
-pytest tests/unit/
+uv run pytest tests/unit/
 ```
 
 Expected output: all tests pass in a few seconds. No MinIO, no MPI, no GPU required.
@@ -59,8 +56,7 @@ These tests mock all external dependencies.
 ==================== XX passed in X.XXs ====================
 ```
 
-If you see import errors, make sure the virtual environment is active and the package
-is installed (`pip install -e ".[test]"`).
+If you see import errors, run `uv sync --all-extras` and retry.
 
 ### Step 3 — (Optional) Run integration tests with object storage
 

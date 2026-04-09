@@ -101,17 +101,17 @@ echo ""
 # Activate virtual environment
 if [ ! -d ".venv" ]; then
     echo "❌ ERROR: Virtual environment not found at $REPO_ROOT/.venv"
-    echo "   Please create it first: uv venv && uv pip install -e ."
+    echo "   Please create it first: uv venv && uv uv sync
     exit 1
 fi
 
-source .venv/bin/activate
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 echo "✅ Virtual environment activated"
 
 # Verify dgen-py is installed
 if ! python -c "import dgen_py" 2>/dev/null; then
     echo "❌ ERROR: dgen-py not installed"
-    echo "   Install with: pip install dgen-py"
+    echo "   Install with: uv sync"
     exit 1
 fi
 
