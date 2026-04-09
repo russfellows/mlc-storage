@@ -45,7 +45,7 @@ echo "Files: ${NUM_FILES}"
 echo ""
 
 # Activate venv
-source .venv/bin/activate
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 echo "Active venv: $(which python)"
 echo ""
 

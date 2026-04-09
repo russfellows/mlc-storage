@@ -86,7 +86,7 @@ def timeout(seconds: int, message: str = 'Operation timed out'):
 
 
 def run(s3_uri: str, size_gb: float):
-    from mlpstorage.checkpointing import StreamingCheckpointing
+    from mlpstorage_py.checkpointing import StreamingCheckpointing
 
     total_bytes = int(size_gb * (1024 ** 3))
     endpoint = os.environ.get('AWS_ENDPOINT_URL', '(default)')

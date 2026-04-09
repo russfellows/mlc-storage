@@ -47,11 +47,11 @@ export AWS_REGION
 
 # ── Virtual environment ────────────────────────────────────────────────────────
 if [[ ! -f .venv/bin/activate ]]; then
-    echo "ERROR: .venv not found — run: python3 -m venv .venv && pip install -e dlio_benchmark/" >&2
+    echo "ERROR: .venv not found — run: python3 -m venv .venv && uv sync >&2
     exit 1
 fi
 # shellcheck disable=SC1091
-source .venv/bin/activate
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 
 # ── Tracing ───────────────────────────────────────────────────────────────────
 # RUST_LOG=info shows every s3dlio PUT / GET / LIST at the Rust layer.

@@ -39,7 +39,7 @@ fi
 if [[ ! -f .venv/bin/activate ]]; then
     echo "ERROR: .venv not found" >&2; exit 1
 fi
-source .venv/bin/activate  # shellcheck disable=SC1091
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 FORCE=${FORCE:-0}

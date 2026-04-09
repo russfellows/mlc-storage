@@ -50,7 +50,7 @@ def apply_config(config: dict):
 
 
 def test_minio_checkpoint(uri: str, size_gb: float, part_size_mb: int, num_parallel: int):
-    from mlpstorage.checkpointing import StreamingCheckpointing
+    from mlpstorage_py.checkpointing import StreamingCheckpointing
 
     total_bytes = int(size_gb * (1024**3))
     part_size = part_size_mb * 1024 * 1024

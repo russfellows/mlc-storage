@@ -1,7 +1,7 @@
 # Object Store Tests
 
-Performance tests and benchmarks for object storage backends (s3dlio, minio,
-s3torchconnector) used by `mlpstorage`.
+Performance tests and benchmarks for object storage backends (s3dlio, minio)
+used by `mlpstorage`.
 
 All tests load credentials from a `.env` file at the **project root** (`mlp-storage/.env`):
 
@@ -152,31 +152,31 @@ Each library takes a different path to TLS certificate verification:
 
 ---
 
-## Library Selection — `storage_library` YAML Key
+## Library Selection — `--param storage_library=<lib>` at Runtime
 
-The `storage_library` key in the YAML config controls **which S3 client library is used**
-for all I/O operations (reads, writes, listing). It lives in the `storage:` section —
-**not** in `dataset:`.
+The storage library is a **runtime parameter** — pass it on the command line or via
+environment variables, not in the YAML workload config. The YAML config contains only
+workload parameters (dataset sizes, formats, model settings) that never change.
 
-```yaml
-storage:
-  storage_type: s3          # the protocol family ("s3" = object storage)
-  storage_root: mlp-minio   # the bucket name
-  storage_library: minio    # which library to use ← this is the selector
+```bash
+# Example: run with s3dlio
+uv run mlpstorage training datagen --model unet3d \
+  --param storage.storage_type=s3 \
+  --param storage.storage_root=${BUCKET} \
+  --param storage.storage_options.storage_library=s3dlio \
+  --param storage.storage_options.endpoint_url=${AWS_ENDPOINT_URL} \
+  --param storage.storage_options.access_key_id=${AWS_ACCESS_KEY_ID} \
+  --param storage.storage_options.secret_access_key=${AWS_SECRET_ACCESS_KEY}
 ```
 
-**Valid values:**
+Or source `.env` and let the shell scripts handle the plumbing (see below).
+
+**Valid library values:**
 
 | `storage_library` | Library | Notes |
 |---|---|---|
-| `s3dlio` | s3dlio (Rust-based, Tokio async) | `get_many()` parallel batch, `MultipartUploadWriter` |
+| `s3dlio` | s3dlio (Rust-based, Tokio async) | `get_many()` parallel batch, `MultipartUploadWriter` — **recommended** |
 | `minio` | minio Python SDK | `ThreadPoolExecutor`, automatic 5 MB multipart |
-| `s3torchconnector` | Amazon s3torchconnector (Rust) | `S3Client.get_object()` (direct, optimal); ⚠️ DLIO reader currently uses `S3IterableDataset` (sequential, 1 GET/worker) — see `S3library_review_21-Mar.md` |
-
-The three separate workload configs differ only on this key (and the bucket name):
-- `configs/dlio/workload/unet3d_h100_s3dlio.yaml` → `storage_library: s3dlio`
-- `configs/dlio/workload/unet3d_h100_minio.yaml` → `storage_library: minio`
-- `configs/dlio/workload/unet3d_h100_s3torch.yaml` → `storage_library: s3torchconnector`
 
 ### How `storage_library` flows from YAML → code
 
@@ -240,35 +240,35 @@ per-library data locality effects.
 | `native` | s3dlio Rust async vs Python threads | `s3dlio.get_many(uris, max_in_flight=N)` |
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
+cd mlp-storage
 
-# Default: all modes, existing training data (mlp-s3dlio bucket), concurrency 1/4/8/16
-python tests/object-store/test_s3lib_get_bench.py
+# Default: all modes, existing training data, concurrency 1/4/8/16
+uv run python tests/object-store/test_s3lib_get_bench.py
 
 # Write 20 synthetic 128 MB objects first, then run all tests against them
-python tests/object-store/test_s3lib_get_bench.py \
+uv run python tests/object-store/test_s3lib_get_bench.py \
     --write --write-num-files 20 --write-size-mb 128
 
 # Serial-only test — per-request latency and single-stream MB/s
-python tests/object-store/test_s3lib_get_bench.py --mode serial --num-files 30
+uv run python tests/object-store/test_s3lib_get_bench.py --mode serial --num-files 30
 
 # Parallel sweep with custom worker counts
-python tests/object-store/test_s3lib_get_bench.py \
+uv run python tests/object-store/test_s3lib_get_bench.py \
     --mode parallel --workers 1 4 8 16 32 64
 
 # Test only s3dlio native get_many (Rust Tokio async) vs ThreadPoolExecutor
-python tests/object-store/test_s3lib_get_bench.py \
+uv run python tests/object-store/test_s3lib_get_bench.py \
     --mode native --workers 1 4 8 16 32
 
-# Test only two libraries
-python tests/object-store/test_s3lib_get_bench.py --libraries s3dlio minio
+# Test only s3dlio and minio
+uv run python tests/object-store/test_s3lib_get_bench.py --libraries s3dlio minio
 
 # Custom bucket and prefix
-python tests/object-store/test_s3lib_get_bench.py \
+uv run python tests/object-store/test_s3lib_get_bench.py \
     --bucket my-bucket --prefix data/train/ --num-files 50
 
 # CLI reference
-python tests/object-store/test_s3lib_get_bench.py --help
+uv run python tests/object-store/test_s3lib_get_bench.py --help
 ```
 
 #### Sample Output
@@ -361,20 +361,20 @@ Measures **native API write + read throughput** across all three libraries side-
 without any DLIO involvement. Each library gets its own dedicated bucket.
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
+cd mlp-storage
 
-# Default: 100 × 128 MiB objects, 8 write + 8 read workers, all three libraries
-python tests/object-store/test_direct_write_comparison.py
+# Default: 100 × 128 MiB objects, 8 write + 8 read workers
+uv run python tests/object-store/test_direct_write_comparison.py
 
 # Reproduce the 12-worker results in Object_Perf_Results.md
-python tests/object-store/test_direct_write_comparison.py \
+uv run python tests/object-store/test_direct_write_comparison.py \
     --num-files 100 --size-mb 128 --write-workers 12 --read-workers 12
 
 # Single library
-python tests/object-store/test_direct_write_comparison.py --library s3dlio
+uv run python tests/object-store/test_direct_write_comparison.py --library s3dlio
 
 # CLI reference
-python tests/object-store/test_direct_write_comparison.py --help
+uv run python tests/object-store/test_direct_write_comparison.py --help
 ```
 
 #### `test_dlio_multilib_demo.py`
@@ -383,16 +383,16 @@ I/O goes through DLIO's MPI data generation and PyTorch DataLoader — this is t
 realistic DLIO performance as seen by a training job, not direct API throughput.
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
+cd mlp-storage
 
 # Training workload (100 × 128 MiB NPZ, 2 epochs)
-python tests/object-store/test_dlio_multilib_demo.py --workload training
+uv run python tests/object-store/test_dlio_multilib_demo.py --workload training
 
 # Checkpoint workload (~105 GB streaming checkpoint, llama3-8b profile)
-python tests/object-store/test_dlio_multilib_demo.py --workload checkpoint
+uv run python tests/object-store/test_dlio_multilib_demo.py --workload checkpoint
 
 # Single library
-python tests/object-store/test_dlio_multilib_demo.py --workload training --library s3dlio
+uv run python tests/object-store/test_dlio_multilib_demo.py --workload training --library s3dlio
 ```
 
 #### `test_training_mpi_sweep.py`
@@ -402,22 +402,22 @@ three libraries. Each (library, N) combination runs as an independent clean cycl
 throughput are measured at each N.
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
+cd mlp-storage
 
 # Full sweep: all libraries, N = 1, 2, 4
-python tests/object-store/test_training_mpi_sweep.py
+uv run python tests/object-store/test_training_mpi_sweep.py
 
 # Custom process counts
-python tests/object-store/test_training_mpi_sweep.py --process-counts 1 2 4 8
+uv run python tests/object-store/test_training_mpi_sweep.py --process-counts 1 2 4 8
 
 # Single library
-python tests/object-store/test_training_mpi_sweep.py --library s3dlio
+uv run python tests/object-store/test_training_mpi_sweep.py --library s3dlio
 
 # Skip datagen (use data already in bucket)
-python tests/object-store/test_training_mpi_sweep.py --skip-datagen
+uv run python tests/object-store/test_training_mpi_sweep.py --skip-datagen
 
 # Keep objects after the run (skip cleanup)
-python tests/object-store/test_training_mpi_sweep.py --skip-cleanup
+uv run python tests/object-store/test_training_mpi_sweep.py --skip-cleanup
 ```
 
 ---
@@ -433,28 +433,19 @@ regardless of checkpoint size.
 StreamingCheckpointing with the **s3dlio** backend.
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
-python tests/object-store/test_s3dlio_checkpoint.py --size-gb 16
-python tests/object-store/test_s3dlio_checkpoint.py --size-gb 100
-python tests/object-store/test_s3dlio_checkpoint.py --help
-```
-
-#### `test_s3torch_checkpoint.py`
-StreamingCheckpointing with the **s3torchconnector** backend.
-
-```bash
-cd mlp-storage && source .venv/bin/activate
-python tests/object-store/test_s3torch_checkpoint.py --size-gb 16
-python tests/object-store/test_s3torch_checkpoint.py --help
+cd mlp-storage
+uv run python tests/object-store/test_s3dlio_checkpoint.py --size-gb 16
+uv run python tests/object-store/test_s3dlio_checkpoint.py --size-gb 100
+uv run python tests/object-store/test_s3dlio_checkpoint.py --help
 ```
 
 #### `test_minio_checkpoint.py`
 StreamingCheckpointing with the **minio** backend.
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
-python tests/object-store/test_minio_checkpoint.py --size-gb 16
-python tests/object-store/test_minio_checkpoint.py --help
+cd mlp-storage
+uv run python tests/object-store/test_minio_checkpoint.py --size-gb 16
+uv run python tests/object-store/test_minio_checkpoint.py --help
 ```
 
 ---
@@ -467,14 +458,14 @@ Tests the two s3dlio write APIs directly (no DLIO, no mlpstorage wrapper):
 - `MultipartUploadWriter` — multipart upload (`write` + `close`)
 
 ```bash
-cd mlp-storage && source .venv/bin/activate
+cd mlp-storage
 
 # Uses defaults from .env (bucket: bucket-s3dlio)
-python tests/object-store/test_s3dlio_direct.py
+uv run python tests/object-store/test_s3dlio_direct.py
 
 # Custom bucket
-python tests/object-store/test_s3dlio_direct.py --bucket my-bucket
-python tests/object-store/test_s3dlio_direct.py --help
+uv run python tests/object-store/test_s3dlio_direct.py --bucket my-bucket
+uv run python tests/object-store/test_s3dlio_direct.py --help
 ```
 
 ---
@@ -599,13 +590,13 @@ s3://chckpt-test1/<library>/llama3-8b/<checkpoint_id>/<rank>.pt
 
 ```bash
 cd /path/to/mlp-storage
-source .venv/bin/activate
 
-# Ensure credentials and endpoint are set
-source .env
+# Set up environment (one-time)
+uv sync
 
+# Ensure credentials and endpoint are set in .env (see .env.example)
 # Verify bucket exists and is reachable
-python3 -c "import s3dlio; print(s3dlio.list('s3://chckpt-test1/', recursive=False))"
+uv run python -c "import s3dlio; print(s3dlio.list('s3://chckpt-test1/', recursive=False))"
 ```
 
 For HTTPS endpoints (self-signed MinIO certificate), set:
