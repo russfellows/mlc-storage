@@ -1445,9 +1445,9 @@ class TestBenchmarkProgress:
 
         benchmark.run()
 
-        # In non-interactive mode, create_stage_progress calls logger.status for each stage
-        # Verify at least one stage was logged via status()
-        status_calls = [call for call in mock_logger.status.call_args_list]
+        # In non-interactive mode, create_stage_progress calls logger.info for each stage
+        # Verify at least one stage was logged via info()
+        status_calls = [call for call in mock_logger.info.call_args_list]
         stage_logged = any('Stage' in str(call) for call in status_calls)
         assert stage_logged, f"Expected stage log messages, got: {status_calls}"
 

@@ -281,22 +281,24 @@ def add_mpi_arguments(parser):
 
 
 def add_storage_type_arguments(parser):
-    """Add --file / --object storage-type selector (required, mutually exclusive).
+    """Add --file / --object storage-type selector to a subcommand parser.
 
-    Call this for benchmarks that perform file or object I/O (training,
-    checkpointing).  VectorDB and KV-cache benchmarks have their own
-    connection model and do NOT need this argument group.
+    This group is optional (neither flag is required at parse time), so it can
+    be safely added to every benchmark subparser — VectorDB, KV-cache, training,
+    and checkpointing alike.  Benchmarks that do not yet use object storage
+    simply ignore the flags; those that do can check ``args.file`` /
+    ``args.object``.
 
     When --object is passed the runtime reads S3 credentials and endpoint from
     .env (AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-    AWS_REGION, BUCKET, STORAGE_LIBRARY).  -–file requires a local path
+    AWS_REGION, BUCKET, STORAGE_LIBRARY).  --file expects a local path
     reachable on every participating host.
 
     Args:
         parser: Argparse subcommand parser to add arguments to.
     """
     storage_group = parser.add_argument_group("Storage Type")
-    access_proto = storage_group.add_mutually_exclusive_group(required=True)
+    access_proto = storage_group.add_mutually_exclusive_group(required=False)
     access_proto.add_argument(
         "--file",
         action="store_true",
