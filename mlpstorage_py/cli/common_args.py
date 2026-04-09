@@ -188,22 +188,6 @@ def add_universal_arguments(parser):
         help="Path to YAML file with argument overrides"
     )
 
-    # Create a mutually exclusive group for file/object options
-    access_proto = standard_args.add_mutually_exclusive_group(required=True)
-    access_proto.add_argument(
-        "--file",
-        action="store_true",
-        help="Use POSIX files as the data access method"
-    )
-    access_proto.add_argument(
-        "--object",
-        nargs="?",
-        type=str,
-        const="s3",
-        choices=["s3"],
-        help="Use the given Object API as the data access method, defaults to S3"
-    )
-
     # Create a mutually exclusive group for closed/open options
     submission_group = standard_args.add_mutually_exclusive_group()
     submission_group.add_argument(
@@ -289,6 +273,43 @@ def add_mpi_arguments(parser):
         type=str,
         action="append",
         help="Other MPI parameters that will be passed to MPI"
+    )
+
+
+def add_storage_type_arguments(parser):
+    """Add --file / --object storage-type selector (required, mutually exclusive).
+
+    Call this for benchmarks that perform file or object I/O (training,
+    checkpointing).  VectorDB and KV-cache benchmarks have their own
+    connection model and do NOT need this argument group.
+
+    When --object is passed the runtime reads S3 credentials and endpoint from
+    .env (AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+    AWS_REGION, BUCKET, STORAGE_LIBRARY).  -–file requires a local path
+    reachable on every participating host.
+
+    Args:
+        parser: Argparse subcommand parser to add arguments to.
+    """
+    storage_group = parser.add_argument_group("Storage Type")
+    access_proto = storage_group.add_mutually_exclusive_group(required=True)
+    access_proto.add_argument(
+        "--file",
+        action="store_true",
+        help="Use POSIX files as the data access method"
+    )
+    access_proto.add_argument(
+        "--object",
+        nargs="?",
+        type=str,
+        const="s3",
+        choices=["s3"],
+        help=(
+            "Use the given Object API as the data access method, defaults to S3. "
+            "S3 credentials and endpoint are read from environment variables or "
+            "a .env file (AWS_ENDPOINT_URL, AWS_ACCESS_KEY_ID, "
+            "AWS_SECRET_ACCESS_KEY, AWS_REGION, BUCKET, STORAGE_LIBRARY)."
+        ),
     )
 
 
