@@ -40,7 +40,7 @@ echo "Endpoint: $AWS_ENDPOINT_URL"
 echo "Library:  s3torchconnector (AWS official connector)"
 echo ""
 
-source .venv/bin/activate
+source .venv/bin/activate  # .venv managed by uv (run "uv sync" to set up)
 echo "Active venv: $(which python)"
 echo "Active mlpstorage: $(which mlpstorage)"
 echo ""

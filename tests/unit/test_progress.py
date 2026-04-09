@@ -11,7 +11,7 @@ Tests cover:
 import pytest
 from unittest.mock import MagicMock, patch, PropertyMock
 
-from mlpstorage.progress import (
+from mlpstorage_py.progress import (
     is_interactive_terminal,
     progress_context,
     create_stage_progress,
@@ -28,7 +28,7 @@ class TestIsInteractiveTerminal:
 
     def test_returns_true_when_console_is_terminal(self):
         """Should return True when Console.is_terminal is True."""
-        with patch("mlpstorage.progress.Console") as MockConsole:
+        with patch("mlpstorage_py.progress.Console") as MockConsole:
             mock_console = MagicMock()
             type(mock_console).is_terminal = PropertyMock(return_value=True)
             MockConsole.return_value = mock_console
@@ -39,7 +39,7 @@ class TestIsInteractiveTerminal:
 
     def test_returns_false_when_console_is_not_terminal(self):
         """Should return False when Console.is_terminal is False."""
-        with patch("mlpstorage.progress.Console") as MockConsole:
+        with patch("mlpstorage_py.progress.Console") as MockConsole:
             mock_console = MagicMock()
             type(mock_console).is_terminal = PropertyMock(return_value=False)
             MockConsole.return_value = mock_console
@@ -57,7 +57,7 @@ class TestProgressContextNonInteractive:
         mock_logger = MagicMock()
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with progress_context("Loading data", logger=mock_logger) as (
                 update,
@@ -70,7 +70,7 @@ class TestProgressContextNonInteractive:
     def test_no_error_without_logger(self):
         """Should not error when no logger is provided in non-interactive mode."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with progress_context("Loading data") as (update, set_desc):
                 # Should not raise any exceptions
@@ -79,7 +79,7 @@ class TestProgressContextNonInteractive:
     def test_yielded_functions_are_noops(self):
         """Should yield no-op functions that can be called without error."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with progress_context("Loading data") as (update, set_desc):
                 # These should not raise any exceptions
@@ -95,9 +95,9 @@ class TestProgressContextInteractive:
     def test_creates_progress_for_indeterminate(self):
         """Should create Progress with spinner for indeterminate (total=None)."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -113,9 +113,9 @@ class TestProgressContextInteractive:
     def test_creates_progress_for_determinate(self):
         """Should create Progress with bar for determinate (total set)."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -131,9 +131,9 @@ class TestProgressContextInteractive:
     def test_update_advances_progress(self):
         """Should advance progress when update is called."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -152,9 +152,9 @@ class TestProgressContextInteractive:
     def test_update_sets_completed(self):
         """Should set completed value when update is called with completed."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -171,9 +171,9 @@ class TestProgressContextInteractive:
     def test_set_description_updates(self):
         """Should update description when set_description is called."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -190,9 +190,9 @@ class TestProgressContextInteractive:
     def test_exception_cleanup(self):
         """Should stop progress even when exception is raised inside context."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -214,7 +214,7 @@ class TestCreateStageProgressNonInteractive:
         stages = ["Stage 1", "Stage 2", "Stage 3"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with create_stage_progress(stages, logger=mock_logger) as advance_stage:
                 # Initial stage already logged
@@ -233,7 +233,7 @@ class TestCreateStageProgressNonInteractive:
         stages = ["Stage 1", "Stage 2"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with create_stage_progress(stages) as advance_stage:
                 advance_stage()  # Should not raise
@@ -241,7 +241,7 @@ class TestCreateStageProgressNonInteractive:
     def test_empty_stages_works(self):
         """Should handle empty stages list without error."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=False
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=False
         ):
             with create_stage_progress([]) as advance_stage:
                 advance_stage()  # Should not raise
@@ -255,9 +255,9 @@ class TestCreateStageProgressInteractive:
         stages = ["Validating", "Collecting", "Running"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -277,9 +277,9 @@ class TestCreateStageProgressInteractive:
         stages = ["Stage 1", "Stage 2", "Stage 3"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -299,9 +299,9 @@ class TestCreateStageProgressInteractive:
         stages = ["Stage 1", "Stage 2"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -320,9 +320,9 @@ class TestCreateStageProgressInteractive:
         stages = ["Stage 1", "Stage 2"]
 
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 mock_progress = MagicMock()
                 mock_progress.add_task.return_value = 0
                 MockProgress.return_value = mock_progress
@@ -337,9 +337,9 @@ class TestCreateStageProgressInteractive:
     def test_empty_stages_interactive(self):
         """Should handle empty stages list without creating Progress."""
         with patch(
-            "mlpstorage.progress.is_interactive_terminal", return_value=True
+            "mlpstorage_py.progress.is_interactive_terminal", return_value=True
         ):
-            with patch("mlpstorage.progress.Progress") as MockProgress:
+            with patch("mlpstorage_py.progress.Progress") as MockProgress:
                 with create_stage_progress([]) as advance_stage:
                     advance_stage()  # Should not raise
 

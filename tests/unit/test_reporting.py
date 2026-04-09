@@ -18,9 +18,9 @@ from unittest.mock import MagicMock, patch, PropertyMock
 from dataclasses import asdict
 from argparse import Namespace
 
-from mlpstorage.report_generator import Result, ReportGenerator
-from mlpstorage.config import BENCHMARK_TYPES, PARAM_VALIDATION, EXIT_CODE
-from mlpstorage.rules import Issue
+from mlpstorage_py.report_generator import Result, ReportGenerator
+from mlpstorage_py.config import BENCHMARK_TYPES, PARAM_VALIDATION, EXIT_CODE
+from mlpstorage_py.rules import Issue
 
 
 class TestResultDataclass:
@@ -436,8 +436,8 @@ class TestReportGeneratorAccumulateResults:
         mock_run.accelerator = 'h100'
         mock_run.metrics = {'throughput': 100.0}
 
-        with patch('mlpstorage.report_generator.get_runs_files', return_value=[mock_run]):
-            with patch('mlpstorage.report_generator.BenchmarkVerifier') as mock_verifier_class:
+        with patch('mlpstorage_py.report_generator.get_runs_files', return_value=[mock_run]):
+            with patch('mlpstorage_py.report_generator.BenchmarkVerifier') as mock_verifier_class:
                 mock_verifier = MagicMock()
                 mock_verifier.verify.return_value = PARAM_VALIDATION.CLOSED
                 mock_verifier.issues = []
@@ -471,8 +471,8 @@ class TestReportGeneratorAccumulateResults:
         mock_run2.accelerator = 'h100'
         mock_run2.metrics = {}
 
-        with patch('mlpstorage.report_generator.get_runs_files', return_value=[mock_run1, mock_run2]):
-            with patch('mlpstorage.report_generator.BenchmarkVerifier') as mock_verifier_class:
+        with patch('mlpstorage_py.report_generator.get_runs_files', return_value=[mock_run1, mock_run2]):
+            with patch('mlpstorage_py.report_generator.BenchmarkVerifier') as mock_verifier_class:
                 mock_verifier = MagicMock()
                 mock_verifier.verify.return_value = PARAM_VALIDATION.CLOSED
                 mock_verifier.issues = []
@@ -512,8 +512,8 @@ class TestReportGeneratorIntegration:
             'metrics': mock_run.metrics
         }
 
-        with patch('mlpstorage.report_generator.get_runs_files', return_value=[mock_run]):
-            with patch('mlpstorage.report_generator.BenchmarkVerifier') as mock_verifier_class:
+        with patch('mlpstorage_py.report_generator.get_runs_files', return_value=[mock_run]):
+            with patch('mlpstorage_py.report_generator.BenchmarkVerifier') as mock_verifier_class:
                 mock_verifier = MagicMock()
                 mock_verifier.verify.return_value = PARAM_VALIDATION.CLOSED
                 mock_verifier.issues = []
