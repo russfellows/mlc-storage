@@ -57,10 +57,11 @@ DEFAULT_MAX_IN_FLIGHT  = 8   # s3dlio per-object concurrent multipart parts
 # Objects below this size use a single PUT; at or above use multipart.
 MULTIPART_THRESHOLD = 32 * 1024 * 1024  # 32 MiB
 
+_default_bucket = os.environ.get('BUCKET') or os.environ.get('S3_BUCKET') or ''
 LIBRARY_BUCKETS = {
-    's3dlio':            os.environ.get('BUCKET_S3DLIO', 'bucket-s3dlio'),
-    'minio':             os.environ.get('BUCKET_MINIO', 'bucket-minio'),
-    's3torchconnector':  os.environ.get('BUCKET_S3TORCH', 'bucket-s3torch'),
+    's3dlio':            os.environ.get('BUCKET_S3DLIO', _default_bucket),
+    'minio':             os.environ.get('BUCKET_MINIO', _default_bucket),
+    's3torchconnector':  os.environ.get('BUCKET_S3TORCH', _default_bucket),
 }
 
 
@@ -493,11 +494,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('--bucket-s3dlio',   default=LIBRARY_BUCKETS['s3dlio'],
-                        help=f"Bucket for s3dlio test (default: {LIBRARY_BUCKETS['s3dlio']})")
+                        help='Bucket for s3dlio test (env: BUCKET_S3DLIO or BUCKET)')
     parser.add_argument('--bucket-minio',    default=LIBRARY_BUCKETS['minio'],
-                        help=f"Bucket for minio test (default: {LIBRARY_BUCKETS['minio']})")
+                        help='Bucket for minio test (env: BUCKET_MINIO or BUCKET)')
     parser.add_argument('--bucket-s3torch',  default=LIBRARY_BUCKETS['s3torchconnector'],
-                        help=f"Bucket for s3torchconnector test (default: {LIBRARY_BUCKETS['s3torchconnector']})")
+                        help='Bucket for s3torchconnector test (env: BUCKET_S3TORCH or BUCKET)')
     parser.add_argument('--num-files',  type=int,   default=DEFAULT_NUM_FILES,
                         help=f'Objects to write and read per library (default: {DEFAULT_NUM_FILES})')
     parser.add_argument('--size-mb',    type=float, default=DEFAULT_SIZE_MB,
@@ -539,6 +540,18 @@ def main():
         'minio':            args.bucket_minio,
         's3torchconnector': args.bucket_s3torch,
     }
+
+    # Validate that buckets are set for the libraries being tested
+    import sys as _sys
+    missing = [lib for lib in libraries if not buckets.get(lib)]
+    if missing:
+        print(
+            f"ERROR: No bucket specified for: {', '.join(missing)}\n"
+            "  Set BUCKET (or BUCKET_S3DLIO / BUCKET_MINIO / BUCKET_S3TORCH) in .env,\n"
+            "  or pass --bucket-s3dlio / --bucket-minio / --bucket-s3torch on the CLI.",
+            file=_sys.stderr,
+        )
+        _sys.exit(1)
 
     print()
     print("=" * 88)
