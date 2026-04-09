@@ -87,7 +87,7 @@ class TestReportGeneratorInit:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                generator = ReportGenerator(str(results_dir), logger=mock_logger)
+                generator = ReportGenerator(str(results_dir), logger=mock_logger, validate_structure=False)
 
         assert generator.logger == mock_logger
 
@@ -99,7 +99,7 @@ class TestReportGeneratorInit:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                generator = ReportGenerator(str(results_dir), args=args)
+                generator = ReportGenerator(str(results_dir), args=args, validate_structure=False)
 
         assert generator.debug is True
 
@@ -115,7 +115,7 @@ class TestReportGeneratorWriteJson:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                return ReportGenerator(str(results_dir))
+                return ReportGenerator(str(results_dir), validate_structure=False)
 
     def test_writes_json_file(self, generator):
         """Should write results to JSON file."""
@@ -158,7 +158,7 @@ class TestReportGeneratorWriteCsv:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                return ReportGenerator(str(results_dir))
+                return ReportGenerator(str(results_dir), validate_structure=False)
 
     def test_writes_csv_file(self, generator):
         """Should write results to CSV file."""
@@ -214,7 +214,7 @@ class TestReportGeneratorGenerateReports:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                gen = ReportGenerator(str(results_dir))
+                gen = ReportGenerator(str(results_dir), validate_structure=False)
 
         # Add mock run results
         mock_run = MagicMock()
@@ -268,7 +268,7 @@ class TestReportGeneratorPrintResults:
 
         with patch.object(ReportGenerator, 'accumulate_results'):
             with patch.object(ReportGenerator, 'print_results'):
-                gen = ReportGenerator(str(results_dir))
+                gen = ReportGenerator(str(results_dir), validate_structure=False)
 
         return gen
 
@@ -444,7 +444,7 @@ class TestReportGeneratorAccumulateResults:
                 mock_verifier_class.return_value = mock_verifier
 
                 with patch.object(ReportGenerator, 'print_results'):
-                    generator = ReportGenerator(str(results_dir))
+                    generator = ReportGenerator(str(results_dir), validate_structure=False)
 
         assert 'test_run' in generator.run_results
         assert generator.run_results['test_run'].category == PARAM_VALIDATION.CLOSED
@@ -479,7 +479,7 @@ class TestReportGeneratorAccumulateResults:
                 mock_verifier_class.return_value = mock_verifier
 
                 with patch.object(ReportGenerator, 'print_results'):
-                    generator = ReportGenerator(str(results_dir))
+                    generator = ReportGenerator(str(results_dir), validate_structure=False)
 
         # Should have workload result for (unet3d, h100)
         assert ('unet3d', 'h100') in generator.workload_results
@@ -519,7 +519,7 @@ class TestReportGeneratorIntegration:
                 mock_verifier.issues = []
                 mock_verifier_class.return_value = mock_verifier
 
-                generator = ReportGenerator(str(results_dir))
+                generator = ReportGenerator(str(results_dir), validate_structure=False)
 
         # Generate reports
         result = generator.generate_reports()
