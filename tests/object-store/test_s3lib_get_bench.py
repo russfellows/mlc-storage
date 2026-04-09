@@ -63,7 +63,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 
-DEFAULT_BUCKET      = os.environ.get('S3_BUCKET', 'mlp-s3dlio')
+DEFAULT_BUCKET      = os.environ.get('BUCKET') or os.environ.get('S3_BUCKET')
 DEFAULT_PREFIX      = os.environ.get('S3_PREFIX', 'test-run/unet3d/train/')
 DEFAULT_NUM_FILES   = 20
 DEFAULT_WORKERS     = [1, 4, 8, 16]   # concurrency sweep for parallel + native tests
@@ -487,7 +487,7 @@ def main() -> None:
 
     # Source bucket/prefix/files
     parser.add_argument('--bucket',     default=DEFAULT_BUCKET,
-                        help=f'Source bucket (default: {DEFAULT_BUCKET})')
+                        help='Source bucket (env: BUCKET or S3_BUCKET; or pass --bucket)')
     parser.add_argument('--prefix',     default=DEFAULT_PREFIX,
                         help=f'Object prefix to list from (default: {DEFAULT_PREFIX})')
     parser.add_argument('--num-files',  type=int, default=DEFAULT_NUM_FILES,
@@ -538,6 +538,11 @@ def main() -> None:
     if args.secret_key: config['AWS_SECRET_ACCESS_KEY'] = args.secret_key
     if args.region:     config['AWS_REGION']            = args.region
     apply_config(config)
+
+    if not args.bucket:
+        print("ERROR: No bucket specified. Set BUCKET (or S3_BUCKET) in .env, "
+              "or pass --bucket my-bucket", file=__import__('sys').stderr)
+        __import__('sys').exit(1)
 
     libraries     = args.libraries
     workers_sweep = sorted(set(args.workers))

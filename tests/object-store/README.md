@@ -1,753 +1,274 @@
-# Object Store Tests
+# Object-Store Tests
 
-Performance tests and benchmarks for object storage backends (s3dlio, minio)
-used by `mlpstorage`.
+Tests for S3-compatible object storage backends used by `mlpstorage` and `dlio_benchmark`.
 
-All tests load credentials from a `.env` file at the **project root** (`mlp-storage/.env`):
+All tests read credentials and runtime configuration from a `.env` file at the
+**project root** (`mlp-storage/.env`) — no credentials or site-specific values are
+embedded in any test script or config file.
 
+---
+
+## Prerequisites
+
+### 1 — Install dependencies
+
+```bash
+cd /path/to/mlp-storage
+uv sync
 ```
-AWS_ACCESS_KEY_ID=<key>
-AWS_SECRET_ACCESS_KEY=<secret>
-AWS_ENDPOINT_URL=http://<host>:<port>
+
+### 2 — Create `.env`
+
+Copy the example and fill in your values:
+
+```bash
+cp .env.example .env
+# edit .env — never commit this file
+```
+
+`.env` must contain (at minimum):
+
+```bash
+AWS_ACCESS_KEY_ID=your_access_key
+AWS_SECRET_ACCESS_KEY=your_secret_key
+AWS_ENDPOINT_URL=https://your-s3-host:9000   # or http:// for plain HTTP
 AWS_REGION=us-east-1
+BUCKET=your-test-bucket                       # used by run_training.sh
+STORAGE_LIBRARY=s3dlio                        # s3dlio | minio (default: s3dlio)
 ```
 
-For HTTPS endpoints with a self-signed certificate, set the CA bundle path:
+For HTTPS endpoints with a self-signed certificate, also set:
 
 ```bash
-export AWS_CA_BUNDLE=/path/to/selfsigned.crt
+AWS_CA_BUNDLE=/path/to/your-cert.crt
 ```
 
-`AWS_CA_BUNDLE` is read by s3dlio and by the Python test scripts in this directory.
-s3torchconnector also reads the same `AWS_CA_BUNDLE` name. See **[How to Test with SSL (HTTPS)](#how-to-test-with-ssl-https)** below
-for full setup instructions.
+Shell environment variables already set take precedence over the `.env` file.
 
-Environment variables already set in the shell take precedence over the `.env` file.
-No credentials are hard-coded in any test.
+### 3 — Ensure the bucket exists
+
+Create your bucket in MinIO (or your S3-compatible store) before running tests:
+
+```bash
+# Verify bucket is reachable
+uv run python -c "import s3dlio; print(s3dlio.list('s3://your-bucket/', recursive=False))"
+```
 
 ---
 
-## How to Test with SSL (HTTPS)
+## Tests
 
-By default all tests use plain HTTP (`http://`). If you want to test with HTTPS — for
-example against a MinIO instance configured with TLS — there are several steps required
-because each library resolves TLS trust differently.
+There are four tests. All runtime parameters come from `.env` (or environment
+variables / CLI flags) — no editing of scripts or config files is needed.
 
-### Step 1 — Generate the correct server certificate (on the MinIO host)
+### `run_training.sh` — Data generation + training
 
-The certificate **must** be generated with `basicConstraints=CA:FALSE`. Rust-based
-libraries (s3dlio, s3torchconnector) use **rustls**, which strictly enforces RFC 5280
-and rejects any server certificate that advertises itself as a CA (`CA:TRUE`). OpenSSL
-and curl do not enforce this, so the error only appears with Rust clients.
+Runs a full MLPerf Storage training cycle:
 
-```bash
-# Run on the MinIO server as root (or the MinIO user)
-openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
-  -keyout /home/minio-user/.minio/certs/private.key \
-  -out    /home/minio-user/.minio/certs/public.crt \
-  -subj "/CN=<minio-ip-or-hostname>" \
-  -addext "subjectAltName=IP:<minio-ip-or-hostname>" \
-  -addext "basicConstraints=CA:FALSE" \
-  -addext "keyUsage=digitalSignature,keyEncipherment" \
-  -addext "extendedKeyUsage=serverAuth"
-```
-
-Replace `<minio-ip-or-hostname>` with your MinIO server's IP or DNS name, e.g.
-`your-minio-host`.  The `subjectAltName` is **required** — modern TLS clients reject
-certificates that only set a `CN` with no SAN.
-
-Fix ownership then restart MinIO:
+1. **Datagen** — generates synthetic training data and writes it to the object store
+2. **Training** — reads the dataset via the mlpstorage CLI
 
 ```bash
-chown minio-user:minio-user /home/minio-user/.minio/certs/private.key \
-                             /home/minio-user/.minio/certs/public.crt
-chmod 600 /home/minio-user/.minio/certs/private.key
-chmod 644 /home/minio-user/.minio/certs/public.crt
-systemctl restart minio
-systemctl status minio    # verify it came up cleanly
+cd /path/to/mlp-storage
+
+# Default: unet3d model, s3dlio library, 1 MPI process
+BUCKET=my-test-bucket bash tests/object-store/run_training.sh
+
+# Use minio instead
+BUCKET=my-test-bucket STORAGE_LIBRARY=minio bash tests/object-store/run_training.sh
+
+# 8 parallel MPI processes for datagen + training
+BUCKET=my-test-bucket NP=8 bash tests/object-store/run_training.sh
+
+# Skip datagen (data already in bucket)
+BUCKET=my-test-bucket SKIP_DATAGEN=1 bash tests/object-store/run_training.sh
+
+# Different model
+BUCKET=my-test-bucket MODEL=bert bash tests/object-store/run_training.sh
 ```
 
-### Step 2 — Copy the certificate to the client machine
+**Runtime parameters** (all optional except BUCKET):
 
-```bash
-# Run on the client (e.g. loki-russ)
-scp <minio-user>@<minio-host>:/home/minio-user/.minio/certs/public.crt \
-    ~/Documents/Code/mlp-storage/.certs/minio-selfsigned.crt
-```
-
-### Step 3 — Trust the certificate on the client
-
-```bash
-sudo cp ~/Documents/Code/mlp-storage/.certs/minio-selfsigned.crt \
-    /usr/local/share/ca-certificates/minio-selfsigned.crt
-sudo update-ca-certificates
-# Expected output: "1 added, 0 removed; done."
-```
-
-> **Note — linuxbrew Python:** If Python is installed via linuxbrew
-> (`/home/linuxbrew/...`), its OpenSSL is isolated from the system CA store.
-> The minio Python SDK will **not** pick up the cert from `update-ca-certificates`
-> automatically.  See **Step 5** below.
-
-### Step 4 — Verify with curl and openssl
-
-```bash
-# 1. Quick TLS check — should negotiate TLS and return HTTP 403 (AccessDenied is expected)
-curl -v https://<minio-ip>:9000/
-
-# 2. Inspect the deployed certificate
-openssl x509 -in /usr/local/share/ca-certificates/minio-selfsigned.crt \
-    -noout -text | grep -A3 "Basic Constraints"
-# Must show: CA:FALSE
-
-# 3. Confirm SAN is present
-openssl x509 -in /usr/local/share/ca-certificates/minio-selfsigned.crt \
-    -noout -text | grep -A2 "Subject Alternative Name"
-# Must show: IP Address:<minio-ip>
-```
-
-A successful curl output will include:
-```
-* SSL certificate verify ok.
-* subjectAltName: host "<minio-ip>" matched cert's IP address!
-< HTTP/1.1 403 Forbidden   ← expected; means TLS is working
-```
-
-### Step 5 — Configure each library
-
-Update `.env` to use `https://`:
-
-```
-AWS_ENDPOINT_URL=https://<minio-ip>:9000
-```
-
-Set the CA bundle environment variable (required even with a system-store cert, because
-not all libraries read the system store):
-
-```bash
-export AWS_CA_BUNDLE=/usr/local/share/ca-certificates/minio-selfsigned.crt
-```
-
-#### How each library resolves TLS trust
-
-Each library takes a different path to TLS certificate verification:
-
-| Library | TLS layer | Reads `AWS_CA_BUNDLE` | Reads system store | How trust is established |
-|---|---|---|---|---|
-| s3dlio | Rust/rustls | ✅ | ✅ rustls-native-certs | `AWS_CA_BUNDLE` env var, or system store after `update-ca-certificates` |
-| minio Python SDK | Python/urllib3/OpenSSL | ❌ | ❌ (linuxbrew isolates it) | Custom `urllib3.PoolManager(ssl_context=ctx)` built from `AWS_CA_BUNDLE` — handled automatically in `test_s3lib_get_bench.py` |
-| s3torchconnector | Rust/AWS SDK for Rust | ✅ | ✅ rustls-native-certs | System store pickup after `update-ca-certificates`, or `AWS_CA_BUNDLE` env var |
-
-**Key points:**
-- All three libraries now share the same env var name: `AWS_CA_BUNDLE` (the standard AWS SDK convention).
-  `test_s3lib_get_bench.py` reads it and passes the path to urllib3 explicitly for the minio Python SDK.
-- The minio Python SDK ignores AWS env vars entirely. `test_s3lib_get_bench.py`
-  reads `AWS_CA_BUNDLE` and passes it to urllib3 explicitly via
-  `_make_minio_client()`.
-- rustls enforces RFC 5280 strictly: a certificate with `basicConstraints: CA:TRUE` is
-  rejected with `CaUsedAsEndEntity` even if it is trusted. OpenSSL/curl silently accept
-  it. This is why the cert **must** be generated with `basicConstraints=CA:FALSE`.
-- s3torchconnector reads the system CA store via `rustls-native-certs`, so
-  `update-ca-certificates` is sufficient for it without any extra env var.
-
----
-
-## Library Selection — `--param storage_library=<lib>` at Runtime
-
-The storage library is a **runtime parameter** — pass it on the command line or via
-environment variables, not in the YAML workload config. The YAML config contains only
-workload parameters (dataset sizes, formats, model settings) that never change.
-
-```bash
-# Example: run with s3dlio
-uv run mlpstorage training datagen --model unet3d \
-  --param storage.storage_type=s3 \
-  --param storage.storage_root=${BUCKET} \
-  --param storage.storage_options.storage_library=s3dlio \
-  --param storage.storage_options.endpoint_url=${AWS_ENDPOINT_URL} \
-  --param storage.storage_options.access_key_id=${AWS_ACCESS_KEY_ID} \
-  --param storage.storage_options.secret_access_key=${AWS_SECRET_ACCESS_KEY}
-```
-
-Or source `.env` and let the shell scripts handle the plumbing (see below).
-
-**Valid library values:**
-
-| `storage_library` | Library | Notes |
+| Variable | Default | Description |
 |---|---|---|
-| `s3dlio` | s3dlio (Rust-based, Tokio async) | `get_many()` parallel batch, `MultipartUploadWriter` — **recommended** |
-| `minio` | minio Python SDK | `ThreadPoolExecutor`, automatic 5 MB multipart |
-
-### How `storage_library` flows from YAML → code
-
-1. **`config.py` (LoadConfig, ~line 1094–1097):** `LoadConfig` reads
-   `storage.storage_library` from the YAML and **injects it** into
-   `args.storage_options["storage_library"]`. This is necessary because DLIO's `Args`
-   dataclass has no first-class `storage_library` field — the value piggybacks inside
-   the free-form `storage_options` dict.
-
-2. **`config.py` (Args.validate(), ~line 387):** `validate()` reads it back from
-   `storage_options.get("storage_library", "s3torchconnector")` (default is
-   `s3torchconnector` for backwards compat with configs that predate this key).
-   It uses the value to:
-   - Verify the library package is installed (fails fast with a clear error if not)
-   - Set the correct `reader_classname` for the DataLoader
-   - Enforce the right `checkpoint_mechanism` (`pt_s3_save` for s3torchconnector,
-     `pt_obj_save` for minio / s3dlio)
-
-3. **`storage/obj_store_lib.py` (`ObjStoreLibStorage.__init__()`, ~lines 161–166):**
-   Reads `storage_options.get("storage_library")` and instantiates the correct client:
-
-   ```python
-   if storage_library == "s3dlio":
-       # s3dlio Rust client
-   elif storage_library == "s3torchconnector":
-       # S3Client from s3torchconnector
-   elif storage_library == "minio":
-       # Minio Python SDK client
-   ```
-
-   This single branch point controls all read, write, and list operations for the
-   entire training/datagen run.
+| `BUCKET` | *(required)* | S3 bucket for training data |
+| `STORAGE_LIBRARY` | `s3dlio` | `s3dlio` or `minio` |
+| `MODEL` | `unet3d` | mlpstorage model name |
+| `NP` | `1` | MPI process count |
+| `SKIP_DATAGEN` | `0` | Set to `1` to skip data generation |
+| `SKIP_TRAINING` | `0` | Set to `1` to skip training run |
+| `DATA_DIR` | `test-run/` | Object prefix for the dataset |
 
 ---
 
-## Results
+### `run_checkpointing.sh` — Checkpoint write + read
 
-**[S3library_review_21-Mar.md](S3library_review_21-Mar.md)** — Prefetch fairness code review (March 21, 2026): analysis of concurrency models across all three libraries in the DLIO reader, root cause of the s3torchconnector benchmark gap, and remediation options. Includes s3dlio v0.9.84 fix status.
+Runs a LLaMA 3 8B checkpoint cycle via `dlio_benchmark`:
 
-**[Object_Perf_Results.md](Object_Perf_Results.md)** — Full benchmark results including:
-- Direct native-API write + read throughput (all three libraries, 12 parallel workers)
-- DLIO streaming checkpoint write + read throughput (16 GB and 100 GB)
-- DLIO training MPI sweep (N=1, 2, 4 processes × all three libraries)
-- Analysis of DLIO overhead vs native API performance
+1. **Write** — saves `CHECKPOINTS` checkpoint(s) to the object store
+2. **Read** — restores each checkpoint back
 
----
-
-## Test Files
-
-### Cross-Library Comparisons
-
-#### `test_s3lib_get_bench.py`
-Benchmarks **GET throughput** across all three libraries with three rigorously fair
-test modes. All libraries read from the **same bucket and same objects** — no
-per-library data locality effects.
-
-| Mode | What it measures | Concurrency model |
-|---|---|---|
-| `serial` | Per-request latency (p50/p95/p99/max) + single-stream MB/s | One GET at a time, no parallelism |
-| `parallel` | Aggregate MB/s at matched concurrency | `ThreadPoolExecutor(max_workers=N)` — identical across all libraries |
-| `native` | s3dlio Rust async vs Python threads | `s3dlio.get_many(uris, max_in_flight=N)` |
+Uses the `llama3_8b_checkpoint` workload config. All storage runtime parameters
+are injected as Hydra overrides — the YAML file contains only model/workload sizing.
 
 ```bash
-cd mlp-storage
+cd /path/to/mlp-storage
 
-# Default: all modes, existing training data, concurrency 1/4/8/16
+# Quick sanity check (1 MPI rank = ~13.1 GB I/O)
+BUCKET=my-test-bucket bash tests/object-store/run_checkpointing.sh
+
+# Full llama3-8b run (8 MPI ranks = ~105 GB I/O)
+BUCKET=my-test-bucket NP=8 bash tests/object-store/run_checkpointing.sh
+
+# Use minio, 4 ranks, 1 checkpoint only
+BUCKET=my-test-bucket STORAGE_LIBRARY=minio NP=4 CHECKPOINTS=1 \
+    bash tests/object-store/run_checkpointing.sh
+```
+
+**Runtime parameters** (all optional except BUCKET):
+
+| Variable | Default | Description |
+|---|---|---|
+| `BUCKET` | *(required)* | S3 bucket for checkpoints |
+| `STORAGE_LIBRARY` | `s3dlio` | `s3dlio` or `minio` |
+| `NP` | `1` | MPI rank count (use `8` for full llama3-8b) |
+| `CHECKPOINTS` | `2` | Number of write + read cycles |
+| `MODEL` | `llama3_8b_checkpoint` | DLIO workload config name |
+
+> **Note on s3torchconnector and NP=1:** At NP=1 the full ~105 GB checkpoint is a single
+> object, which exceeds the AWS CRT library's ~78 GB object limit. Use `NP>=2` with
+> s3torchconnector. s3dlio and minio are not affected.
+
+---
+
+### `test_s3lib_get_bench.py` — GET throughput benchmark
+
+Benchmarks raw S3 GET throughput across s3dlio, minio, and s3torchconnector.
+All three libraries read from the **same bucket and same objects** for a fair comparison.
+
+```bash
+cd /path/to/mlp-storage
+
+# Benchmark existing training objects (bucket from BUCKET env var)
 uv run python tests/object-store/test_s3lib_get_bench.py
 
-# Write 20 synthetic 128 MB objects first, then run all tests against them
+# Write 20 x 128 MB test objects first, then benchmark
 uv run python tests/object-store/test_s3lib_get_bench.py \
     --write --write-num-files 20 --write-size-mb 128
 
-# Serial-only test — per-request latency and single-stream MB/s
-uv run python tests/object-store/test_s3lib_get_bench.py --mode serial --num-files 30
+# Serial mode only (per-request latency: p50/p95/p99/max)
+uv run python tests/object-store/test_s3lib_get_bench.py --mode serial
 
-# Parallel sweep with custom worker counts
+# Parallel sweep at custom worker counts
 uv run python tests/object-store/test_s3lib_get_bench.py \
-    --mode parallel --workers 1 4 8 16 32 64
+    --mode parallel --workers 1 4 8 16 32
 
-# Test only s3dlio native get_many (Rust Tokio async) vs ThreadPoolExecutor
+# Override bucket and prefix
 uv run python tests/object-store/test_s3lib_get_bench.py \
-    --mode native --workers 1 4 8 16 32
+    --bucket my-bucket --prefix data/train/
 
 # Test only s3dlio and minio
 uv run python tests/object-store/test_s3lib_get_bench.py --libraries s3dlio minio
 
-# Custom bucket and prefix
-uv run python tests/object-store/test_s3lib_get_bench.py \
-    --bucket my-bucket --prefix data/train/ --num-files 50
-
-# CLI reference
 uv run python tests/object-store/test_s3lib_get_bench.py --help
 ```
 
-#### Sample Output
+The `BUCKET` environment variable sets the default bucket; `--bucket` overrides it.
 
-*Results below use HTTPS (with a self-signed MinIO certificate
-and `AWS_CA_BUNDLE` set — the more realistic and secure configuration.*
+**Test modes:**
 
-```console
-(.venv) eval@loki-russ:~/Documents/Code/mlp-storage$ python ./tests/object-store/test_s3lib_get_bench.py
-Loaded credentials from: /path/to/mlp-storage/.env
-
-════════════════════════════════════════════════════════════════════════
-S3 LIBRARY GET BENCHMARK
-════════════════════════════════════════════════════════════════════════
-  Endpoint:   https://minio-host:9000
-  Libraries:  s3dlio, minio, s3torchconnector
-  Mode:       all
-  Workers:    [1, 4, 8, 16]  (concurrency sweep)
-
-── Listing objects ──────────────────────────────────────────────────────
-  Bucket: mlp-s3dlio  Prefix: test-run/unet3d/train/  (max 20)
-  Found 20 objects  (first: test-run/unet3d/train/img_000_of_168.npz)
-[s3dlio] Loading CA bundle from: /usr/local/share/ca-certificates/minio-172-16-1-40_selfsigned.crt
-  Objects:  20 × 213.7 MB = 4274 MB total
-
-── Serial GET ───────────────────────────────────────────────────────────
-  [s3dlio              ] serial: 20 × 1 GET …
-  [s3dlio              ]  done: 515 MB/s (stream), p50=0.279s
-  [minio               ] serial: 20 × 1 GET …
-  [minio               ]  done: 511 MB/s (stream), p50=0.280s
-  [s3torchconnector    ] serial: 20 × 1 GET …
-  [s3torchconnector    ]  done: 389 MB/s (stream), p50=0.358s
-
-── Parallel GET (ThreadPoolExecutor) ────────────────────────────────────
-  [s3dlio              ] parallel workers=  1: …    574 MB/s
-  [minio               ] parallel workers=  1: …    507 MB/s
-  [s3torchconnector    ] parallel workers=  1: …    402 MB/s
-  [s3dlio              ] parallel workers=  4: …   1049 MB/s
-  [minio               ] parallel workers=  4: …   1025 MB/s
-  [s3torchconnector    ] parallel workers=  4: …    544 MB/s
-  [s3dlio              ] parallel workers=  8: …   1065 MB/s
-  [minio               ] parallel workers=  8: …    930 MB/s
-  [s3torchconnector    ] parallel workers=  8: …    516 MB/s
-  [s3dlio              ] parallel workers= 16: …   1043 MB/s
-  [minio               ] parallel workers= 16: …    916 MB/s
-  [s3torchconnector    ] parallel workers= 16: …    570 MB/s
-
-── s3dlio native get_many() ─────────────────────────────────────────────
-  [s3dlio native       ] get_many max_in_flight=  1: …    653 MB/s
-  [s3dlio native       ] get_many max_in_flight=  4: …    946 MB/s
-  [s3dlio native       ] get_many max_in_flight=  8: …    971 MB/s
-  [s3dlio native       ] get_many max_in_flight= 16: …    972 MB/s
-```
-
-**Serial GET** — one object at a time, no parallelism (20 objects)
-
-| Library | p50 | p95 | p99 | max | MB/s |
-|---|---|---|---|---|---|
-| s3dlio | 0.279s | 0.454s | 0.498s | 0.509s | **515 ◀** |
-| minio | 0.280s | 0.449s | 0.464s | 0.468s | 511 |
-| s3torchconnector | 0.358s | 0.600s | 0.633s | 0.641s | 389 |
-
-*p50/p95/p99/max — per-GET wall-clock latency (s) · MB/s — single-stream throughput (sum\_bytes / sum\_latency) · ◀ = fastest library*
-
-**Parallel GET** — `ThreadPoolExecutor`, same concurrency for all (20 objects, same bucket + objects for all libraries)
-
-| Library | w=1 | w=4 | w=8 | w=16 |
-|---|---|---|---|---|
-| s3dlio | **574 ◀** | **1,049 ◀** | **1,065 ◀** | **1,043 ◀** |
-| minio | 507 | 1,025 | 930 | 916 |
-| s3torchconnector | 402 | 544 | 516 | 570 |
-
-*All values in MB/s · All libraries use `ThreadPoolExecutor(max_workers=N)` — identical concurrency model · ◀ = fastest library at that worker count*
-
-**s3dlio Native get_many()** — Rust Tokio async, s3dlio only (20 objects)
-
-| max\_in\_flight | MB/s | vs ThreadPoolExecutor |
-|---|---|---|
-| 1 | 653 | +13.7% vs w=1 |
-| 4 | 946 | −9.8% vs w=4 |
-| 8 | 971 | −8.9% vs w=8 |
-| 16 | 972 | −6.9% vs w=16 |
-
-*`get_many()` uses s3dlio's Rust Tokio async engine; all requests are scheduled in a single Rust thread pool — no Python GIL or thread creation overhead.*
+| Mode | What it measures |
+|---|---|
+| `serial` | Per-request latency (p50/p95/p99/max) + single-stream MB/s |
+| `parallel` | Aggregate MB/s using `ThreadPoolExecutor` at matched concurrency |
+| `native` | s3dlio `get_many()` Rust Tokio async vs Python threads |
+| `all` | All three modes (default) |
 
 ---
 
-#### `test_direct_write_comparison.py`
-Measures **native API write + read throughput** across all three libraries side-by-side,
-without any DLIO involvement. Each library gets its own dedicated bucket.
+### `test_direct_write_comparison.py` — Native write + read benchmark
+
+Benchmarks raw write and read throughput via each library's native API (no DLIO
+overhead). Each library can use its own dedicated bucket, or all can share one.
 
 ```bash
-cd mlp-storage
+cd /path/to/mlp-storage
 
-# Default: 100 × 128 MiB objects, 8 write + 8 read workers
+# Default: all libraries, 100 x 128 MB objects, 8 write + 8 read workers
+# Uses BUCKET env var for all libraries (or set BUCKET_S3DLIO etc. individually)
 uv run python tests/object-store/test_direct_write_comparison.py
 
-# Reproduce the 12-worker results in Object_Perf_Results.md
+# Per-library buckets
+BUCKET_S3DLIO=bucket-a BUCKET_MINIO=bucket-b \
+    uv run python tests/object-store/test_direct_write_comparison.py
+
+# 12 workers
 uv run python tests/object-store/test_direct_write_comparison.py \
     --num-files 100 --size-mb 128 --write-workers 12 --read-workers 12
 
 # Single library
 uv run python tests/object-store/test_direct_write_comparison.py --library s3dlio
 
-# CLI reference
 uv run python tests/object-store/test_direct_write_comparison.py --help
 ```
 
-#### `test_dlio_multilib_demo.py`
-Runs **DLIO-driven training and checkpoint workloads** across all three libraries.
-I/O goes through DLIO's MPI data generation and PyTorch DataLoader — this is the
-realistic DLIO performance as seen by a training job, not direct API throughput.
+Bucket precedence (highest wins):
 
-```bash
-cd mlp-storage
-
-# Training workload (100 × 128 MiB NPZ, 2 epochs)
-uv run python tests/object-store/test_dlio_multilib_demo.py --workload training
-
-# Checkpoint workload (~105 GB streaming checkpoint, llama3-8b profile)
-uv run python tests/object-store/test_dlio_multilib_demo.py --workload checkpoint
-
-# Single library
-uv run python tests/object-store/test_dlio_multilib_demo.py --workload training --library s3dlio
-```
-
-#### `test_training_mpi_sweep.py`
-Sweeps MPI **process count (N = 1, 2, 4)** for both datagen and training across all
-three libraries. Each (library, N) combination runs as an independent clean cycle:
-`clean → datagen(N) → train(N) → clean`. Both write (datagen) and read (training)
-throughput are measured at each N.
-
-```bash
-cd mlp-storage
-
-# Full sweep: all libraries, N = 1, 2, 4
-uv run python tests/object-store/test_training_mpi_sweep.py
-
-# Custom process counts
-uv run python tests/object-store/test_training_mpi_sweep.py --process-counts 1 2 4 8
-
-# Single library
-uv run python tests/object-store/test_training_mpi_sweep.py --library s3dlio
-
-# Skip datagen (use data already in bucket)
-uv run python tests/object-store/test_training_mpi_sweep.py --skip-datagen
-
-# Keep objects after the run (skip cleanup)
-uv run python tests/object-store/test_training_mpi_sweep.py --skip-cleanup
-```
-
----
-
-### Per-Library Checkpoint Tests
-
-Each of these tests the `StreamingCheckpointing` pipeline for a single library:
-a fixed-RAM streaming producer-consumer pipeline where dgen-py generates data
-concurrently while the library uploads it. Memory usage is constant at ~128 MB
-regardless of checkpoint size.
-
-#### `test_s3dlio_checkpoint.py`
-StreamingCheckpointing with the **s3dlio** backend.
-
-```bash
-cd mlp-storage
-uv run python tests/object-store/test_s3dlio_checkpoint.py --size-gb 16
-uv run python tests/object-store/test_s3dlio_checkpoint.py --size-gb 100
-uv run python tests/object-store/test_s3dlio_checkpoint.py --help
-```
-
-#### `test_minio_checkpoint.py`
-StreamingCheckpointing with the **minio** backend.
-
-```bash
-cd mlp-storage
-uv run python tests/object-store/test_minio_checkpoint.py --size-gb 16
-uv run python tests/object-store/test_minio_checkpoint.py --help
-```
-
----
-
-### Direct s3dlio API Tests
-
-#### `test_s3dlio_direct.py`
-Tests the two s3dlio write APIs directly (no DLIO, no mlpstorage wrapper):
-- `PyObjectWriter` — streaming writer (`write_chunk` + `finalize`)
-- `MultipartUploadWriter` — multipart upload (`write` + `close`)
-
-```bash
-cd mlp-storage
-
-# Uses defaults from .env (bucket: bucket-s3dlio)
-uv run python tests/object-store/test_s3dlio_direct.py
-
-# Custom bucket
-uv run python tests/object-store/test_s3dlio_direct.py --bucket my-bucket
-uv run python tests/object-store/test_s3dlio_direct.py --help
-```
-
----
-
-### Shell Script Tests
-
-These shell scripts run the full `mlpstorage` CLI pipeline for each library —
-datagen, training, and checkpoint — using the **standard unet3d h100 workload**
-(`unet3d_h100.yaml`): 168 files × ~140 MB each (~23 GB total), batch_size=7,
-5 epochs, computation_time=0.323 s. This matches the real MLPerf Storage h100
-submission workload.
-
-#### `test_mlp_s3dlio.sh`
-Full mlpstorage datagen + training with **s3dlio** as the storage backend,
-using the standard unet3d h100 workload paramters.
-
-```bash
-cd mlp-storage
-bash tests/object-store/test_mlp_s3dlio.sh
-```
-
-#### `test_mlp_minio.sh`
-Full mlpstorage datagen + training with **minio** as the storage backend,
-using the standard unet3d h100 workload parameters.
-
-```bash
-cd mlp-storage
-bash tests/object-store/test_mlp_minio.sh
-```
-
-#### `test_mlp_s3torch.sh`
-Full mlpstorage datagen + training with **s3torchconnector** as the storage backend,
-using the standard unet3d h100 workload parameters.
-
-```bash
-cd mlp-storage
-bash tests/object-store/test_mlp_s3torch.sh
-```
-
-#### `test_s3dlio_multilib.sh`
-Shell-based multi-library comparison using s3dlio directly (not via mlpstorage).
-
-```bash
-cd mlp-storage
-bash tests/object-store/test_s3dlio_multilib.sh
-```
-
-#### `demo_streaming_checkpoint.sh`
-Quickstart demo showing the two major optimisations: dgen-py integration (155×
-faster data generation) and StreamingCheckpointing (192× memory reduction).
-Compares old vs new method for both file and object storage.
-
-```bash
-TEST_SIZE_GB=1 TEST_CHECKPOINT_DIR=/tmp/ckpt-demo \
-    bash tests/object-store/demo_streaming_checkpoint.sh
-```
+1. `--bucket-s3dlio` / `--bucket-minio` / `--bucket-s3torch` CLI flag
+2. `BUCKET_S3DLIO` / `BUCKET_MINIO` / `BUCKET_S3TORCH` env var
+3. `BUCKET` env var (shared default for all libraries)
 
 ---
 
 ## Credential Setup
 
-Create `mlp-storage/.env` (never commit this file):
+Create `mlp-storage/.env` (never commit — it is already in `.gitignore`):
 
 ```bash
 AWS_ACCESS_KEY_ID=your_access_key
 AWS_SECRET_ACCESS_KEY=your_secret_key
-AWS_ENDPOINT_URL=http://your-minio-host:9000
+AWS_ENDPOINT_URL=https://your-minio-host:9000
 AWS_REGION=us-east-1
+BUCKET=your-test-bucket
+STORAGE_LIBRARY=s3dlio
 ```
 
-`.env` is already listed in `.gitignore`. All scripts and Python tests read it
-automatically at startup; shell environment variables always take precedence.
+See `.env.example` at the repo root for a fully annotated template.
 
 ---
 
-## Real Checkpoint Tests — `dlio_xxx_checkpoint.sh`
+## TLS / HTTPS Setup
 
-These scripts run **end-to-end LLaMA 3 8B checkpoint workloads** directly through
-`dlio_benchmark` using the mlp-storage storage backends. They are the authoritative
-benchmark for checkpoint write and read throughput, equivalent to what a real
-distributed training run produces during a checkpoint save/restore cycle.
+If your endpoint uses a self-signed certificate:
 
-> **No data generation required** — checkpoint workloads synthesize tensor data
-> on the fly using the model sizing parameters. Run these tests standalone without
-> any prior `datagen` step.
+1. Generate the cert with `basicConstraints=CA:FALSE`  
+   (Rust-based libraries use **rustls** and enforce RFC 5280 — CA:TRUE is rejected)
+2. The cert must include a `subjectAltName` (SAN) matching the server IP or hostname
+3. Run `sudo update-ca-certificates` (s3torchconnector uses the system store)
+4. Set `AWS_CA_BUNDLE=/path/to/cert.crt` in `.env` (used by s3dlio)
 
-### Common parameters
-
-| Variable | Default | Description |
-|---|---|---|
-| `NP` | `1` | MPI rank count — simulates that many GPU processes |
-| `CHECKPOINTS` | `2` | Number of checkpoint write + read cycles |
-
-**NP guidance:**
-
-> **Important:** NP controls the number of shards, **not** the total amount of data.
-> The LLaMA 3 8B checkpoint has two components that are always saved together:
-> model weights (~16 GB, fp16) and optimizer state (~89 GB, fp32). Combined that is
-> ~105 GB total per checkpoint. All NP settings produce the same ~105 GB total I/O —
-> NP only splits that data into more, smaller per-rank objects.
-
-| NP | Total I/O per checkpoint | Per-rank object size | s3dlio | minio | s3torchconnector |
-|---|---|---|---|---|---|
-| `1` | ~105 GB write + ~105 GB read | ~105 GB | ✅ | ✅ | ❌ fails (> 78 GB limit) |
-| `2` | ~105 GB write + ~105 GB read | ~52.5 GB | ✅ | ✅ | ✅ |
-| `4` | ~105 GB write + ~105 GB read | ~26 GB | ✅ | ✅ | ✅ |
-| `8` | ~105 GB write + ~105 GB read | ~13.1 GB | ✅ | ✅ | ✅ |
-
-> **s3torchconnector NP=1 failure:** The AWS CRT library (used internally by
-> s3torchconnector) cannot write a single object larger than approximately 78 GB. At
-> NP=1 the full ~105 GB checkpoint (weights + optimizer state) is written as one object,
-> which exceeds this limit and causes the upload to fail. Use NP=2 or larger with
-> s3torchconnector — with 2 ranks the per-rank shard is ~52.5 GB, well within the CRT
-> limit. s3dlio and minio are not affected by this limit.
-
-Each rank independently writes its shard to a unique object key under:
-```
-s3://chckpt-test1/<library>/llama3-8b/<checkpoint_id>/<rank>.pt
-```
-
-### Prerequisites
+Verify TLS is working:
 
 ```bash
-cd /path/to/mlp-storage
-
-# Set up environment (one-time)
-uv sync
-
-# Ensure credentials and endpoint are set in .env (see .env.example)
-# Verify bucket exists and is reachable
-uv run python -c "import s3dlio; print(s3dlio.list('s3://chckpt-test1/', recursive=False))"
-```
-
-For HTTPS endpoints (self-signed MinIO certificate), set:
-```bash
-# Already in .env if configured — verify with:
-echo $AWS_CA_BUNDLE    # should point to the .crt file
-```
-
-### Scripts
-
-All three scripts share identical interface — only the storage library and bucket
-prefix differ.
-
-#### `dlio_s3dlio_checkpoint.sh` — s3dlio (Rust / Tokio)
-
-```bash
-cd /path/to/mlp-storage
-
-# Single-rank sanity check (default, ~13 GB I/O)
-bash tests/object-store/dlio_s3dlio_checkpoint.sh
-
-# 2-rank run
-NP=2 bash tests/object-store/dlio_s3dlio_checkpoint.sh
-
-# Full 8-rank llama3-8b reference (~89 GB total, 8 × ~11 GB shards)
-NP=8 bash tests/object-store/dlio_s3dlio_checkpoint.sh
-
-# Quick 1-checkpoint run (write once, read once)
-CHECKPOINTS=1 bash tests/object-store/dlio_s3dlio_checkpoint.sh
-
-# Combine overrides
-NP=4 CHECKPOINTS=1 bash tests/object-store/dlio_s3dlio_checkpoint.sh
-```
-
-Objects land at: `s3://chckpt-test1/s3dlio/llama3-8b/`
-
-#### `dlio_minio_checkpoint.sh` — minio Python SDK
-
-```bash
-cd /path/to/mlp-storage
-
-bash tests/object-store/dlio_minio_checkpoint.sh          # NP=1 (default)
-NP=2 bash tests/object-store/dlio_minio_checkpoint.sh
-NP=8 bash tests/object-store/dlio_minio_checkpoint.sh    # full reference
-CHECKPOINTS=1 bash tests/object-store/dlio_minio_checkpoint.sh
-```
-
-Objects land at: `s3://chckpt-test1/minio/llama3-8b/`
-
-#### `dlio_s3torch_checkpoint.sh` — s3torchconnector (AWS CRT)
-
-> ⚠️ **Known limitation — NP=1 will fail.**  The AWS CRT library used by
-> s3torchconnector cannot write a single object larger than ~78 GB. At NP=1 the full
-> LLaMA 3 8B checkpoint (~105 GB: model weights ~16 GB + optimizer state ~89 GB) is
-> written as one object and the upload fails with a CRT internal error.  **Always use
-> NP≥2 with s3torchconnector.**  This is not a configuration problem — it is a hard
-> limit in the AWS CRT library.
-
-```bash
-cd /path/to/mlp-storage
-
-# NP=1 WILL FAIL for llama3-8b (105 GB object > 78 GB CRT limit)
-# bash tests/object-store/dlio_s3torch_checkpoint.sh
-
-# Minimum working rank count for s3torchconnector
-NP=2 bash tests/object-store/dlio_s3torch_checkpoint.sh
-NP=4 bash tests/object-store/dlio_s3torch_checkpoint.sh
-NP=8 bash tests/object-store/dlio_s3torch_checkpoint.sh  # full reference
-CHECKPOINTS=1 bash tests/object-store/dlio_s3torch_checkpoint.sh
-```
-
-Objects land at: `s3://chckpt-test1/s3torch/llama3-8b/`
-
-> **Note:** `s3torchconnector` only supports AWS S3 and S3-compatible endpoints that
-> accept AWS Signature V4. It does not support Azure or GCS endpoints.
-
-### Progress output
-
-During a checkpoint write each library prints a live throughput line that updates in
-place (carriage-return style):
-
-```
-[Writer] 6.55 GB, 0.31 GB/s   
-```
-
-The line shows cumulative GB written and the current instantaneous throughput. When the
-upload completes the line is finalised with a newline and DLIO prints per-rank summary
-statistics.
-
-### Cleanup
-
-After a run, delete the objects to reclaim bucket space:
-
-```bash
-bash tests/object-store/dlio_s3dlio_cleanup.sh
-bash tests/object-store/dlio_minio_cleanup.sh
-bash tests/object-store/dlio_s3torch_cleanup.sh
+# Should return HTTP 403 (AccessDenied) — means TLS handshake succeeded
+curl -v https://your-minio-host:9000/
 ```
 
 ---
 
-## Full Workflow — Datagen → Train → Checkpoint
+## Adding More Libraries
 
-The scripts below run the complete DLIO UNet3D H100 workload for each library. Use
-these when you want to benchmark **training data loading** rather than checkpointing.
+Runtime parameters — library, bucket, endpoint, credentials — all flow from
+environment variables. To test a new storage library:
 
-### Phase 1 — Generate training data
+1. Add it to `mlpstorage_py/storage/` and register it in `obj_store_lib.py`
+2. Set `STORAGE_LIBRARY=<new-library>` in `.env`
+3. Run `run_training.sh` or `run_checkpointing.sh` without changing any test script
 
-Data generation writes synthetic NPZ files to the object store. This is a one-time
-step per bucket/library combination; you can reuse the generated data for multiple
-training runs.
+---
 
-```bash
-# Generate UNet3D training data (do this once per library bucket)
-bash tests/object-store/dlio_s3dlio_datagen.sh    # → mlp-s3dlio bucket
-bash tests/object-store/dlio_minio_datagen.sh     # → mlp-minio bucket
-bash tests/object-store/dlio_s3torch_datagen.sh   # → mlp-s3torch bucket
-```
+## Archived Tests
 
-Override the number of samples (default varies per config):
-```bash
-NUM_FILES=100 bash tests/object-store/dlio_s3dlio_datagen.sh
-```
-
-### Phase 2 — Training throughput
-
-Runs the training I/O loop (no actual GPU compute — pure storage benchmark):
-
-```bash
-NP=1  bash tests/object-store/dlio_s3dlio_train.sh
-NP=2  bash tests/object-store/dlio_minio_train.sh
-NP=4  bash tests/object-store/dlio_s3torch_train.sh
-```
-
-### Phase 3 — Checkpoint (standalone)
-
-See **[Real Checkpoint Tests](#real-checkpoint-tests--dlio_xxx_checkpointsh)** above.
-Checkpointing does not require training data — it runs independently.
-
-### Phase 4 — Full cycle (datagen + train + checkpoint)
-
-```bash
-bash tests/object-store/dlio_s3dlio_cycle.sh    # all three phases, s3dlio
-bash tests/object-store/dlio_minio_cycle.sh     # all three phases, minio
-bash tests/object-store/dlio_s3torch_cycle.sh   # all three phases, s3torch
-```
-
-### Cleanup
-
-```bash
-bash tests/object-store/dlio_s3dlio_cleanup.sh
-bash tests/object-store/dlio_minio_cleanup.sh
-bash tests/object-store/dlio_s3torch_cleanup.sh
-```
+Older per-library scripts (dlio\_s3dlio\_\*.sh, dlio\_minio\_\*.sh, etc.),
+per-library Python tests, and historical result documents are preserved in
+`tests/object-store/old-archive/` for reference. They are **not maintained**.
