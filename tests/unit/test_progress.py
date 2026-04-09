@@ -53,7 +53,7 @@ class TestProgressContextNonInteractive:
     """Tests for progress_context in non-interactive mode."""
 
     def test_logs_status_with_logger(self):
-        """Should log status via logger.status() in non-interactive mode."""
+        """Should log status via logger.info() in non-interactive mode."""
         mock_logger = MagicMock()
 
         with patch(
@@ -65,7 +65,7 @@ class TestProgressContextNonInteractive:
             ):
                 pass
 
-        mock_logger.status.assert_called_once_with("Loading data...")
+        mock_logger.info.assert_called_once_with("Loading data...")
 
     def test_no_error_without_logger(self):
         """Should not error when no logger is provided in non-interactive mode."""
@@ -209,7 +209,7 @@ class TestCreateStageProgressNonInteractive:
     """Tests for create_stage_progress in non-interactive mode."""
 
     def test_logs_stages_with_logger(self):
-        """Should log each stage via logger.status() in non-interactive mode."""
+        """Should log each stage via logger.info() in non-interactive mode."""
         mock_logger = MagicMock()
         stages = ["Stage 1", "Stage 2", "Stage 3"]
 
@@ -221,9 +221,9 @@ class TestCreateStageProgressNonInteractive:
                 advance_stage()  # Advance to Stage 2
                 advance_stage()  # Advance to Stage 3
 
-        # Verify logger.status was called for all stages
-        assert mock_logger.status.call_count == 3
-        calls = [str(call) for call in mock_logger.status.call_args_list]
+        # Verify logger.info was called for all stages
+        assert mock_logger.info.call_count == 3
+        calls = [str(call) for call in mock_logger.info.call_args_list]
         assert any("Stage 1" in call for call in calls)
         assert any("Stage 2" in call for call in calls)
         assert any("Stage 3" in call for call in calls)
