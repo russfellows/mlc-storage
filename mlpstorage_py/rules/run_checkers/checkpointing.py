@@ -31,7 +31,7 @@ class CheckpointingRunRulesChecker(RunRulesChecker):
     def check_model(self) -> Optional[Issue]:
         """Verify model is a valid LLM model."""
         model = self.benchmark_run.model
-        valid_models = [m.value for m in self.supported_models]
+        valid_models = list(self.supported_models)
 
         if model not in valid_models:
             return Issue(
