@@ -245,7 +245,7 @@ wheels = [
 [[package]]
 name = "dlio-benchmark"
 version = "3.0.0"
-source = { git = "https://github.com/russfellows/dlio_benchmark.git?branch=main#0a1b3c553c54671bac230a98a2a11e92ebb68b36" }
+source = { git = "https://github.com/russfellows/dlio_benchmark.git?branch=main#f58903c1b2d6251c3662f8f735f40d0c3bf3b49e" }
 dependencies = [
     { name = "dgen-py" },
     { name = "h5py" },
