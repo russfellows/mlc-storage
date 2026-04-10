@@ -77,7 +77,7 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-dlio-benchmark = { git = "https://github.com/russfellows/dlio_benchmark.git", branch = "dev" }
+dlio-benchmark = { git = "https://github.com/russfellows/dlio_benchmark.git", branch = "main" }
 torch = [{ index = "pytorch-cpu" }]
 torchvision = [{ index = "pytorch-cpu" }]
 torchaudio = [{ index = "pytorch-cpu" }]
