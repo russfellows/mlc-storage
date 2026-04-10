@@ -12,8 +12,10 @@
 #   BUCKET           — S3/MinIO bucket name           (REQUIRED — no default)
 #   STORAGE_LIBRARY  — storage library: s3dlio | minio  (default: s3dlio)
 #   NP               — MPI rank count (each rank = 1 GPU shard of llama3-8b)
-#                      NP=1: single-rank sanity check (~13.1 GB I/O)
-#                      NP=8: full llama3-8b ZeRO-3 (~105 GB I/O)  (default: 1)
+#                      NP=4: recommended default — good balance of speed and
+#                            parallelism; also required for s3torchconnector
+#                            (single-object size limit at NP=1)
+#                      NP=8: full llama3-8b ZeRO-3 (~105 GB I/O)  (default: 4)
 #   CHECKPOINTS      — number of checkpoint write + read cycles  (default: 2)
 #   MODEL            — DLIO workload name  (default: llama3_8b_checkpoint)
 #
@@ -22,14 +24,14 @@
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL, AWS_REGION
 #
 # Note on NP and s3torchconnector:
-#   At NP=1 the entire ~105 GB checkpoint is written as ONE object. The AWS CRT
-#   library used by s3torchconnector has a ~78 GB single-object limit, so NP=1
-#   WILL FAIL with s3torchconnector.  Use NP≥2 for that library.
+#   With NP=1 the entire ~105 GB checkpoint is a single object. The AWS CRT
+#   client used by s3torchconnector has a ~78 GB single-object limit, so NP=1
+#   WILL FAIL with s3torchconnector.  NP=4 is the default for this reason.
 #
 # Usage:
 #   cd /path/to/mlp-storage
 #
-#   # Quick sanity check (NP=1 rank, s3dlio, 2 checkpoints)
+#   # Standard run (NP=2, s3dlio, 2 checkpoints — the default)
 #   BUCKET=my-test-bucket bash tests/object-store/run_checkpointing.sh
 #
 #   # Full llama3-8b run (8 MPI ranks)
@@ -62,11 +64,23 @@ fi
 : "${AWS_SECRET_ACCESS_KEY:?ERROR: AWS_SECRET_ACCESS_KEY not set — add it to .env}"
 : "${AWS_ENDPOINT_URL:?ERROR: AWS_ENDPOINT_URL not set — add it to .env}"
 : "${AWS_REGION:=us-east-1}"
-: "${BUCKET:?ERROR: BUCKET not set — pass it as: BUCKET=my-bucket bash $0}"
-
 # ── Tunables ──────────────────────────────────────────────────────────────────
 STORAGE_LIBRARY="${STORAGE_LIBRARY:-s3dlio}"
-NP="${NP:-1}"
+
+# If BUCKET is not set derive a default from the storage library:
+#   s3dlio          → mlp-s3dlio
+#   minio           → mlp-minio
+#   s3torchconnector → mlp-s3torch
+if [[ -z "${BUCKET:-}" ]]; then
+    case "${STORAGE_LIBRARY}" in
+        minio)            BUCKET="mlp-minio" ;;
+        s3torchconnector) BUCKET="mlp-s3torch" ;;
+        *)                BUCKET="mlp-s3dlio" ;;
+    esac
+    echo "[info] BUCKET not set — defaulting to '${BUCKET}' for library '${STORAGE_LIBRARY}'"
+fi
+: "${BUCKET:?ERROR: BUCKET not set}"
+NP="${NP:-4}"
 CHECKPOINTS="${CHECKPOINTS:-2}"
 MODEL="${MODEL:-llama3_8b_checkpoint}"
 
@@ -123,9 +137,30 @@ echo "  Run dir  : ${RUN_DIR}"
 echo "════════════════════════════════════════════════════════"
 echo ""
 
+# ── Per-library credential overrides ─────────────────────────────────────────
+# Credentials are passed explicitly so every library (including minio, which
+# uses a custom HTTP client) receives the correct key material regardless of
+# what environment variables are set.
+CHECKPOINT_PARAMS=(
+    "++workload.storage.storage_options.region=${AWS_REGION}"
+    "++workload.storage.storage_options.s3_force_path_style=true"
+    "++workload.storage.storage_options.access_key_id=${AWS_ACCESS_KEY_ID}"
+    "++workload.storage.storage_options.secret_access_key=${AWS_SECRET_ACCESS_KEY}"
+)
+
+# s3torchconnector uses the AWS CRT client, which reads credentials from the
+# AWS credential chain (not from storage_options).  Point it at the named
+# profile whose key matches this endpoint, and unset the env-var credentials
+# so the CRT client doesn't fall through to an incorrect key.
+S3_PROFILE="${S3_PROFILE:-}"
+if [[ "${STORAGE_LIBRARY}" == "s3torchconnector" ]]; then
+    profile="${S3_PROFILE:-mlp-minio}"
+    CHECKPOINT_PARAMS+=("++workload.storage.storage_options.s3_profile=${profile}")
+    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+fi
+
 DLIO_S3_IMPLEMENTATION=mlp \
 mpirun -np "${NP}" --allow-run-as-root \
-    --mca btl ^vader \
     "${DLIO_BIN}" \
     "workload=${MODEL}" \
     "++hydra.run.dir=${RUN_DIR}" \
@@ -133,6 +168,7 @@ mpirun -np "${NP}" --allow-run-as-root \
     "++workload.storage.storage_root=${BUCKET}" \
     "++workload.storage.storage_library=${STORAGE_LIBRARY}" \
     "++workload.storage.storage_options.endpoint_url=${AWS_ENDPOINT_URL}" \
+    "${CHECKPOINT_PARAMS[@]}" \
     "++workload.checkpoint.checkpoint_folder=${CHECKPOINT_FOLDER}" \
     "++workload.checkpoint.num_checkpoints_write=${CHECKPOINTS}" \
     "++workload.checkpoint.num_checkpoints_read=${CHECKPOINTS}" \
