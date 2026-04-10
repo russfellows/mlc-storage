@@ -245,7 +245,7 @@ wheels = [
 [[package]]
 name = "dlio-benchmark"
 version = "3.0.0"
-source = { git = "https://github.com/russfellows/dlio_benchmark.git?branch=dev#b1696e1fd93fbf68e3d304e102a01a62a00eeb67" }
+source = { git = "https://github.com/russfellows/dlio_benchmark.git?branch=main#0a1b3c553c54671bac230a98a2a11e92ebb68b36" }
 dependencies = [
     { name = "dgen-py" },
     { name = "h5py" },
@@ -568,8 +568,8 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "dlio-benchmark", git = "https://github.com/russfellows/dlio_benchmark.git?branch=dev" },
-    { name = "dlio-benchmark", marker = "extra == 'full'", git = "https://github.com/russfellows/dlio_benchmark.git?branch=dev" },
+    { name = "dlio-benchmark", git = "https://github.com/russfellows/dlio_benchmark.git?branch=main" },
+    { name = "dlio-benchmark", marker = "extra == 'full'", git = "https://github.com/russfellows/dlio_benchmark.git?branch=main" },
     { name = "minio", specifier = ">=7.2.20" },
     { name = "packaging", specifier = ">=21.0" },
     { name = "psutil", specifier = ">=5.9" },
