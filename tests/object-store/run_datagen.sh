@@ -1,20 +1,18 @@
 #!/usr/bin/env bash
-# run_training.sh
+# run_datagen.sh
 #
-# Object-store training test — reads the dataset from the object store.
+# Object-store data generation — writes synthetic training data to the object store.
 #
-# Run run_datagen.sh FIRST to generate the dataset.  Once the dataset exists
-# in the bucket this script can be run repeatedly without re-generating data.
+# Run this ONCE before running run_training.sh.  Once generated, the dataset
+# can be reused for as many training runs as needed without re-generating.
 #
 # All runtime parameters are supplied via environment variables (or .env):
 #
 #   BUCKET           — S3/MinIO bucket name              (REQUIRED — no default)
 #   STORAGE_LIBRARY  — storage library: s3dlio | minio   (default: s3dlio)
 #   MODEL            — mlpstorage model name             (default: unet3d)
-#   NP               — number of simulated accelerators  (default: 1)
-#   DATA_DIR         — object prefix used during datagen (default: test-run/)
-#   ACCELERATOR_TYPE — accelerator to simulate           (default: h100)
-#   CLIENT_MEMORY_GB — client host memory in GB          (default: 512)
+#   NP               — MPI process count for generation  (default: 1)
+#   DATA_DIR         — object prefix for the dataset     (default: test-run/)
 #
 # Credentials are read from:
 #   .env file at the repo root  OR  shell environment variables
@@ -23,14 +21,21 @@
 # Usage:
 #   cd /path/to/mlp-storage
 #
-#   # Training with s3dlio (default), after datagen has been run
+#   # Generate unet3d dataset with s3dlio (default)
+#   BUCKET=my-test-bucket bash tests/object-store/run_datagen.sh
+#
+#   # Generate with minio
+#   BUCKET=my-test-bucket STORAGE_LIBRARY=minio bash tests/object-store/run_datagen.sh
+#
+#   # 8 parallel MPI processes for faster generation
+#   BUCKET=my-test-bucket NP=8 bash tests/object-store/run_datagen.sh
+#
+#   # bert model under a custom prefix
+#   BUCKET=my-test-bucket MODEL=bert DATA_DIR=datasets/ \
+#       bash tests/object-store/run_datagen.sh
+#
+# After datagen completes, run training with matching BUCKET/MODEL/DATA_DIR:
 #   BUCKET=my-test-bucket bash tests/object-store/run_training.sh
-#
-#   # Use minio instead
-#   BUCKET=my-test-bucket STORAGE_LIBRARY=minio bash tests/object-store/run_training.sh
-#
-#   # 8 simulated accelerators, bert model
-#   BUCKET=my-test-bucket NP=8 MODEL=bert bash tests/object-store/run_training.sh
 
 set -euo pipefail
 
@@ -70,8 +75,6 @@ fi
 MODEL="${MODEL:-unet3d}"
 NP="${NP:-1}"
 DATA_DIR="${DATA_DIR:-test-run/}"
-ACCELERATOR_TYPE="${ACCELERATOR_TYPE:-h100}"
-CLIENT_MEMORY_GB="${CLIENT_MEMORY_GB:-512}"
 
 # ── Virtual environment ───────────────────────────────────────────────────────
 if [[ ! -f .venv/bin/activate ]]; then
@@ -86,7 +89,7 @@ if ! command -v mlpstorage &>/dev/null; then
     exit 1
 fi
 
-# ── Storage params (passed to mlpstorage via --param) ────────────────────────
+# ── Storage params (passed to mlpstorage via --params) ───────────────────────
 # All runtime storage details come from environment — nothing hardcoded here.
 STORAGE_PARAMS=(
     "storage.storage_type=s3"
@@ -98,57 +101,42 @@ STORAGE_PARAMS=(
     "storage.s3_force_path_style=true"
 )
 
-# All object-store libraries (s3dlio, minio, s3torchconnector) need spawn
-# multiprocessing context for the PyTorch DataLoader.  The default "fork"
-# context breaks C-extension runtimes (Tokio in s3dlio, CRT threads in
-# s3torchconnector) in the forked worker processes, causing S3 reads to hang.
-STORAGE_PARAMS+=("reader.multiprocessing_context=spawn")
-
-# Disable DLIO checkpoint workflow in training tests.  mlpstorage training run
-# forces workflow.checkpoint=true, which causes DLIO to attempt a checkpoint
-# write using the default local path (no s3:// scheme), failing with
-# "Unsupported URI scheme".  Object-store checkpoint I/O is tested separately
-# by run_checkpointing.sh so we disable it here to keep tests independent.
-STORAGE_PARAMS+=("workflow.checkpoint=false")
-
 # s3torchconnector uses the AWS CRT client, which reads credentials from the
 # AWS credential chain (not from storage_options).  Point it at the named
 # profile whose key matches this endpoint, and unset the env-var credentials
 # so the CRT client doesn't fall through to an incorrect key.
-S3_PROFILE="${S3_PROFILE:-}"
+S3_PROFILE="${S3_PROFILE:-}"   # caller may override; default: auto-detect
 if [[ "${STORAGE_LIBRARY}" == "s3torchconnector" ]]; then
-    profile="${S3_PROFILE:-mlp-minio}"
+    profile="${S3_PROFILE:-mlp-minio}"  # default profile for MinIO endpoint
     STORAGE_PARAMS+=("storage.storage_options.s3_profile=${profile}")
     unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 fi
 
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo "  Object-Store Training Test"
+echo "  Object-Store Data Generation"
 echo "════════════════════════════════════════════════════════"
-echo "  Model    : ${MODEL}"
-echo "  Library  : ${STORAGE_LIBRARY}"
-echo "  Bucket   : ${BUCKET}"
-echo "  Endpoint : ${AWS_ENDPOINT_URL}"
-echo "  Dataset  : s3://${BUCKET}/${DATA_DIR}${MODEL}/"
-echo "  NP       : ${NP}"
-echo "  Accel    : ${ACCELERATOR_TYPE}"
-echo "  Memory   : ${CLIENT_MEMORY_GB} GB"
+echo "  Model   : ${MODEL}"
+echo "  Library : ${STORAGE_LIBRARY}"
+echo "  Bucket  : ${BUCKET}"
+echo "  Endpoint: ${AWS_ENDPOINT_URL}"
+echo "  Output  : s3://${BUCKET}/${DATA_DIR}${MODEL}/"
+echo "  NP      : ${NP}"
 echo "════════════════════════════════════════════════════════"
 echo ""
 
-DLIO_S3_IMPLEMENTATION=mlp mlpstorage training run \
+DLIO_S3_IMPLEMENTATION=mlp mlpstorage training datagen \
     --model "${MODEL}" \
-    --allow-run-as-root \
+    --num-processes "${NP}" \
+    --data-dir "${DATA_DIR}" \
     --skip-validation \
-    --num-accelerators "${NP}" \
-    --accelerator-type "${ACCELERATOR_TYPE}" \
-    --client-host-memory-in-gb "${CLIENT_MEMORY_GB}" \
+    --allow-run-as-root \
     --object s3 \
-    --params "${STORAGE_PARAMS[@]}" \
-        "dataset.data_folder=${DATA_DIR}${MODEL}"
+    --params "${STORAGE_PARAMS[@]}"
 
 echo ""
 echo "════════════════════════════════════════════════════════"
-echo "  ✅  run_training.sh complete"
+echo "  ✅  run_datagen.sh complete"
+echo "  Dataset: s3://${BUCKET}/${DATA_DIR}${MODEL}/"
+echo "  Next:    BUCKET=${BUCKET} bash tests/object-store/run_training.sh"
 echo "════════════════════════════════════════════════════════"
