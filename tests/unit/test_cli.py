@@ -18,7 +18,7 @@ from unittest.mock import patch, MagicMock
 from pathlib import Path
 
 # Import argument builders from cli package
-from mlpstorage_py.cli import (
+from mlpstorage.cli import (
     add_training_arguments,
     add_checkpointing_arguments,
     add_vectordb_arguments,
@@ -30,14 +30,14 @@ from mlpstorage_py.cli import (
     PROGRAM_DESCRIPTIONS,
 )
 # Import parser functions from cli_parser module
-from mlpstorage_py.cli_parser import (
+from mlpstorage.cli_parser import (
     validate_args,
     update_args,
     apply_yaml_config_overrides,
     help_messages,
     prog_descriptions,
 )
-from mlpstorage_py.config import MODELS, ACCELERATORS, LLM_MODELS, EXEC_TYPE
+from mlpstorage.config import MODELS, ACCELERATORS, LLM_MODELS, EXEC_TYPE
 
 
 class TestHelpMessages:
@@ -167,8 +167,7 @@ class TestAddTrainingArguments:
             '--model', 'unet3d',
             '--max-accelerators', '8',
             '--accelerator-type', 'h100',
-            '--client-host-memory-in-gb', '128',
-            '--file'
+            '--client-host-memory-in-gb', '128'
         ])
         assert args.command == 'datasize'
         assert args.model == 'unet3d'
@@ -180,8 +179,7 @@ class TestAddTrainingArguments:
             'datagen',
             '--model', 'resnet50',
             '--num-processes', '16',
-            '--data-dir', '/data',
-            '--file'
+            '--data-dir', '/data'
         ])
         assert args.command == 'datagen'
         assert args.model == 'resnet50'
@@ -194,8 +192,7 @@ class TestAddTrainingArguments:
             '--model', 'cosmoflow',
             '--num-accelerators', '4',
             '--accelerator-type', 'a100',
-            '--client-host-memory-in-gb', '256',
-            '--file'
+            '--client-host-memory-in-gb', '256'
         ])
         assert args.command == 'run'
         assert args.model == 'cosmoflow'
@@ -206,8 +203,7 @@ class TestAddTrainingArguments:
         # Note: configview only has --num-accelerators, not --model
         args = parser.parse_args([
             'configview',
-            '--num-accelerators', '8',
-            '--file'
+            '--num-accelerators', '8'
         ])
         assert args.command == 'configview'
         assert args.num_accelerators == 8
@@ -220,8 +216,7 @@ class TestAddTrainingArguments:
             '--num-accelerators', '8',
             '--accelerator-type', 'h100',
             '--client-host-memory-in-gb', '128',
-            '--hosts', 'host1', 'host2',
-            '--file'
+            '--hosts', 'host1', 'host2'
         ])
         assert args.hosts == ['host1', 'host2']
 
@@ -233,8 +228,7 @@ class TestAddTrainingArguments:
             '--num-accelerators', '8',
             '--accelerator-type', 'h100',
             '--client-host-memory-in-gb', '128',
-            '--params', 'key1=val1', 'key2=val2',
-            '--file'
+            '--params', 'key1=val1', 'key2=val2'
         ])
         assert args.params == [['key1=val1', 'key2=val2']]
 
@@ -256,8 +250,7 @@ class TestAddCheckpointingArguments:
             '--model', 'llama3-8b',
             '--num-processes', '8',
             '--client-host-memory-in-gb', '512',
-            '--checkpoint-folder', '/ckpt',
-            '--file'
+            '--checkpoint-folder', '/ckpt'
         ])
         assert args.command == 'datasize'
         assert args.model == 'llama3-8b'
@@ -269,8 +262,7 @@ class TestAddCheckpointingArguments:
             '--model', 'llama3-70b',
             '--num-processes', '64',
             '--client-host-memory-in-gb', '1024',
-            '--checkpoint-folder', '/ckpt',
-            '--file'
+            '--checkpoint-folder', '/ckpt'
         ])
         assert args.command == 'run'
         assert args.model == 'llama3-70b'
@@ -284,8 +276,7 @@ class TestAddCheckpointingArguments:
             '--num-processes', '8',
             '--client-host-memory-in-gb', '512',
             '--checkpoint-folder', '/ckpt',
-            '--num-checkpoints-read', '5',
-            '--file'
+            '--num-checkpoints-read', '5'
         ])
         assert args.num_checkpoints_read == 5
 
@@ -297,8 +288,7 @@ class TestAddCheckpointingArguments:
             '--num-processes', '8',
             '--client-host-memory-in-gb', '512',
             '--checkpoint-folder', '/ckpt',
-            '--num-checkpoints-write', '3',
-            '--file'
+            '--num-checkpoints-write', '3'
         ])
         assert args.num_checkpoints_write == 3
 
